@@ -1,0 +1,21 @@
+VSF License (Version 0.0)
+
+Copyright (c) Nick Spiker
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, merge, publish, and distribute the Software, subject to the following conditions:
+
+0. MEMORY SAFETY REQUIREMENT
+   All implementations of this Software must be in memory-safe languages with compile-time verification. Acceptable languages include but are not limited to: Rust, Ada/SPARK, formally verified C/C++.
+
+   Explicitly PROHIBITED: Python, unverified C/C++, JavaScript (for core implementation; bindings are permitted).
+
+1. NON-COMPETITION
+   You may NOT sell this Software or direct derivatives as a standalone product or service. You MAY use this Software in commercial products, provided the Software is not the primary value proposition.
+
+2. PATENT GRANT
+   Subject to compliance with this license, you are granted a royalty-free, worldwide patent license to make, use, and distribute implementations of the exponential-width integer encoding system described in US Patent Application US 2024/0233187 A1.
+
+3. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+For questions or alternative licensing, contact: fractaldecoder@proton.me
