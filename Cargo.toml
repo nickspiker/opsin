@@ -5,6 +5,10 @@ edition = "2024"
 description = "Spectral image viewer and converter, with the minimal edits a viewer earns: exposure, rotation, starring, culling. The observer is a variable. Full editing belongs to a separate crate."
 license-file = "LICENSE"
 repository = "https://github.com/nickspiker/opsin"
+keywords = ["spectral", "image", "viewer", "raw", "vsf"]
+categories = ["multimedia::images"]
+# The hero webp renders in the README via its raw URL; the orb .rgb is a make_orb intermediate. Neither ships. The orb .vsf DOES ship (include_bytes! in app.rs).
+exclude = ["opsin.webp", "assets/opsin_orb.rgb"]
 
 [dependencies]
 # Container format — VSF-Image sections (sensor plane, spectral characterization, provenance chain).
