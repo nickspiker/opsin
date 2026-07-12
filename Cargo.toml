@@ -2,7 +2,7 @@
 name = "opsin"
 version = "0.0.0"
 edition = "2024"
-description = "Spectral image viewer, converter and (eventually) editor. The observer is a variable."
+description = "Spectral image viewer and converter, with the minimal edits a viewer earns: exposure, rotation, starring, culling. The observer is a variable. Full editing belongs to a separate crate."
 license-file = "LICENSE"
 repository = "https://github.com/nickspiker/opsin"
 
