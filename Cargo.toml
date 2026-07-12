@@ -10,6 +10,6 @@ repository = "https://github.com/nickspiker/opsin"
 # Container format — VSF-Image sections (sensor plane, spectral characterization, provenance chain).
 vsf = { version = "0.9.2", path = "../vsf", features = ["inspect"] }
 # Sensor intake — decodes RAW/DNG to counts + gives us both DNG ColorMatrices and illuminant codes to build the tiered colour_profile.
-iris = { version = "0.1.0", path = "../iris" }
+iris = { version = "0.0.0", path = "../iris" }
 # CPU softbuffer compositor — hosts the viewer's event loop, chrome, paint primitives. Same dep shape as Photon's desktop block.
 fluor = { version = "0.0.2", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"] }
