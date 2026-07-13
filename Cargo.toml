@@ -16,4 +16,4 @@ vsf = { version = "0.9.2", path = "../vsf", features = ["inspect"] }
 # Sensor intake — decodes RAW/DNG to counts + gives us both DNG ColorMatrices and illuminant codes to build the tiered colour_profile.
 iris = { version = "0.0.0", path = "../iris" }
 # CPU softbuffer compositor — hosts the viewer's event loop, chrome, paint primitives. Same dep shape as Photon's desktop block.
-fluor = { version = "0.0.2", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"] }
+fluor = { version = "0.0.3", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"] }
