@@ -1,4 +1,4 @@
-//! Image loading + VSF conversion, used by the viewer. `load_any` decodes any supported source (VSF-Image passthrough, or camera RAW/DNG via iris) into a [`Decoded`] — a `SpectralImage` carrying its own tiered colour_profile; `to_linear` renders it, deriving the display matrix from that profile and baking the debayer bin + matrix into one integer pass (signed output); `write_vsf` saves the image.
+//! Image loading + VSF conversion, used by the viewer. `load_any` decodes any supported source (VSF-Image passthrough, or camera RAW/DNG via limbus) into a [`Decoded`] — a `SpectralImage` carrying its own tiered colour_profile; `to_linear` renders it, deriving the display matrix from that profile and baking the debayer bin + matrix into one integer pass (signed output); `write_vsf` saves the image.
 //!
 //! Colour, per the VERICHROME IDT taxonomy: the DNG path is an **Absolute IDT** — camera → XYZ → linear **VSF RGB** by straight matrix inversion, illuminant cast preserved, no chromatic adaptation (that's a Creative IDT and not welcome here). The STORED reference is VSF RGB (spectral 703/523/462nm primaries, Illuminant E) — never Rec.2020 or XYZ, which are display/rendering targets resolved at read time. **Relative (DSR)** rendering comes from a chameleon magic-9 when one exists for the source — that entry just gets elected first. The monitor is assumed Rec.2020 primaries / gamma-2 — an assumption that lives at DISPLAY (concatenation `VSF_RGB2REC2020 × stored`), NOT in the stored file. Sources without any matrix render raw-camera.
 //!
@@ -8,7 +8,7 @@ use std::path::Path;
 use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer};
 use vsf::{BitPackedTensor, Tensor};
 
-/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the rest go through iris (50+ RAW formats — this is a representative common subset, not exhaustive).
+/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the rest go through limbus (50+ RAW formats — this is a representative common subset, not exhaustive).
 pub const SUPPORTED_EXTS: &[&str] = &[
     "vsf", "dng", "arw", "cr2", "cr3", "nef", "nrw", "raf", "rw2", "orf", "pef", "srw", "raw", "tif", "tiff",
 ];
@@ -120,7 +120,7 @@ fn display_matrix(img: &SpectralImage) -> Option<[f32; 9]> {
     Some(disp)
 }
 
-/// Decode any supported source into a [`Decoded`]: VSF-Image files are read directly (no cmx yet); everything else is ingested through iris (camera RAW / DNG) with a camera→Rec.2020 cmx when a ColorMatrix1 is present.
+/// Decode any supported source into a [`Decoded`]: VSF-Image files are read directly (no cmx yet); everything else is ingested through limbus (camera RAW / DNG) with a camera→Rec.2020 cmx when a ColorMatrix1 is present.
 pub fn load_any(input: &Path) -> Result<Decoded, String> {
     match input.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("vsf") => {
@@ -133,9 +133,9 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     }
 }
 
-/// Camera RAW / DNG → [`Decoded`], in memory (no file written). Decodes via iris, packs the sensor plane as a `BitPackedTensor` at native bit depth, records the CFA as a channel-index tile, and derives the camera→Rec.2020 cmx from the DNG ColorMatrix1 when present (3-channel sources only).
+/// Camera RAW / DNG → [`Decoded`], in memory (no file written). Decodes via limbus, packs the sensor plane as a `BitPackedTensor` at native bit depth, records the CFA as a channel-index tile, and derives the camera→Rec.2020 cmx from the DNG ColorMatrix1 when present (3-channel sources only).
 pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
-    let (info, pixels) = iris::read_dng(input).ok_or_else(|| format!("{}: unable to decode", input.display()))?;
+    let (info, pixels) = limbus::read_dng(input).ok_or_else(|| format!("{}: unable to decode", input.display()))?;
 
     let bit_depth = if info.bitdepth >= 1 && info.bitdepth <= 16 { info.bitdepth } else { 16 };
 
