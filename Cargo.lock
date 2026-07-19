@@ -1324,8 +1324,8 @@ dependencies = [
 name = "limbus"
 version = "0.0.0"
 dependencies = [
- "bitvec",
  "rawler",
+ "rayon",
 ]
 
 [[package]]
@@ -2023,6 +2023,7 @@ version = "0.0.0"
 dependencies = [
  "fluor",
  "limbus",
+ "rayon",
  "vsf",
 ]
 
@@ -3038,6 +3039,7 @@ dependencies = [
  "libm",
  "num-complex",
  "num-traits",
+ "rayon",
  "spin",
 ]
 

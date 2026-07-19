@@ -4,8 +4,9 @@
 //!
 //! Matrix convention: opsin stays row-major throughout (row = output channel, `m[out*3 + in]`), matching the DNG ColorMatrix spec and this crate's `inv3`/`matmul3`/`build_coefs`. vsf::colour stores the SAME matrices column-major, so its numeric constants are pulled in via the `t3` transpose — one source of truth for the primaries, no convention clash.
 
+use rayon::prelude::*;
 use std::path::Path;
-use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer};
+use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
 use vsf::{BitPackedTensor, Tensor};
 
 /// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the rest go through limbus (50+ RAW formats — this is a representative common subset, not exhaustive).
@@ -205,6 +206,16 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         None
     };
 
+    // EXIF Orientation (tag 274) enters the translateration log verbatim — the camera's display-time claim, never applied to the sensor plane. Codes 2..=8 are real transforms; 1 (normal) and limbus's absent-sentinel 9 record nothing.
+    let view = (2..=8).contains(&info.orientation).then(|| ViewTransform {
+        space: "vsf_rgb_linear".to_string(),
+        ops: vec![ViewOp {
+            name: "orientation".to_string(),
+            class: IdtClass::Technical,
+            params: vec![info.orientation as f32],
+        }],
+    });
+
     let img = SpectralImage {
         width: info.width,
         height: info.height,
@@ -217,7 +228,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         model: info.model.trim_end_matches('\0').trim().to_string(),
         provenance: Provenance::default(),
         profile,
-        view: None,
+        view,
     };
 
     Ok(Decoded { img })
@@ -284,12 +295,83 @@ fn q_to_lin(acc: i64) -> i32 {
     ((acc + (1i64 << (QSHIFT - 1))) >> QSHIFT) as i32
 }
 
-/// Render to linear SIGNED interleaved RGB, white at 65535 — values outside 0..65535 are preserved (negative = read noise below black / out-of-Rec.2020-gamut; above = speculars past the illuminant peak), so exposure can recover them; the single display clamp happens at the encode boundary. Mosaic: each CFA tile → one output pixel (2:1 for a 2×2 Bayer). The debayer bin, the black/white normalisation, and the camera→Rec.2020 cmx are **baked into integer Q24 constants** — the per-pixel work is one `i64` multiply-accumulate per (sample × output) and a shift; no float touches a pixel (see [`build_coefs`]). Without a cmx the constants encode a plain channel-averaged bin (raw camera space). Planar sources take the first three channels.
-pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
+/// Inverse (gather) mapping of an EXIF orientation: DISPLAY pixel (dx, dy) → source pixel in the PRE-orientation `w × h` buffer. Identity for codes outside 2..=8. Shared by the display permute and the histogram's raw-sample lookup, so they can never disagree about which sensor tile a screen pixel shows.
+pub fn orientation_src(code: u16, w: usize, h: usize, dx: usize, dy: usize) -> (usize, usize) {
+    match code {
+        2 => (w - 1 - dx, dy),
+        3 => (w - 1 - dx, h - 1 - dy),
+        4 => (dx, h - 1 - dy),
+        5 => (dy, dx),
+        6 => (dy, h - 1 - dx),
+        7 => (w - 1 - dy, h - 1 - dx),
+        8 => (w - 1 - dy, dx),
+        _ => (dx, dy),
+    }
+}
+
+/// The EXIF orientation code from the view log: the `orientation` op's first param when present and a real transform (2..=8), else 1 (display as stored).
+pub fn orientation_code(img: &SpectralImage) -> u16 {
+    img.view
+        .as_ref()
+        .and_then(|v| v.ops.iter().find(|op| op.name == "orientation"))
+        .and_then(|op| op.params.first())
+        .map(|&p| p as u16)
+        .filter(|c| (2..=8).contains(c))
+        .unwrap_or(1)
+}
+
+/// Apply an EXIF orientation code to an interleaved 3-channel buffer — display-time only, the stored sensor plane is never touched. Codes 5..=8 swap the output dims; anything outside 2..=8 passes through unmoved. Mapping is (source → display): 2 mirror-H, 3 rotate 180, 4 mirror-V, 5 transpose, 6 rotate 90 CW, 7 transverse, 8 rotate 90 CCW — implemented as the INVERSE gather (each destination pixel fetches its source) so destination rows are independent and split across the rayon pool.
+fn apply_orientation(w: usize, h: usize, rgb: Vec<i32>, code: u16) -> (usize, usize, Vec<i32>) {
+    if !(2..=8).contains(&code) {
+        return (w, h, rgb);
+    }
+    let (ow, oh) = if code >= 5 { (h, w) } else { (w, h) };
+    let mut out = vec![0i32; rgb.len()];
+    out.par_chunks_mut(ow * 3).enumerate().for_each(|(dy, out_row)| {
+        for dx in 0..ow {
+            let (sx, sy) = orientation_src(code, w, h, dx, dy);
+            let src = (sy * w + sx) * 3;
+            out_row[dx * 3..dx * 3 + 3].copy_from_slice(&rgb[src..src + 3]);
+        }
+    });
+    (ow, oh, out)
+}
+
+/// Render to linear SIGNED interleaved RGB, white at 65535 — values outside 0..65535 are preserved (negative = read noise below black / out-of-Rec.2020-gamut; above = speculars past the illuminant peak), so exposure can recover them; the single display clamp happens at the encode boundary. Mosaic: each CFA tile → one output pixel (2:1 for a 2×2 Bayer). The debayer bin, the black/white normalisation, and the camera→Rec.2020 cmx are **baked into integer Q24 constants** — the per-pixel work is one `i64` multiply-accumulate per (sample × output) and a shift; no float touches a pixel (see [`build_coefs`]). Without a cmx the constants encode a plain channel-averaged bin (raw camera space). Planar sources take the first three channels. Last, the view log's `orientation` op (EXIF tag 274, recorded at ingest) permutes the OUTPUT buffer — display honours the camera's claim while the stored plane stays exactly as captured.
+///
+/// `clip_show` is lumis's `preview_sub` indicator at opsin's levels, applied to raw counts BEFORE every other step: a sample at/above its channel's white level zeroes (blown highlights render DARK, channel-wise — a red-only clip drops only red), and a sample below its black level saturates to container max (crushed shadows render BLOWN). Display-only; the stored plane never changes.
+pub fn to_linear(dec: &Decoded, clip_show: bool) -> Result<(usize, usize, Vec<i32>), String> {
     let img = &dec.img;
     // Display matrix derived fresh from the stored VSF-RGB profile: VSF_RGB2REC2020 × elected entry, illuminant-normalized. None ⇒ raw-camera bin.
     let cmx = display_matrix(img);
     let counts = img.samples.unpack_u16();
+
+    let clip_levels: Option<Vec<(u16, u16)>> = if clip_show {
+        let k = img.channel_count();
+        let mut lv = Vec::with_capacity(k);
+        for ch in 0..k {
+            lv.push((level(&img.black, ch, k, "black")?.round() as u16, level(&img.white, ch, k, "white")?.round() as u16));
+        }
+        Some(lv)
+    } else {
+        None
+    };
+    // Identity when off; the lumis inversion when on.
+    let clip_v = |v: u16, ch: usize| -> u16 {
+        match &clip_levels {
+            Some(lv) => {
+                let (black, white) = lv[ch];
+                if v >= white {
+                    0
+                } else if v < black {
+                    u16::MAX
+                } else {
+                    v
+                }
+            }
+            None => v,
+        }
+    };
 
     let (out_w, out_h, rgb) = match &img.layout {
         PlaneLayout::Mosaic { cfa } => {
@@ -306,26 +388,27 @@ pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
             }
             let (rows, bias) = build_coefs(img, &cmx, &tile_count)?;
 
+            // Output rows are independent (each reads only its own tile rows), so the pass splits across the rayon pool.
             let mut rgb = vec![0i32; ow * oh * 3];
-            for by in 0..oh {
+            rgb.par_chunks_mut(ow * 3).enumerate().for_each(|(by, out_row)| {
                 for bx in 0..ow {
                     let mut acc = [-bias[0], -bias[1], -bias[2]];
                     for ty in 0..th {
                         let row = (by * th + ty) * img.width + bx * tw;
                         for tx in 0..tw {
-                            let c = &rows[cfa.data[ty * tw + tx] as usize].coef;
-                            let v = counts[row + tx] as i64;
+                            let ch = cfa.data[ty * tw + tx] as usize;
+                            let c = &rows[ch].coef;
+                            let v = clip_v(counts[row + tx], ch) as i64;
                             acc[0] += c[0] * v;
                             acc[1] += c[1] * v;
                             acc[2] += c[2] * v;
                         }
                     }
-                    let out = (by * ow + bx) * 3;
-                    rgb[out] = q_to_lin(acc[0]);
-                    rgb[out + 1] = q_to_lin(acc[1]);
-                    rgb[out + 2] = q_to_lin(acc[2]);
+                    out_row[bx * 3] = q_to_lin(acc[0]);
+                    out_row[bx * 3 + 1] = q_to_lin(acc[1]);
+                    out_row[bx * 3 + 2] = q_to_lin(acc[2]);
                 }
-            }
+            });
             (ow, oh, rgb)
         }
         PlaneLayout::Planar => {
@@ -335,17 +418,100 @@ pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
             }
             let (rows, bias) = build_coefs(img, &cmx, &vec![1f64; 3])?;
             let n = img.width * img.height;
+            let w = img.width;
             let mut rgb = vec![0i32; n * 3];
-            for i in 0..n {
-                let cam = [counts[i] as i64, counts[n + i] as i64, counts[2 * n + i] as i64];
-                for o in 0..3 {
-                    let acc = rows[0].coef[o] * cam[0] + rows[1].coef[o] * cam[1] + rows[2].coef[o] * cam[2] - bias[o];
-                    rgb[i * 3 + o] = q_to_lin(acc);
+            rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, out_row)| {
+                for x in 0..w {
+                    let i = y * w + x;
+                    let cam = [clip_v(counts[i], 0) as i64, clip_v(counts[n + i], 1) as i64, clip_v(counts[2 * n + i], 2) as i64];
+                    for o in 0..3 {
+                        let acc = rows[0].coef[o] * cam[0] + rows[1].coef[o] * cam[1] + rows[2].coef[o] * cam[2] - bias[o];
+                        out_row[x * 3 + o] = q_to_lin(acc);
+                    }
                 }
-            }
+            });
             (img.width, img.height, rgb)
         }
     };
 
-    Ok((out_w, out_h, rgb))
+    Ok(apply_orientation(out_w, out_h, rgb, orientation_code(img)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2×1 buffer: pixel A left, pixel B right, distinct per-channel values.
+    fn two_px() -> Vec<i32> {
+        vec![1, 2, 3, 4, 5, 6]
+    }
+
+    #[test]
+    fn orientation_identity_and_invalid_pass_through() {
+        for code in [0, 1, 9, 42] {
+            let (w, h, out) = apply_orientation(2, 1, two_px(), code);
+            assert_eq!((w, h), (2, 1));
+            assert_eq!(out, two_px());
+        }
+    }
+
+    #[test]
+    fn orientation_transforms_map_corners_correctly() {
+        // (code, expected dims, expected buffer) for the 2×1 [A B] source.
+        let a = [1, 2, 3];
+        let b = [4, 5, 6];
+        let cat = |first: &[i32; 3], second: &[i32; 3]| [first.as_slice(), second.as_slice()].concat();
+        let cases = [
+            (2, (2, 1), cat(&b, &a)),  // mirror-H: [B A]
+            (3, (2, 1), cat(&b, &a)),  // rotate 180 of a single row = mirror-H
+            (4, (2, 1), cat(&a, &b)),  // mirror-V of a single row = unchanged
+            (5, (1, 2), cat(&a, &b)),  // transpose: column [A; B]
+            (6, (1, 2), cat(&a, &b)),  // rotate 90 CW: column [A; B] (h=1 so no flip)
+            (7, (1, 2), cat(&b, &a)),  // transverse: column [B; A]
+            (8, (1, 2), cat(&b, &a)),  // rotate 90 CCW: column [B; A]
+        ];
+        for (code, dims, expect) in cases {
+            let (w, h, out) = apply_orientation(2, 1, two_px(), code);
+            assert_eq!((w, h), dims, "dims for code {code}");
+            assert_eq!(out, expect, "buffer for code {code}");
+        }
+    }
+
+    #[test]
+    fn to_linear_honours_view_orientation() {
+        // 2×1 planar RGB, uncharacterized (identity render), tagged rotate-90-CCW (code 8): display comes back 1×2 with the right pixel on top. The stored plane is untouched — only the render output moves.
+        let img = SpectralImage {
+            width: 2,
+            height: 1,
+            channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+            layout: PlaneLayout::Planar,
+            samples: BitPackedTensor::pack(16, vec![3, 1, 2], &[10u16, 20, 30, 40, 50, 60]),
+            black: vec![0.; 3],
+            white: vec![65535.; 3],
+            make: String::new(),
+            model: String::new(),
+            provenance: Provenance::default(),
+            profile: None,
+            view: Some(ViewTransform {
+                space: "vsf_rgb_linear".to_string(),
+                ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
+            }),
+        };
+        let (w, h, lin) = to_linear(&Decoded { img }, false).unwrap();
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
+    }
+
+    #[test]
+    fn rotate90_cw_puts_top_right_first() {
+        // 2×2 source [A B; C D], code 6 (rotate 90 CW) → [C A; D B].
+        let src: Vec<i32> = (0..12).collect(); // A=0.., B=3.., C=6.., D=9..
+        let (w, h, out) = apply_orientation(2, 2, src, 6);
+        assert_eq!((w, h), (2, 2));
+        let px = |i: usize| &out[i * 3..i * 3 + 3];
+        assert_eq!(px(0), &[6, 7, 8]); // C
+        assert_eq!(px(1), &[0, 1, 2]); // A
+        assert_eq!(px(2), &[9, 10, 11]); // D
+        assert_eq!(px(3), &[3, 4, 5]); // B
+    }
 }
