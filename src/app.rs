@@ -14,7 +14,7 @@ use fluor::pixel::{Blend, BlendMode};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::panel::{Observer, PanelTools, CHART_RES, HIST_BINS};
+use crate::panel::{Observer, PanelTools, HIST_OVERSAMPLE};
 
 /// Empty-canvas backdrop behind/around the image: opaque near-black in α+darkness packing (α=0xFF, darkness ≈ high = dark visible).
 const BACKDROP: u32 = 0xFF_F2_F2_F2;
@@ -28,13 +28,6 @@ const fn argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
 const HAIRLINE: u32 = argb(0x60, 0x60, 0x60, 0xFF);
 /// Panel label text (EV readout, button labels).
 const TEXT_GREY: u32 = argb(0xE0, 0xE0, 0xE0, 0xFF);
-/// Histogram channel colours (translucent so overlaps read additively under the front-to-back blend).
-const HIST_R: u32 = argb(0xE0, 0x40, 0x40, 0x90);
-const HIST_G: u32 = argb(0x40, 0xE0, 0x40, 0x90);
-const HIST_B: u32 = argb(0x50, 0x50, 0xF0, 0x90);
-/// Chromaticity chart curves.
-const LOCUS: u32 = argb(0xB0, 0xB0, 0xB0, 0xFF);
-const PLANCK: u32 = argb(0xE0, 0xA0, 0x40, 0xFF);
 
 /// Base tone (visible RGB) for the top-bar noise texture — the controls-strip grey (`WINDOW_CONTROLS_BG` ≈ 0x1E1E1E visible) so the textured fill and the flat control fill sit at the same value.
 const BAR_TEXTURE_BASE: u32 = 0x00_1E_1E_1E;
@@ -66,8 +59,21 @@ pub struct OpsinApp {
     dir_list: Vec<PathBuf>,
     /// Index into `dir_list` of the image currently shown.
     dir_idx: usize,
-    /// Linear SIGNED Rec.2020 of the current image (white = 65535, out-of-range preserved) — kept so exposure re-encodes without re-decoding, and so the EV multiply can recover clipped-at-display speculars and sub-black noise.
+    /// Linear SIGNED Rec.2020 of the current image (white = 65535, out-of-range preserved) — kept so exposure re-encodes without re-decoding, so the EV multiply can recover clipped-at-display speculars and sub-black noise, and as the chart's per-frame chromaticity source.
     lin: Vec<i32>,
+    /// The raw sensor view — the histogram's per-frame source.
+    raw: RawView,
+    /// Histogram x-axis: false = linear counts, true = log2 stops. Y-axis likewise: linear count vs log2 count. Independent pills; every combination is a labelled remap, never a silent curve.
+    hist_xlog: bool,
+    hist_ylog: bool,
+    /// Clip indicator on/off — lumis's raw inversion in [`crate::convert::to_linear`]: blown highlights render dark, crushed shadows render blown, channel-wise.
+    clip_show: bool,
+    /// The retained decode, so the clip toggle can re-render the linear pipe without touching disk. `None` only in the empty drop-target state.
+    dec: Option<crate::convert::Decoded>,
+    /// The histogram's axis pills + the clip toggle, overlaid top-right of the histogram rect. Labels read the CURRENT mode.
+    btn_xscale: fluor::widgets::Button,
+    btn_yscale: fluor::widgets::Button,
+    btn_clip: fluor::widgets::Button,
     /// Exposure in stops (gain = 2^ev in linear). ±[EV_RANGE].
     ev: f32,
     /// The panel's exposure slider (fluor widget, value 0..1 ↔ −EV_RANGE..+EV_RANGE).
@@ -95,6 +101,9 @@ pub struct OpsinApp {
 /// Grace for X11's synthetic key-Release while a key is actually held (photon's chord constant).
 const CHORD_RELEASE_GRACE: Duration = Duration::from_millis(40);
 
+/// Clip pill fill while the indicator is live — a warning red so the false-colour preview can't be mistaken for the image.
+const CLIP_ON_FILL: u32 = argb(0x8B, 0x30, 0x30, 0xFF);
+
 /// Exposure slider half-range in stops.
 const EV_RANGE: f32 = (1 << 2) as f32;
 
@@ -107,38 +116,199 @@ struct PanelRects {
     chart: (usize, usize, usize, usize),
 }
 
-/// One decoded image, ready to install into the viewer. Produced by [`load_image`], consumed by `open` (construction) and `load_current` (navigation). Keeps the linear RGB so exposure changes re-encode without re-decoding the source.
+/// One decoded image, ready to install into the viewer. Produced by [`load_image`], consumed by `open` (construction) and `install` (navigation). Keeps the linear RGB so exposure changes re-encode without re-decoding the source, and the raw sensor view so the histogram bins actual counts per frame.
 struct Loaded {
     pixels: Vec<u32>,
     lin: Vec<i32>,
     w: usize,
     h: usize,
-    tools: PanelTools,
+    raw: RawView,
+    /// The decode itself, retained so the clip toggle re-renders without touching disk. `None` only for the empty drop-target state.
+    dec: Option<crate::convert::Decoded>,
     title: String,
 }
 
-/// Linear signed Rec.2020 → gamma-2 u8 visible → darkness-packed u32. Exposure is a Q16 integer multiply — the gain constant is the only float, precomputed once (a scalar commutes with the cmx, shifts no hue). The SINGLE display clamp in the whole pipe follows the multiply: negative light and beyond-white cannot display, and the bare integer cast would wrap (a −1 shadow pixel would speckle full-white), so the clamp is the u16 container boundary, applied at the last possible moment — everything before it is signed and recoverable. Then the EV-independent sqrt LUT (64Ki sqrts once) maps to display bytes.
-fn encode_pixels(lin: &[i32], ev: f32) -> Vec<u32> {
-    const GAIN_SHIFT: u32 = 1 << 4;
-    let gain = (2f64.powf(ev as f64) * (1u64 << GAIN_SHIFT) as f64).round() as i64;
-    let mut lut = [0u32; 65536];
-    for (v, out) in lut.iter_mut().enumerate() {
-        *out = 255 - ((v as f32 / 65535.).sqrt() * 255.) as u32;
-    }
-    let mut pixels = Vec::with_capacity(lin.len() / 3);
-    for px in lin.chunks_exact(3) {
-        let ch = |v: i32| lut[((v as i64 * gain) >> GAIN_SHIFT).clamp(0, 65535) as usize];
-        pixels.push(0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2]));
-    }
-    pixels
+/// The raw sensor plane retained for the view-live histogram: unpacked counts, CFA channel routing, black/white levels, and the orientation bridge from display coords back to sensor tiles. Everything the per-frame binning needs, nothing borrowed from the decode.
+struct RawView {
+    /// Sensor counts — mosaic `[h, w]`, or planar `[k, h, w]` planes.
+    counts: Vec<u16>,
+    /// Sensor plane width (row stride into `counts`).
+    sensor_w: usize,
+    /// CFA tile dims + channel index per cell; `cfa` empty ⇒ planar.
+    tile_w: usize,
+    tile_h: usize,
+    cfa: Vec<u8>,
+    /// Plane stride (w·h) for planar sources; 0 for mosaic.
+    planar_n: usize,
+    /// Per-display-channel black/white in raw counts (scalar levels broadcast).
+    black: [f32; 3],
+    white: [f32; 3],
+    /// Sensor bit depth — the stops span of the log view.
+    bits: usize,
+    /// EXIF orientation code the display applied; [`crate::convert::orientation_src`] inverts it per pixel.
+    orient: u16,
+    /// PRE-orientation display dims (the debayer-bin output the orientation permuted).
+    pre_w: usize,
+    pre_h: usize,
+    /// Per-channel sample census of one CFA tile (Bayer: G = 2) — spread deposits weight by 1/census so green's double sampling stops inflating it (lumis's equal-energy channel weighting, generalized to any tile).
+    census: [f32; 3],
 }
 
-/// Decode `path` (any supported format) into display pixels + panel tools + a title. Encoded at EV 0; the caller re-encodes if it's carrying exposure over.
-fn load_image(path: &Path) -> Result<Loaded, String> {
+impl RawView {
+    fn empty() -> Self {
+        Self { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [1.; 3], bits: 1, orient: 1, pre_w: 0, pre_h: 0, census: [1.; 3] }
+    }
+
+    fn from_image(img: &vsf::spectral_image::SpectralImage) -> Self {
+        let level = |l: &[f32], i: usize| if l.len() == 1 { l[0] } else { l.get(i).copied().unwrap_or_else(|| l.first().copied().unwrap_or(0.)) };
+        let black = [level(&img.black, 0), level(&img.black, 1), level(&img.black, 2)];
+        let white = [level(&img.white, 0), level(&img.white, 1), level(&img.white, 2)];
+        let bits = (img.bit_depth() as usize).clamp(1, 16);
+        let orient = crate::convert::orientation_code(img);
+        match &img.layout {
+            vsf::spectral_image::PlaneLayout::Mosaic { cfa } => {
+                let (tile_h, tile_w) = (cfa.shape[0], cfa.shape[1]);
+                let mut census = [0f32; 3];
+                for &c in &cfa.data {
+                    census[(c as usize).min(2)] += 1.;
+                }
+                for c in &mut census {
+                    *c = c.max(1.);
+                }
+                Self {
+                    counts: img.samples.unpack_u16(),
+                    sensor_w: img.width,
+                    tile_w,
+                    tile_h,
+                    cfa: cfa.data.clone(),
+                    planar_n: 0,
+                    black,
+                    white,
+                    bits,
+                    orient,
+                    pre_w: img.width / tile_w,
+                    pre_h: img.height / tile_h,
+                    census,
+                }
+            }
+            vsf::spectral_image::PlaneLayout::Planar => Self {
+                counts: img.samples.unpack_u16(),
+                sensor_w: img.width,
+                tile_w: 1,
+                tile_h: 1,
+                cfa: Vec::new(),
+                planar_n: img.width * img.height,
+                black,
+                white,
+                bits,
+                orient,
+                pre_w: img.width,
+                pre_h: img.height,
+                census: [1.; 3],
+            },
+        }
+    }
+
+    /// Tally every raw sample under display pixel (dx, dy) into the per-ADC-code table: orientation bridge → sensor tile → CFA channel routing (channels past 3 fold onto blue pending the spectral resolve). No axis math here — codes are exact, and [`Self::spread`] owns the mapping.
+    #[inline]
+    fn collect_codes(&self, dx: usize, dy: usize, codes: &mut [[u32; 3]]) {
+        let (sx, sy) = crate::convert::orientation_src(self.orient, self.pre_w, self.pre_h, dx, dy);
+        if self.planar_n > 0 {
+            let idx = sy * self.sensor_w + sx;
+            for ch in 0..3 {
+                codes[self.counts[ch * self.planar_n + idx] as usize][ch] += 1;
+            }
+        } else {
+            let base = sy * self.tile_h * self.sensor_w + sx * self.tile_w;
+            for ty in 0..self.tile_h {
+                for tx in 0..self.tile_w {
+                    let ch = (self.cfa[ty * self.tile_w + tx] as usize).min(2);
+                    codes[self.counts[base + ty * self.sensor_w + tx] as usize][ch] += 1;
+                }
+            }
+        }
+    }
+
+    /// Equal-energy spread: each ADC code deposits its census-weighted count uniformly over the bin interval its quantization step `[v, v+1)` covers through the active axis — exact density on both axes, comb-free, deterministic (lumis's `bin_span` idea taken to its conclusion: the interval IS the span, deposited rather than divided, so no duty-cycle/log-order weirdness survives). Below-black collapses into bin 0 and at/above-white into the last bin — the clip spikes.
+    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize) -> Vec<[f32; 3]> {
+        let mut dens = vec![[0f32; 3]; bins];
+        for ch in 0..3 {
+            let black = self.black[ch];
+            let range = (self.white[ch] - black).max(1.);
+            let frac = |x: f32| -> f32 {
+                if x_log {
+                    if x <= 0. { 0. } else { (1. + (x / range).log2() / self.bits as f32).clamp(0., 1.) }
+                } else {
+                    (x / range).clamp(0., 1.)
+                }
+            };
+            let weight = 1. / self.census[ch];
+            // Effective quantization step: files re-scaled after capture (e.g. a 10-bit frame stretched
+            // into 16-bit codes by older lumis saves) only populate every Nth code, and depositing over
+            // [v, v+1) would re-comb them. The MODE of the gaps between occupied codes is the honest
+            // estimator: a native file's mode is 1 (identical behaviour, bit for bit), a stretched file's
+            // is its stretch factor. Irregular stretches (65536/1023 alternates 64/65) leave sub-bin
+            // residue only. Scene-content gaps can't skew a mode the way a mean or a max would.
+            let step = {
+                let mut gap_hist = [0u32; 257];
+                let mut prev: Option<usize> = None;
+                for (v, code) in codes.iter().enumerate() {
+                    if code[ch] > 0 {
+                        if let Some(p) = prev {
+                            gap_hist[(v - p).min(256)] += 1;
+                        }
+                        prev = Some(v);
+                    }
+                }
+                gap_hist.iter().enumerate().skip(1).max_by_key(|e| *e.1).map(|(g, _)| g).unwrap_or(1).max(1) as f32
+            };
+            for (v, code) in codes.iter().enumerate() {
+                let c = code[ch];
+                if c == 0 {
+                    continue;
+                }
+                let b0 = frac(v as f32 - black) * bins as f32;
+                let b1 = (frac(v as f32 + step - black) * bins as f32).max(b0);
+                let total = c as f32 * weight;
+                let lo = (b0 as usize).min(bins - 1);
+                if b1 - b0 <= f32::EPSILON {
+                    // Degenerate interval — the clip collapses (≤ black, ≥ white) land whole in one bin.
+                    dens[lo][ch] += total;
+                    continue;
+                }
+                let hi = (b1.ceil() as usize).clamp(lo + 1, bins);
+                let inv = total / (b1 - b0);
+                for (b, d) in dens[lo..hi].iter_mut().enumerate() {
+                    let bf = (lo + b) as f32;
+                    d[ch] += (b1.min(bf + 1.) - b0.max(bf)).max(0.) * inv;
+                }
+            }
+        }
+        dens
+    }
+}
+
+/// Linear signed Rec.2020 → gamma-2 u8 visible → darkness-packed u32. Exposure is a Q16 integer multiply — the gain constant is the only float, precomputed once (a scalar commutes with the cmx, shifts no hue). The SINGLE display clamp in the whole pipe follows the multiply: negative light and beyond-white cannot display, and the bare integer cast would wrap (a −1 shadow pixel would speckle full-white), so the clamp is the u16 container boundary, applied at the last possible moment — everything before it is signed and recoverable. Then the EV-independent sqrt LUT (64Ki sqrts, built ONCE per process — it never varies with EV) maps to display bytes. Each output pixel depends only on its own three samples, so the pass splits across the rayon pool — this runs on every exposure-slider tick and must stay interactive at full resolution.
+fn encode_pixels(lin: &[i32], ev: f32) -> Vec<u32> {
+    use rayon::prelude::*;
+    const GAIN_SHIFT: u32 = 1 << 4;
+    static LUT: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| (0..65536u32).map(|v| 255 - ((v as f32 / 65535.).sqrt() * 255.) as u32).collect());
+    let gain = (2f64.powf(ev as f64) * (1u64 << GAIN_SHIFT) as f64).round() as i64;
+    lin.par_chunks_exact(3)
+        .map(|px| {
+            let ch = |v: i32| lut[((v as i64 * gain) >> GAIN_SHIFT).clamp(0, 65535) as usize];
+            0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2])
+        })
+        .collect()
+}
+
+/// Decode `path` (any supported format) into display pixels + the raw sensor view + a title, rendering with the caller's live clip-indicator state. Encoded at EV 0; the caller re-encodes if it's carrying exposure over.
+fn load_image(path: &Path, clip_show: bool) -> Result<Loaded, String> {
     let dec = crate::convert::load_any(path)?;
-    let (w, h, lin) = crate::convert::to_linear(&dec)?;
+    let (w, h, lin) = crate::convert::to_linear(&dec, clip_show)?;
     let pixels = encode_pixels(&lin, 0.);
-    let tools = PanelTools::build(&pixels, &lin, w, h, &Observer::stock());
+    let raw = RawView::from_image(&dec.img);
     let title = format!(
         "opsin — {} ({}×{}, {} ch, {}-bit)",
         path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -147,7 +317,7 @@ fn load_image(path: &Path) -> Result<Loaded, String> {
         dec.img.channel_count(),
         dec.img.bit_depth()
     );
-    Ok(Loaded { pixels, lin, w, h, tools, title })
+    Ok(Loaded { pixels, lin, w, h, raw, dec: Some(dec), title })
 }
 
 /// Sorted list of supported images in `dir`.
@@ -188,7 +358,8 @@ impl OpsinApp {
             lin: Vec::new(),
             w: 0,
             h: 0,
-            tools: PanelTools::build(&[], &[], 0, 0, &Observer::stock()),
+            raw: RawView::empty(),
+            dec: None,
             title: "opsin — drop an image".to_string(),
         };
         Self::from_loaded(loaded, Vec::new(), 0)
@@ -201,7 +372,7 @@ impl OpsinApp {
             return Err(format!("{}: no supported images", path.display()));
         }
 
-        let loaded = load_image(&dir_list[dir_idx])?;
+        let loaded = load_image(&dir_list[dir_idx], false)?;
         Ok(Self::from_loaded(loaded, dir_list, dir_idx))
     }
 
@@ -217,6 +388,11 @@ impl OpsinApp {
         let ev_slider = fluor::widgets::Slider::new(&mut hit_counter, 0., 0., 1., 1., 0.5);
         let btn_one = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "1:1");
         let btn_fit = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Fit");
+        let btn_xscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "X Lin");
+        let btn_yscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Y Lin");
+        let btn_clip = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Clip");
+
+        let tools = PanelTools::new(&loaded.pixels, loaded.w, loaded.h);
 
         Self {
             title: loaded.title,
@@ -233,10 +409,18 @@ impl OpsinApp {
             view_h: 800,
             panel_frac: 7. / (1 << 5) as f32,
             divider_drag: false,
-            tools: loaded.tools,
+            tools,
             dir_list,
             dir_idx,
             lin: loaded.lin,
+            raw: loaded.raw,
+            hist_xlog: false,
+            hist_ylog: false,
+            clip_show: false,
+            dec: loaded.dec,
+            btn_xscale,
+            btn_yscale,
+            btn_clip,
             ev: 0.,
             ev_slider,
             btn_one,
@@ -362,13 +546,27 @@ impl OpsinApp {
 
     /// Center the main view on the navigator-space point under the cursor (clamped to the thumb, so dragging past the edge pins to the edge). The navigator IS the fraction space — the cursor's thumb fractions become the anchored composition directly.
     fn nav_center(&mut self, viewport: Viewport, cx: f32, cy: f32) {
-        let (nx, ny, nw, nh) = self.panel_rects(viewport).nav;
-        if nw == 0 || nh == 0 || self.zoom_rel <= 0. {
+        let Some((fx, fy, fw, fh)) = self.nav_fit(viewport) else {
+            return;
+        };
+        if self.zoom_rel <= 0. {
             return;
         }
         // Clamp justified: external drag input — the cursor can leave the thumb entirely; pinning to the edge is the intended behavior, not bug-hiding.
-        self.cx_frac = ((cx - nx as f32) / nw as f32).clamp(0., 1.);
-        self.cy_frac = ((cy - ny as f32) / nh as f32).clamp(0., 1.);
+        self.cx_frac = ((cx - fx as f32) / fw as f32).clamp(0., 1.);
+        self.cy_frac = ((cy - fy as f32) / fh as f32).clamp(0., 1.);
+    }
+
+    /// The aspect-fitted thumb placement inside the navigator rect (letterboxed, centered) — blit, view-rect overlay, and cursor mapping ALL share this rect, so the navigator never stretches and clicks land exactly where they look. `None` when the panel or the image has no extent.
+    fn nav_fit(&self, viewport: Viewport) -> Option<(usize, usize, usize, usize)> {
+        let (nx, ny, nw, nh) = self.panel_rects(viewport).nav;
+        let (tw, th) = (self.tools.thumb_w, self.tools.thumb_h);
+        if nw == 0 || nh == 0 || tw == 0 || th == 0 {
+            return None;
+        }
+        let fw = nw.min(nh * tw / th).max(1);
+        let fh = (fw * th / tw).clamp(1, nh);
+        Some((nx + (nw - fw) / 2, ny + (nh - fh) / 2, fw, fh))
     }
 
     /// Apply the slider's 0..1 value as stops and re-encode the display pixels. The panel thumbnail tracks (cheap); histogram/scatter stay on the un-exposed linear data — they describe the capture, not the view.
@@ -383,15 +581,17 @@ impl OpsinApp {
         ctx.window.request_redraw();
     }
 
-    /// Swap the decoded image into the view: title, pixels, dims, panel tools, redraw. Same dimensions (and no rotation model yet, so dims are the whole test) ⇒ the view state carries over — pan, zoom, and exposure stay put so stepping through a burst or LED sequence compares like with like. Different dimensions ⇒ refit and reset exposure.
+    /// Swap the decoded image into the view: title, pixels, dims, panel tools, redraw. Same dimensions ⇒ the view state carries over — pan, zoom, and exposure stay put so stepping through a burst or LED sequence compares like with like. Different dimensions ⇒ refit and reset exposure. Dims arrive from `to_linear` with EXIF orientation already applied, so they remain the whole test — a 90°-tagged frame in a landscape burst lands portrait and correctly refits.
     fn install(&mut self, loaded: Loaded, ctx: &mut Context) {
         let same_geometry = loaded.w == self.img_w && loaded.h == self.img_h && self.img_w > 0;
         self.chrome.set_title(&loaded.title);
         self.title = loaded.title;
         self.img_w = loaded.w;
         self.img_h = loaded.h;
-        self.tools = loaded.tools;
+        self.tools = PanelTools::new(&loaded.pixels, loaded.w, loaded.h);
         self.lin = loaded.lin;
+        self.raw = loaded.raw;
+        self.dec = loaded.dec;
         if same_geometry && self.ev.abs() > 1e-4 {
             // Carry the exposure into the new frame (loaded.pixels were encoded at EV 0).
             self.pixels = encode_pixels(&self.lin, self.ev);
@@ -416,7 +616,7 @@ impl OpsinApp {
         let mut idx = self.dir_idx;
         for _ in 0..n {
             idx = ((idx as isize + delta).rem_euclid(n as isize)) as usize;
-            match load_image(&self.dir_list[idx]) {
+            match load_image(&self.dir_list[idx], self.clip_show) {
                 Ok(loaded) => {
                     self.dir_idx = idx;
                     self.install(loaded, ctx);
@@ -429,7 +629,7 @@ impl OpsinApp {
 
     /// Open a path dropped onto the window: rebuild the folder list around it so arrow-nav works from there, then show it. Unsupported / undecodable drops are logged and ignored (current image stays).
     fn show_path(&mut self, path: &Path, ctx: &mut Context) {
-        match load_image(path) {
+        match load_image(path, self.clip_show) {
             Ok(loaded) => {
                 let (list, idx) = dir_list_for(path);
                 self.dir_list = list;
@@ -450,16 +650,22 @@ impl OpsinApp {
         }
         let out = src.with_extension("vsf");
         let mut dec = crate::convert::load_any(src)?;
-        // Record the live exposure as a Technical view op (a scalar shifts no hue) — the translateration log, replayed on reopen. EV 0 leaves the section omitted.
+        // Record the live exposure as a Technical view op (a scalar shifts no hue) — APPENDED to the translateration log, so the ingest-recorded orientation op rides ahead of it. EV 0 adds nothing (and an op-less log was never created).
         if self.ev.abs() > 1e-4 {
-            dec.img.view = Some(vsf::spectral_image::ViewTransform {
-                space: "vsf_rgb_linear".to_string(),
-                ops: vec![vsf::spectral_image::ViewOp {
-                    name: "exposure".to_string(),
-                    class: vsf::spectral_image::IdtClass::Technical,
-                    params: vec![self.ev],
-                }],
-            });
+            let op = vsf::spectral_image::ViewOp {
+                name: "exposure".to_string(),
+                class: vsf::spectral_image::IdtClass::Technical,
+                params: vec![self.ev],
+            };
+            match &mut dec.img.view {
+                Some(v) => v.ops.push(op),
+                None => {
+                    dec.img.view = Some(vsf::spectral_image::ViewTransform {
+                        space: "vsf_rgb_linear".to_string(),
+                        ops: vec![op],
+                    })
+                }
+            }
         }
         crate::convert::write_vsf(&dec.img, &out)?;
         Ok(out)
@@ -571,10 +777,7 @@ impl OpsinApp {
 
     /// If (cx, cy) lands in the navigator's drawn thumbnail, return the image coords it points at.
     fn nav_hit(&self, viewport: Viewport, cx: f32, cy: f32) -> Option<(f32, f32)> {
-        let (nx, ny, nw, nh) = self.panel_rects(viewport).nav;
-        if nw == 0 || nh == 0 {
-            return None;
-        }
+        let (nx, ny, nw, nh) = self.nav_fit(viewport)?;
         let fx = (cx - nx as f32) / nw as f32;
         let fy = (cy - ny as f32) / nh as f32;
         if !(0.0..1.).contains(&fx) || !(0.0..1.).contains(&fy) {
@@ -591,33 +794,14 @@ fn put(target: &mut [u32], buf_w: usize, x: usize, y: usize, colour: u32) {
     target[i] = target[i].under(colour, BlendMode::Normal);
 }
 
-/// Plot a polyline as densely-interpolated 1px dots — fine for the panel's small charts, no AA pretensions yet.
-fn plot_polyline(target: &mut [u32], buf_w: usize, pts: &[(f32, f32)], rect: (usize, usize, usize, usize), colour: u32) {
-    let (rx, ry, rw, rh) = rect;
-    if rw == 0 || rh == 0 {
-        return;
-    }
-    let to_px = |p: (f32, f32)| (rx as f32 + p.0 * (rw - 1) as f32, ry as f32 + p.1 * (rh - 1) as f32);
-    for pair in pts.windows(2) {
-        let (x0, y0) = to_px(pair[0]);
-        let (x1, y1) = to_px(pair[1]);
-        let steps = ((x1 - x0).abs().max((y1 - y0).abs()).ceil() as usize).max(1);
-        for s in 0..=steps {
-            let t = s as f32 / steps as f32;
-            let x = (x0 + (x1 - x0) * t) as usize;
-            let y = (y0 + (y1 - y0) * t) as usize;
-            if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
-                put(target, buf_w, x, y, colour);
-            }
-        }
-    }
-}
-
 impl Container for OpsinApp {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn fluor::host::widget::Widget)) {
         self.chrome.visit(f);
         f(&mut self.btn_one);
         f(&mut self.btn_fit);
+        f(&mut self.btn_xscale);
+        f(&mut self.btn_yscale);
+        f(&mut self.btn_clip);
     }
 }
 
@@ -684,7 +868,7 @@ impl FluorApp for OpsinApp {
                 let hit = self.chrome.hit_at(cx, cy);
                 let mut dirty = self.chrome.set_hover(hit);
                 // Pill button hover — driven by the same stamped hit map as the chrome controls.
-                for b in [&mut self.btn_one, &mut self.btn_fit] {
+                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
                     let over = hit == b.hit_id();
                     if b.is_hovered() != over {
                         b.set_hovered(over);
@@ -724,6 +908,31 @@ impl FluorApp for OpsinApp {
                     if self.btn_fit.take_click() {
                         // Fit — a MOMENT too: sets the composition to whole-image-centered; the span-relative transform carries it thru resizes on its own.
                         self.fit(ctx.viewport);
+                        ctx.window.request_redraw();
+                    }
+                    if self.btn_xscale.take_click() {
+                        // X: linear counts ↔ log2 stops — an explicit, labelled remap; the pill always reads the CURRENT mode.
+                        self.hist_xlog = !self.hist_xlog;
+                        self.btn_xscale.set_label(if self.hist_xlog { "X Log" } else { "X Lin" });
+                        ctx.window.request_redraw();
+                    }
+                    if self.btn_yscale.take_click() {
+                        // Y: linear count ↔ log2 count.
+                        self.hist_ylog = !self.hist_ylog;
+                        self.btn_yscale.set_label(if self.hist_ylog { "Y Log" } else { "Y Lin" });
+                        ctx.window.request_redraw();
+                    }
+                    if self.btn_clip.take_click() {
+                        // Clip indicator: re-render the linear pipe from the retained decode with lumis's raw inversion — blown highlights dark, crushed shadows blown, channel-wise. Display-only; the stored plane and the raw histogram source are untouched.
+                        self.clip_show = !self.clip_show;
+                        self.btn_clip.set_fill(self.clip_show.then_some(CLIP_ON_FILL));
+                        if let Some(dec) = &self.dec {
+                            if let Ok((_, _, lin)) = crate::convert::to_linear(dec, self.clip_show) {
+                                self.lin = lin;
+                                self.pixels = encode_pixels(&self.lin, self.ev);
+                                self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
+                            }
+                        }
                         ctx.window.request_redraw();
                     }
                     return response;
@@ -905,7 +1114,7 @@ impl FluorApp for OpsinApp {
 
         // ── Right tool panel ──
         let divider_px = (self.divider_x(ctx.viewport) as usize).min(buf_w.saturating_sub(1));
-        let PanelRects { nav, btns, hist, ev: ev_rect, chart } = self.panel_rects(ctx.viewport);
+        let PanelRects { nav: _, btns, hist, ev: ev_rect, chart } = self.panel_rects(ctx.viewport);
         {
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             // Divider — 1px vertical hairline from the bar down (fill_rect's 0-width hairline convention).
@@ -937,7 +1146,7 @@ impl FluorApp for OpsinApp {
                     let centi = (zoom * 100.).trunc() as u64;
                     format!("{}.{:02}x", centi / 100, centi % 100)
                 };
-                ctx.text.draw_text_center_u32(&mut canvas, &magnification, (bx + bw / 2) as f32, (by + bh / 2) as f32, font, 400, TEXT_GREY, "Open Sans", clip, None, None);
+                ctx.text.draw_text_center(&mut canvas, &magnification, (bx + bw / 2) as f32, (by + bh / 2) as f32, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
             }
             // Exposure slider + EV label. Label takes the band's left end, the slider the rest; the fluor Slider paints the lumis-style white/black track + circular handle.
             let (ex, ey, ew, eh) = ev_rect;
@@ -947,7 +1156,7 @@ impl FluorApp for OpsinApp {
                 // Truncated toward zero, never rounded — same integer decomposition as the magnification readout, so the label shows the stored value's truth: three 1/3-stop nudges display "+0.99" because the float accumulation genuinely is a hair under a stop.
                 let centi = (self.ev * 100.).trunc() as i32;
                 let label = format!("{}{}.{:02}", if centi < 0 { '-' } else { '+' }, (centi / 100).abs(), (centi % 100).abs());
-                ctx.text.draw_text_left_u32(&mut canvas, &label, ex as f32, (ey + eh / 2) as f32, font, 400, TEXT_GREY, "Open Sans", clip, None, None);
+                ctx.text.draw_text_left(&mut canvas, &label, ex as f32, (ey + eh / 2) as f32, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
                 let sw = ew.saturating_sub(label_w);
                 if sw > eh {
                     self.ev_slider.set_rect((ex + label_w + sw / 2) as f32, (ey + eh / 2) as f32, sw as f32, eh as f32);
@@ -956,44 +1165,106 @@ impl FluorApp for OpsinApp {
                 }
             }
 
-            // Histogram bars — per-column, three translucent channel segments composing additively. Bins are oversampled (HIST_BINS); each column takes the PEAK over its bin range so narrow spikes survive the downsample (oriel's oversample idea).
+            // Histogram pills in their OWN band carved from the top of the hist rect — above the plot, never on it. Right-aligned row: [X ..][Y ..][Clip]. Geometry derives from the hist rect (RU-coherent, no pixel constants).
             let (hx, hy, hw, hh) = hist;
+            let pill_h = (hh as f32 / 5.).max(8.);
+            let pill_pad = hh as f32 / (1 << 4) as f32;
+            let pill_band = (pill_h + pill_pad * 2.) as usize;
+            if hw > 0 && hh > pill_band && !self.raw.counts.is_empty() {
+                let pill_w = pill_h * 3.;
+                let cy_pill = hy as f32 + pill_pad + pill_h / 2.;
+                let mut right = hx as f32 + hw as f32 - pill_pad;
+                for b in [&mut self.btn_clip, &mut self.btn_yscale, &mut self.btn_xscale] {
+                    b.set_rect(right - pill_w / 2., cy_pill, pill_w, pill_h);
+                    b.set_font_size(pill_h * (3. / 4.));
+                    let id = b.hit_id();
+                    b.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
+                    right -= pill_w + pill_pad;
+                }
+            }
+            // The plot body takes the rest of the rect, below the pill band.
+            let (hy, hh) = (hy + pill_band.min(hh), hh.saturating_sub(pill_band));
+
+            // Histogram body — RAW counts of WHAT'S IN VIEW, per frame, equal-energy: every visible display pixel bridges back to its sensor tile and tallies its samples into the per-ADC-code table (exact integers, no axis math per sample); the spread then deposits each code over the bin interval its quantization step covers through the active axis. Comb-free by construction; XOR stop hairlines render in panel::render_hist.
             if hw > 0 && hh > 0 {
-                for col in 0..hw {
-                    let lo = col * HIST_BINS / hw;
-                    let hi = (((col + 1) * HIST_BINS / hw).max(lo + 1)).min(HIST_BINS);
-                    for (ch, colour) in [HIST_R, HIST_G, HIST_B].iter().enumerate() {
-                        let v = self.tools.hist[lo..hi].iter().map(|b| b[ch]).fold(0f32, f32::max);
-                        let bar = (v * hh as f32) as usize;
-                        if bar > 0 {
-                            paint::fill_rect(&mut canvas, (hx + col) as isize, (hy + hh - bar) as isize, 0, bar as isize, *colour, clip, None);
-                        }
+                let bins = hw * HIST_OVERSAMPLE;
+                let codes: Vec<[u32; 3]> = if !self.raw.counts.is_empty() && self.img_w > 0 && zoom > 0. {
+                    use rayon::prelude::*;
+                    let raw = &self.raw;
+                    let (img_w, img_h) = (self.img_w, self.img_h);
+                    let x_end = divider_px.min(buf_w);
+                    let y_start = bar_h.min(buf_h);
+                    (y_start..buf_h)
+                        .into_par_iter()
+                        .with_min_len(((buf_h - y_start) / 8).max(1))
+                        .fold(
+                            || vec![[0u32; 3]; 1 << 16],
+                            |mut c, sy| {
+                                let fy = (sy as f32 - img_oy) / zoom;
+                                if fy >= 0. && (fy as usize) < img_h {
+                                    for sx in 0..x_end {
+                                        let fx = (sx as f32 - img_ox) / zoom;
+                                        if fx >= 0. && (fx as usize) < img_w {
+                                            raw.collect_codes(fx as usize, fy as usize, &mut c);
+                                        }
+                                    }
+                                }
+                                c
+                            },
+                        )
+                        .reduce(
+                            || vec![[0u32; 3]; 1 << 16],
+                            |mut a, b| {
+                                for (x, y) in a.iter_mut().zip(&b) {
+                                    for ch in 0..3 {
+                                        x[ch] += y[ch];
+                                    }
+                                }
+                                a
+                            },
+                        )
+                } else {
+                    vec![[0u32; 3]; 1 << 16]
+                };
+                let dens = self.raw.spread(&codes, self.hist_xlog, bins);
+                // Stop hairlines at oversampled-bin precision: every whole stop from saturation down to the sensor's bit floor — equally spaced in log, halving positions in linear.
+                let stop_bins: Vec<usize> = if self.raw.counts.is_empty() {
+                    Vec::new()
+                } else if self.hist_xlog {
+                    (0..=self.raw.bits as i32).map(|s| (((1. - s as f32 / self.raw.bits as f32) * bins as f32) as usize).min(bins - 1)).collect()
+                } else {
+                    (0..=self.raw.bits as i32).map(|s| ((bins as f32 / 2f32.powi(s)) as usize).min(bins - 1)).collect()
+                };
+                let hist_px = crate::panel::render_hist(&dens, hw, hh, &stop_bins, self.hist_ylog);
+                for row in 0..hh.min(buf_h.saturating_sub(hy)) {
+                    for col in 0..hw.min(buf_w.saturating_sub(hx)) {
+                        put(target, buf_w, hx + col, hy + row, hist_px[row * hw + col]);
                     }
                 }
             }
         }
-        // Navigator thumbnail — nearest blit into the nav rect (direct writes).
-        let (nx, ny, nw, nh) = nav;
-        if nw > 0 && nh > 0 {
-            for ty in 0..nh.min(buf_h.saturating_sub(ny)) {
-                let sy = ty * self.tools.thumb_h / nh;
-                for tx in 0..nw.min(buf_w.saturating_sub(nx)) {
-                    let sx = tx * self.tools.thumb_w / nw;
-                    put(target, buf_w, nx + tx, ny + ty, self.tools.thumb[sy * self.tools.thumb_w + sx]);
+        // Navigator thumbnail — nearest blit into the ASPECT-FITTED sub-rect (letterboxed, centered): the navigator never stretches the image. `nav_fit` is the shared truth for blit, view-rect overlay, and cursor mapping.
+        let fitted = self.nav_fit(ctx.viewport);
+        if let Some((fx, fy, fw, fh)) = fitted {
+            for ty in 0..fh.min(buf_h.saturating_sub(fy)) {
+                let sy = ty * self.tools.thumb_h / fh;
+                for tx in 0..fw.min(buf_w.saturating_sub(fx)) {
+                    let sx = tx * self.tools.thumb_w / fw;
+                    put(target, buf_w, fx + tx, fy + ty, self.tools.thumb[sy * self.tools.thumb_w + sx]);
                 }
             }
         }
         // Navigator view rect — the TRUE viewport rect in thumb space, unclamped (it slides off the thumb edge when panned past the image instead of shrinking and sticking), drawn AFTER the thumbnail as a wrapping-add-of-128 marker on each gamma-encoded RGB byte (`b ^ 0x80` — self-contrasting on any content).
-        if nw > 0 && nh > 0 && zoom > 0. && self.img_w > 0 {
+        if let (Some((fx, fy, fw, fh)), true) = (fitted, zoom > 0. && self.img_w > 0) {
             let img_area_w = self.divider_x(ctx.viewport);
-            let sx = nw as f32 / (self.img_w as f32 * zoom);
-            let sy = nh as f32 / (self.img_h as f32 * zoom);
-            let rx0 = nx as isize + ((0. - img_ox) * sx) as isize;
-            let ry0 = ny as isize + ((bar_h as f32 - img_oy) * sy) as isize;
-            let rx1 = nx as isize + ((img_area_w - img_ox) * sx) as isize;
-            let ry1 = ny as isize + ((buf_h as f32 - img_oy) * sy) as isize;
-            let (cx0, cy0) = (nx as isize, ny as isize);
-            let (cx1, cy1) = ((nx + nw) as isize, (ny + nh) as isize);
+            let sx = fw as f32 / (self.img_w as f32 * zoom);
+            let sy = fh as f32 / (self.img_h as f32 * zoom);
+            let rx0 = fx as isize + ((0. - img_ox) * sx) as isize;
+            let ry0 = fy as isize + ((bar_h as f32 - img_oy) * sy) as isize;
+            let rx1 = fx as isize + ((img_area_w - img_ox) * sx) as isize;
+            let ry1 = fy as isize + ((buf_h as f32 - img_oy) * sy) as isize;
+            let (cx0, cy0) = (fx as isize, fy as isize);
+            let (cx1, cy1) = ((fx + fw) as isize, (fy + fh) as isize);
             let mut mark = |x: isize, y: isize| {
                 if x >= cx0 && x < cx1 && y >= cy0 && y < cy1 {
                     let i = y as usize * buf_w + x as usize;
@@ -1009,22 +1280,65 @@ impl FluorApp for OpsinApp {
                 mark(rx1, y);
             }
         }
-        // Chromaticity chart — locus + Planckian arc lines topmost, the tinted lobe (chromaticity colour × density brightness, precomputed per observer+image) composing under them.
+        // Chromaticity chart — oriel's Maxwell triangle, recomputed THIS FRAME at exactly this rect's size from exactly the pixels visible in the image area: walk the image-area screen pixels, invert the view transform, splat each visible sample's chromaticity into a chart-pixel density grid, render. No base resolution, no resampling — chart pixels ARE screen pixels, and the cloud tracks pan/zoom live. The √3/2 height is the equilateral triangle's geometry, not a pixel ratio.
         let (cx, cy, cw, chh) = chart;
         if cw > 0 && chh > 0 {
-            plot_polyline(target, buf_w, &self.tools.locus, chart, LOCUS);
-            if self.tools.locus.len() >= 2 {
-                let closure = [self.tools.locus[self.tools.locus.len() - 1], self.tools.locus[0]];
-                plot_polyline(target, buf_w, &closure, chart, LOCUS);
-            }
-            plot_polyline(target, buf_w, &self.tools.blackbody, chart, PLANCK);
-            for py in 0..chh.min(buf_h.saturating_sub(cy)) {
-                let gy = py * CHART_RES / chh;
-                for px in 0..cw.min(buf_w.saturating_sub(cx)) {
-                    let gx = px * CHART_RES / cw;
-                    let v = self.tools.chart[gy * CHART_RES + gx];
-                    if v != 0 {
-                        put(target, buf_w, cx + px, cy + py, v);
+            let dw = cw.min((chh as f32 * 2. / 3f32.sqrt()) as usize).max(1);
+            let dh = ((dw as f32 * 3f32.sqrt() / 2.) as usize).clamp(1, chh);
+            let ox = cx + (cw - dw) / 2;
+            let oy = cy + (chh - dh) / 2;
+            let density = if self.img_w > 0 && zoom > 0. && !self.lin.is_empty() {
+                use rayon::prelude::*;
+                let lin: &[i32] = &self.lin;
+                let (img_w, img_h) = (self.img_w, self.img_h);
+                let x_end = divider_px.min(buf_w);
+                let y_start = bar_h.min(buf_h);
+                // Parallel fold over screen rows, split into few bands so the per-band grid merges stay far below the sample splats.
+                (y_start..buf_h)
+                    .into_par_iter()
+                    .with_min_len(((buf_h - y_start) / 8).max(1))
+                    .fold(
+                        || vec![0u32; dw * dh],
+                        |mut grid, sy| {
+                            let fy = (sy as f32 - img_oy) / zoom;
+                            if fy >= 0. && (fy as usize) < img_h {
+                                let row = (fy as usize) * img_w;
+                                for sx in 0..x_end {
+                                    let fx = (sx as f32 - img_ox) / zoom;
+                                    if fx >= 0. && (fx as usize) < img_w {
+                                        let i = (row + fx as usize) * 3;
+                                        let r = lin[i].max(0) as f32;
+                                        let g = lin[i + 1].max(0) as f32;
+                                        let b = lin[i + 2].max(0) as f32;
+                                        if let Some((px, py)) = crate::panel::project(r, g, b, dw, dh) {
+                                            if px >= 0. && px < dw as f32 && py >= 0. && py < dh as f32 {
+                                                grid[py as usize * dw + px as usize] += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            grid
+                        },
+                    )
+                    .reduce(
+                        || vec![0u32; dw * dh],
+                        |mut a, b| {
+                            for (x, y) in a.iter_mut().zip(&b) {
+                                *x += y;
+                            }
+                            a
+                        },
+                    )
+            } else {
+                vec![0u32; dw * dh]
+            };
+            let chart_px = crate::panel::render_chart(&density, dw, dh, &Observer::stock());
+            for py in 0..dh.min(buf_h.saturating_sub(oy)) {
+                for px in 0..dw.min(buf_w.saturating_sub(ox)) {
+                    let v = chart_px[py * dw + px];
+                    if v >> 24 != 0 {
+                        put(target, buf_w, ox + px, oy + py, v);
                     }
                 }
             }
@@ -1097,7 +1411,7 @@ impl FluorApp for OpsinApp {
         if self.chrome.owns_hit(hit) && hit != self.chrome.app_icon_btn.id() {
             return CursorIcon::Pointer;
         }
-        if hit == self.btn_one.hit_id() || hit == self.btn_fit.hit_id() {
+        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
             return CursorIcon::Pointer;
         }
         // Resize arrows only where a press would actually resize — the bar body below the sliver stays Default (it moves the window).

@@ -48,7 +48,7 @@ fn main() {
                     eprintln!("check: unpack {:?} ({} samples)", tu.elapsed(), unpacked.len());
                     drop(unpacked);
                     let t1 = std::time::Instant::now();
-                    match convert::to_linear(&dec) {
+                    match convert::to_linear(&dec, false) {
                         Ok((w, h, lin)) => {
                             let sum: i64 = lin.iter().map(|&v| v as i64).sum();
                             eprintln!("check: decode {t_decode:?}, to_linear {:?} ({w}×{h}, checksum {sum:x})", t1.elapsed());
