@@ -1,6 +1,6 @@
 [package]
 name = "opsin"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 description = "Spectral image viewer and converter, with the minimal edits a viewer earns: exposure, rotation, starring, culling. The observer is a variable. Full editing belongs to a separate crate."
 license-file = "LICENSE"
@@ -12,9 +12,9 @@ exclude = ["opsin.webp", "assets/opsin_orb.rgb"]
 
 [dependencies]
 # Container format — VSF-Image sections (sensor plane, spectral characterization, provenance chain).
-vsf = { version = "0.9.2", path = "../vsf", features = ["inspect", "rayon"] }
+vsf = { version = "0.9.3", path = "../vsf", features = ["inspect", "rayon"] }
 # Sensor intake — decodes RAW/DNG to counts + gives us both DNG ColorMatrices and illuminant codes to build the tiered colour_profile.
-limbus = { version = "0.0.0", path = "../limbus" }
+limbus = { version = "0.0.1", path = "../limbus" }
 # CPU softbuffer compositor — hosts the viewer's event loop, chrome, paint primitives. Same dep shape as Photon's desktop block.
-fluor = { version = "0.0.3", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"] }
+fluor = { version = "0.0.4", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"] }
 rayon = "1.12.0"
