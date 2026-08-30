@@ -243,12 +243,8 @@ impl RawView {
                 }
             };
             let weight = 1. / self.census[ch];
-            // Effective quantization step: files re-scaled after capture (e.g. a 10-bit frame stretched
-            // into 16-bit codes by older lumis saves) only populate every Nth code, and depositing over
-            // [v, v+1) would re-comb them. The MODE of the gaps between occupied codes is the honest
-            // estimator: a native file's mode is 1 (identical behaviour, bit for bit), a stretched file's
-            // is its stretch factor. Irregular stretches (65536/1023 alternates 64/65) leave sub-bin
-            // residue only. Scene-content gaps can't skew a mode the way a mean or a max would.
+            // Effective quantization step: files re-scaled after capture (e.g. a 10-bit frame stretched into 16-bit codes by older lumis saves) only populate every Nth code, and depositing over
+            // [v, v+1) would re-comb them. The MODE of the gaps between occupied codes is the honest estimator: a native file's mode is 1 (identical behaviour, bit for bit), a stretched file's is its stretch factor. Irregular stretches (65536/1023 alternates 64/65) leave sub-bin residue only. Scene-content gaps can't skew a mode the way a mean or a max would.
             let step = {
                 let mut gap_hist = [0u32; 257];
                 let mut prev: Option<usize> = None;
