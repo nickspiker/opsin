@@ -81,6 +81,8 @@ pub struct OpsinApp {
     /// 1:1 / Fit — fluor pill Buttons, same widget family as the slider and chrome (squircle, AA edge, hover tint thru the host overlay pipe). Geometry is set every frame from panel_rects; hit silhouettes stamp into the chrome hit map at render, so dispatch rides the same Container walk as the chrome controls.
     btn_one: fluor::widgets::Button,
     btn_fit: fluor::widgets::Button,
+    /// sRGB JPEG export pill — the visible face of the `E` key.
+    btn_export: fluor::widgets::Button,
     /// True while dragging the exposure slider handle.
     ev_drag: bool,
     /// True while dragging inside the navigator — every cursor move re-centers the main view live.
@@ -230,7 +232,9 @@ impl RawView {
     }
 
     /// Equal-energy spread: each ADC code deposits its census-weighted count uniformly over the bin interval its quantization step `[v, v+1)` covers through the active axis — exact density on both axes, comb-free, deterministic (lumis's `bin_span` idea taken to its conclusion: the interval IS the span, deposited rather than divided, so no duty-cycle/log-order weirdness survives). Below-black collapses into bin 0 and at/above-white into the last bin — the clip spikes.
-    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize) -> Vec<[f32; 3]> {
+    ///
+    /// `gain` is the live EV multiplier (2^ev), applied to the black-subtracted counts before the axis map, so the histogram tracks the exposure slider exactly as the display does: in linear-x every peak moves 2× per stop, in log-x the whole distribution translates one stop per stop — a labelled remap of the same raw counts, still no curve. Data pushed past display white by the gain collapses into the last bin: the clip spike grows as you rack exposure, agreeing with the image's encode-boundary indicator.
+    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, gain: f32) -> Vec<[f32; 3]> {
         let mut dens = vec![[0f32; 3]; bins];
         for ch in 0..3 {
             let black = self.black[ch];
@@ -263,8 +267,8 @@ impl RawView {
                 if c == 0 {
                     continue;
                 }
-                let b0 = frac(v as f32 - black) * bins as f32;
-                let b1 = (frac(v as f32 + step - black) * bins as f32).max(b0);
+                let b0 = frac((v as f32 - black) * gain) * bins as f32;
+                let b1 = (frac((v as f32 + step - black) * gain) * bins as f32).max(b0);
                 let total = c as f32 * weight;
                 let lo = (b0 as usize).min(bins - 1);
                 if b1 - b0 <= f32::EPSILON {
@@ -285,7 +289,9 @@ impl RawView {
 }
 
 /// Linear signed Rec.2020 → gamma-2 u8 visible → darkness-packed u32. Exposure is a Q16 integer multiply — the gain constant is the only float, precomputed once (a scalar commutes with the cmx, shifts no hue). The SINGLE display clamp in the whole pipe follows the multiply: negative light and beyond-white cannot display, and the bare integer cast would wrap (a −1 shadow pixel would speckle full-white), so the clamp is the u16 container boundary, applied at the last possible moment — everything before it is signed and recoverable. Then the EV-independent sqrt LUT (64Ki sqrts, built ONCE per process — it never varies with EV) maps to display bytes. Each output pixel depends only on its own three samples, so the pass splits across the rayon pool — this runs on every exposure-slider tick and must stay interactive at full resolution.
-fn encode_pixels(lin: &[i32], ev: f32) -> Vec<u32> {
+///
+/// `clip_show` is lumis's `preview_sub` indicator relocated to opsin's one display clamp — HERE, after the magic-9 and the EV gain, so it marks what is clipping AT DISPLAY under the current exposure and moves live with the slider. Channel-wise, same inversion as lumis: a channel at/over display white renders DARK, a channel below zero renders BLOWN. Indicator-only — `lin` is never touched, so re-encodes and the JPEG export (which takes `lin` directly) stay clean of it by construction.
+fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool) -> Vec<u32> {
     use rayon::prelude::*;
     const GAIN_SHIFT: u32 = 1 << 4;
     static LUT: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
@@ -293,17 +299,32 @@ fn encode_pixels(lin: &[i32], ev: f32) -> Vec<u32> {
     let gain = (2f64.powf(ev as f64) * (1u64 << GAIN_SHIFT) as f64).round() as i64;
     lin.par_chunks_exact(3)
         .map(|px| {
-            let ch = |v: i32| lut[((v as i64 * gain) >> GAIN_SHIFT).clamp(0, 65535) as usize];
+            let ch = |v: i32| {
+                let g = (v as i64 * gain) >> GAIN_SHIFT;
+                let idx = if clip_show {
+                    // preview_sub after the display transform: over-white → 0 (dark), under-black → max (blown).
+                    if g >= 65535 {
+                        0
+                    } else if g < 0 {
+                        65535
+                    } else {
+                        g
+                    }
+                } else {
+                    g.clamp(0, 65535)
+                };
+                lut[idx as usize]
+            };
             0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2])
         })
         .collect()
 }
 
-/// Decode `path` (any supported format) into display pixels + the raw sensor view + a title, rendering with the caller's live clip-indicator state. Encoded at EV 0; the caller re-encodes if it's carrying exposure over.
-fn load_image(path: &Path, clip_show: bool) -> Result<Loaded, String> {
+/// Decode `path` (any supported format) into display pixels + the raw sensor view + a title. Encoded plain at EV 0; the caller re-encodes if it's carrying exposure or the clip indicator over.
+fn load_image(path: &Path) -> Result<Loaded, String> {
     let dec = crate::convert::load_any(path)?;
-    let (w, h, lin) = crate::convert::to_linear(&dec, clip_show)?;
-    let pixels = encode_pixels(&lin, 0.);
+    let (w, h, lin) = crate::convert::to_linear(&dec)?;
+    let pixels = encode_pixels(&lin, 0., false);
     let raw = RawView::from_image(&dec.img);
     let title = format!(
         "opsin — {} ({}×{}, {} ch, {}-bit)",
@@ -368,7 +389,7 @@ impl OpsinApp {
             return Err(format!("{}: no supported images", path.display()));
         }
 
-        let loaded = load_image(&dir_list[dir_idx], false)?;
+        let loaded = load_image(&dir_list[dir_idx])?;
         Ok(Self::from_loaded(loaded, dir_list, dir_idx))
     }
 
@@ -384,6 +405,7 @@ impl OpsinApp {
         let ev_slider = fluor::widgets::Slider::new(&mut hit_counter, 0., 0., 1., 1., 0.5);
         let btn_one = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "1:1");
         let btn_fit = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Fit");
+        let btn_export = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "JPEG");
         let btn_xscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "X Lin");
         let btn_yscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Y Lin");
         let btn_clip = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Clip");
@@ -421,6 +443,7 @@ impl OpsinApp {
             ev_slider,
             btn_one,
             btn_fit,
+            btn_export,
             ev_drag: false,
             nav_drag: false,
             hit_count: hit_counter,
@@ -565,14 +588,14 @@ impl OpsinApp {
         Some((nx + (nw - fw) / 2, ny + (nh - fh) / 2, fw, fh))
     }
 
-    /// Apply the slider's 0..1 value as stops and re-encode the display pixels. The panel thumbnail tracks (cheap); histogram/scatter stay on the un-exposed linear data — they describe the capture, not the view.
+    /// Apply the slider's 0..1 value as stops and re-encode the display pixels. The panel thumbnail tracks (cheap), the histogram tracks too (the same gain remaps its bins — see the render arm), and the chart alone stays put (chromaticity ratios shrug at a scalar).
     fn apply_ev(&mut self, value01: f32, ctx: &mut Context) {
         let ev = (value01 * 2. - 1.) * EV_RANGE;
         if (ev - self.ev).abs() < 1e-4 || self.lin.is_empty() {
             return;
         }
         self.ev = ev;
-        self.pixels = encode_pixels(&self.lin, ev);
+        self.pixels = encode_pixels(&self.lin, ev, self.clip_show);
         self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
         ctx.window.request_redraw();
     }
@@ -588,9 +611,10 @@ impl OpsinApp {
         self.lin = loaded.lin;
         self.raw = loaded.raw;
         self.dec = loaded.dec;
-        if same_geometry && self.ev.abs() > 1e-4 {
-            // Carry the exposure into the new frame (loaded.pixels were encoded at EV 0).
-            self.pixels = encode_pixels(&self.lin, self.ev);
+        if self.clip_show || (same_geometry && self.ev.abs() > 1e-4) {
+            // Carry the exposure and/or the live clip indicator into the new frame (loaded.pixels were encoded plain at EV 0). Exposure only carries over same geometry; the indicator is a mode and carries always.
+            let ev = if same_geometry { self.ev } else { 0. };
+            self.pixels = encode_pixels(&self.lin, ev, self.clip_show);
             self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
         } else {
             self.pixels = loaded.pixels;
@@ -612,7 +636,7 @@ impl OpsinApp {
         let mut idx = self.dir_idx;
         for _ in 0..n {
             idx = ((idx as isize + delta).rem_euclid(n as isize)) as usize;
-            match load_image(&self.dir_list[idx], self.clip_show) {
+            match load_image(&self.dir_list[idx]) {
                 Ok(loaded) => {
                     self.dir_idx = idx;
                     self.install(loaded, ctx);
@@ -625,7 +649,7 @@ impl OpsinApp {
 
     /// Open a path dropped onto the window: rebuild the folder list around it so arrow-nav works from there, then show it. Unsupported / undecodable drops are logged and ignored (current image stays).
     fn show_path(&mut self, path: &Path, ctx: &mut Context) {
-        match load_image(path, self.clip_show) {
+        match load_image(path) {
             Ok(loaded) => {
                 let (list, idx) = dir_list_for(path);
                 self.dir_list = list;
@@ -664,6 +688,19 @@ impl OpsinApp {
             }
         }
         crate::convert::write_vsf(&dec.img, &out)?;
+        Ok(out)
+    }
+
+    /// Export the current view as an sRGB JPEG beside the source (`<stem>.jpg`) — the live exposure baked in, everything else exactly the rendering on screen. `self.lin` already carries the orientation, so the JPEG lands the way the viewer shows it. Returns the written path for the caller to surface.
+    fn export_current_jpeg(&self) -> Result<PathBuf, String> {
+        let Some(src) = self.dir_list.get(self.dir_idx) else {
+            return Err("no image loaded".to_string());
+        };
+        if self.lin.is_empty() {
+            return Err("no image loaded".to_string());
+        }
+        let out = src.with_extension("jpg");
+        crate::convert::export_srgb_jpeg(&self.lin, self.img_w, self.img_h, self.ev, &out)?;
         Ok(out)
     }
 
@@ -795,6 +832,7 @@ impl Container for OpsinApp {
         self.chrome.visit(f);
         f(&mut self.btn_one);
         f(&mut self.btn_fit);
+        f(&mut self.btn_export);
         f(&mut self.btn_xscale);
         f(&mut self.btn_yscale);
         f(&mut self.btn_clip);
@@ -864,7 +902,7 @@ impl FluorApp for OpsinApp {
                 let hit = self.chrome.hit_at(cx, cy);
                 let mut dirty = self.chrome.set_hover(hit);
                 // Pill button hover — driven by the same stamped hit map as the chrome controls.
-                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
+                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
                     let over = hit == b.hit_id();
                     if b.is_hovered() != over {
                         b.set_hovered(over);
@@ -906,6 +944,13 @@ impl FluorApp for OpsinApp {
                         self.fit(ctx.viewport);
                         ctx.window.request_redraw();
                     }
+                    if self.btn_export.take_click() {
+                        // Same action as the E key — sRGB JPEG beside the source, live exposure baked.
+                        match self.export_current_jpeg() {
+                            Ok(out) => println!("opsin: wrote {}", out.display()),
+                            Err(e) => eprintln!("opsin: JPEG export failed: {e}"),
+                        }
+                    }
                     if self.btn_xscale.take_click() {
                         // X: linear counts ↔ log2 stops — an explicit, labelled remap; the pill always reads the CURRENT mode.
                         self.hist_xlog = !self.hist_xlog;
@@ -919,15 +964,12 @@ impl FluorApp for OpsinApp {
                         ctx.window.request_redraw();
                     }
                     if self.btn_clip.take_click() {
-                        // Clip indicator: re-render the linear pipe from the retained decode with lumis's raw inversion — blown highlights dark, crushed shadows blown, channel-wise. Display-only; the stored plane and the raw histogram source are untouched.
+                        // Clip indicator: lumis's preview_sub inversion at the encode boundary — after the magic-9 and the EV gain, so it marks display clipping under the CURRENT exposure and tracks the slider live. A cheap re-encode, same cost as an EV tick; `lin` is untouched (the JPEG export stays clean of it by construction).
                         self.clip_show = !self.clip_show;
                         self.btn_clip.set_fill(self.clip_show.then_some(CLIP_ON_FILL));
-                        if let Some(dec) = &self.dec {
-                            if let Ok((_, _, lin)) = crate::convert::to_linear(dec, self.clip_show) {
-                                self.lin = lin;
-                                self.pixels = encode_pixels(&self.lin, self.ev);
-                                self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
-                            }
+                        if !self.lin.is_empty() {
+                            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show);
+                            self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
                         }
                         ctx.window.request_redraw();
                     }
@@ -1051,6 +1093,13 @@ impl FluorApp for OpsinApp {
                         }
                         EventResponse::Handled
                     }
+                    Key::Character(c) if c.eq_ignore_ascii_case("e") => {
+                        match self.export_current_jpeg() {
+                            Ok(out) => println!("opsin: wrote {}", out.display()),
+                            Err(e) => eprintln!("opsin: JPEG export failed: {e}"),
+                        }
+                        EventResponse::Handled
+                    }
                     Key::Character(c) if c.eq_ignore_ascii_case("f") => {
                         self.fit(ctx.viewport);
                         ctx.window.request_redraw();
@@ -1119,20 +1168,24 @@ impl FluorApp for OpsinApp {
             for &(sx, sy, sw, sh) in &[btns, hist] {
                 paint::fill_rect(&mut canvas, sx as isize, (sy + sh) as isize + 4, sw as isize, 0, HAIRLINE, clip, None);
             }
-            // 1:1 / magnification / Fit — the band splits in thirds: two fluor pill Buttons (same widget family as the slider and chrome) flanking the LIVE magnification readout (screen px per image px: 1x = pixel-exact certificate, 2.00x = zoomed in past it). The readout derives from the same per-frame span-relative transform as the blit, so it tracks every window op — press 1:1, resize, and it honestly drifts; that's the relative model reporting itself.
+            // 1:1 / magnification / Fit / JPEG — the band splits in quarters: fluor pill Buttons (same widget family as the slider and chrome) around the LIVE magnification readout (screen px per image px: 1x = pixel-exact certificate, 2.00x = zoomed in past it). The readout derives from the same per-frame span-relative transform as the blit, so it tracks every window op — press 1:1, resize, and it honestly drifts; that's the relative model reporting itself. JPEG is the export pill — the visible face of the E key.
             let (bx, by, bw, bh) = btns;
             if bw > 2 && bh > 0 && self.img_w > 0 {
-                let third = bw as f32 / 3.;
+                let quarter = bw as f32 / 4.;
                 let font = bh as f32 / 2.;
                 let bcy = by as f32 + bh as f32 / 2.;
-                self.btn_one.set_rect(bx as f32 + third / 2., bcy, third, bh as f32);
+                self.btn_one.set_rect(bx as f32 + quarter * 0.5, bcy, quarter, bh as f32);
                 self.btn_one.set_font_size(font);
-                self.btn_fit.set_rect(bx as f32 + bw as f32 - third / 2., bcy, third, bh as f32);
+                self.btn_fit.set_rect(bx as f32 + quarter * 2.5, bcy, quarter, bh as f32);
                 self.btn_fit.set_font_size(font);
+                self.btn_export.set_rect(bx as f32 + quarter * 3.5, bcy, quarter, bh as f32);
+                self.btn_export.set_font_size(font);
                 let id = self.btn_one.hit_id();
                 self.btn_one.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
                 let id = self.btn_fit.hit_id();
                 self.btn_fit.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
+                let id = self.btn_export.hit_id();
+                self.btn_export.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
                 // "1x" is a CERTIFICATE, not a rounding: bitwise == against the value one_to_one() stored, so it holds iff the span (window + divider geometry) is unchanged since — the moment a resize makes the image resample, equality breaks and the decimals return. Resize back to the identical geometry and exactness honestly comes back.
                 let (aw, ah, _) = self.image_area(ctx.viewport);
                 let magnification = if self.zoom_rel == 1. / Self::area_span(aw, ah) {
@@ -1142,7 +1195,7 @@ impl FluorApp for OpsinApp {
                     let centi = (zoom * 100.).trunc() as u64;
                     format!("{}.{:02}x", centi / 100, centi % 100)
                 };
-                ctx.text.draw_text_center(&mut canvas, &magnification, (bx + bw / 2) as f32, (by + bh / 2) as f32, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
+                ctx.text.draw_text_center(&mut canvas, &magnification, bx as f32 + quarter * 1.5, (by + bh / 2) as f32, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
             }
             // Exposure slider + EV label. Label takes the band's left end, the slider the rest; the fluor Slider paints the lumis-style white/black track + circular handle.
             let (ex, ey, ew, eh) = ev_rect;
@@ -1222,7 +1275,7 @@ impl FluorApp for OpsinApp {
                 } else {
                     vec![[0u32; 3]; 1 << 16]
                 };
-                let dens = self.raw.spread(&codes, self.hist_xlog, bins);
+                let dens = self.raw.spread(&codes, self.hist_xlog, bins, 2f32.powf(self.ev));
                 // Stop hairlines at oversampled-bin precision: every whole stop from saturation down to the sensor's bit floor — equally spaced in log, halving positions in linear.
                 let stop_bins: Vec<usize> = if self.raw.counts.is_empty() {
                     Vec::new()
@@ -1407,7 +1460,7 @@ impl FluorApp for OpsinApp {
         if self.chrome.owns_hit(hit) && hit != self.chrome.app_icon_btn.id() {
             return CursorIcon::Pointer;
         }
-        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
+        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
             return CursorIcon::Pointer;
         }
         // Resize arrows only where a press would actually resize — the bar body below the sliver stays Default (it moves the window).
@@ -1420,5 +1473,56 @@ impl FluorApp for OpsinApp {
                 if self.drag.is_some() { CursorIcon::Pointer } else { CursorIcon::Default }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Darkness byte of the encoded pixel's red channel (255 = black, 0 = white).
+    fn darkness_r(px: u32) -> u32 {
+        (px >> 16) & 0xFF
+    }
+
+    #[test]
+    fn clip_indicator_marks_at_display_boundary_after_gain() {
+        // One pixel per case, red channel carries the probe value; green/blue mid-grey.
+        let mid = 20000;
+        let lin = vec![
+            70000, mid, mid, // over display white at EV 0
+            -500, mid, mid, // below black at EV 0
+            40000, mid, mid, // legal at EV 0, blows past white at +1 EV
+        ];
+        // Indicator OFF: everything clamps, over-white renders WHITE (darkness 0), negative renders BLACK (darkness 255).
+        let plain = encode_pixels(&lin, 0., false);
+        assert_eq!(darkness_r(plain[0]), 0);
+        assert_eq!(darkness_r(plain[1]), 255);
+        // Indicator ON at EV 0: preview_sub inversion — over-white DARK, under-black BLOWN; the legal pixel unaffected.
+        let clip0 = encode_pixels(&lin, 0., true);
+        assert_eq!(darkness_r(clip0[0]), 255, "blown renders dark");
+        assert_eq!(darkness_r(clip0[1]), 0, "crushed renders blown");
+        assert_eq!(darkness_r(clip0[2]), darkness_r(plain[2]), "legal pixel untouched");
+        // Indicator ON at +1 EV: the 40000 pixel now exceeds display white and flips to dark — the indicator tracks the live exposure.
+        let clip1 = encode_pixels(&lin, 1., true);
+        assert_eq!(darkness_r(clip1[2]), 255, "EV pushes it past white; the mark follows");
+    }
+
+    #[test]
+    fn spread_gain_shifts_bins_and_grows_clip_spike() {
+        let raw = RawView { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [65535.; 3], bits: 16, orient: 1, pre_w: 0, pre_h: 0, census: [1.; 3] };
+        let bins = 64;
+        let mut codes = vec![[0u32; 3]; 1 << 16];
+        codes[16000][0] = 100; // quarter-scale population
+        let d0 = raw.spread(&codes, false, bins, 1.);
+        let d1 = raw.spread(&codes, false, bins, 2.);
+        let peak = |d: &Vec<[f32; 3]>| d.iter().enumerate().max_by(|a, b| a.1[0].total_cmp(&b.1[0])).map(|(i, _)| i).unwrap();
+        // Linear x: doubling the gain doubles the peak's bin position (±1 for the bin floor).
+        assert!((peak(&d1) as i32 - 2 * peak(&d0) as i32).abs() <= 1, "peaks {} vs {}", peak(&d1), peak(&d0));
+        // Gain pushing data past white collapses it into the last bin — the display-clip spike.
+        codes[16000][0] = 0;
+        codes[50000][0] = 77;
+        let d2 = raw.spread(&codes, false, bins, 2.);
+        assert!(d2[bins - 1][0] >= 77. * 0.99, "overspill lands whole in the clip bin, got {}", d2[bins - 1][0]);
     }
 }

@@ -9,9 +9,9 @@ use std::path::Path;
 use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
 use vsf::{BitPackedTensor, Tensor};
 
-/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the rest go through limbus (50+ RAW formats — this is a representative common subset, not exhaustive).
+/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the RAW/TIFF family goes through limbus (50+ RAW formats — this is a representative common subset, not exhaustive); `jxl`/`jpg` are the display-referred ingests (lumis exports and web files — JPEG is assumed sRGB, the format convention).
 pub const SUPPORTED_EXTS: &[&str] = &[
-    "vsf", "dng", "arw", "cr2", "cr3", "nef", "nrw", "raf", "rw2", "orf", "pef", "srw", "raw", "tif", "tiff",
+    "vsf", "dng", "arw", "cr2", "cr3", "nef", "nrw", "raf", "rw2", "orf", "pef", "srw", "raw", "tif", "tiff", "jxl", "jpg", "jpeg",
 ];
 
 /// Is `path` a file the viewer can open (by extension)?
@@ -95,12 +95,38 @@ fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<Profile
 }
 
 /// The display matrix for a characterized image: `VSF_RGB2REC2020 × entries[0]`, then normalized so the elected entry's illuminant lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. `None` when uncharacterized, the target isn't VSF RGB, or the result is singular ⇒ render raw-camera.
-fn display_matrix(img: &SpectralImage) -> Option<[f32; 9]> {
+/// The linear space a render lands in. `Rec2020` is the viewer's display space; `VsfRgb` keeps the buffer in VSF RGB for a host that converts at its own display step (photon, 2026-09-11: "vsf rgb as much as possible").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Rec2020,
+    VsfRgb,
+}
+
+fn display_matrix(img: &SpectralImage, target: Target) -> Option<[f32; 9]> {
     let profile = img.profile.as_ref()?;
     if profile.target != "vsf_rgb" {
         return None;
     }
     let entry = profile.entries.first()?;
+    if target == Target::VsfRgb {
+        // Same exposure scalar, taken in VSF RGB: the illuminant's landing is (XYZ→VSF RGB)·wp.
+        let mut disp = entry.matrix;
+        let wp = illuminant_xyz(entry.illuminant);
+        let m = &XYZ_TO_VSF_RGB;
+        let lit = [
+            m[0] * wp[0] + m[1] * wp[1] + m[2] * wp[2],
+            m[3] * wp[0] + m[4] * wp[1] + m[5] * wp[2],
+            m[6] * wp[0] + m[7] * wp[1] + m[8] * wp[2],
+        ];
+        let peak = lit[0].max(lit[1]).max(lit[2]);
+        if peak <= 0. || !peak.is_finite() {
+            return None;
+        }
+        for v in &mut disp {
+            *v /= peak;
+        }
+        return Some(disp);
+    }
     let mut disp = matmul3(&VSF_RGB_TO_REC2020, &entry.matrix);
 
     // Exposure scalar: the illuminant's own landing in display space. cam_wp = CM·wp, and disp·cam_wp reduces to (XYZ→Rec2020)·wp — independent of the camera matrix — so we compute it straight from the illuminant whitepoint.
@@ -130,8 +156,134 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
             // The profile round-trips inside the file, so a reopened VSF renders colour-managed — no separate cmx to reconstruct.
             Ok(Decoded { img })
         }
+        Some("jxl") => ingest_jxl(input),
+        Some("jpg" | "jpeg") => ingest_jpeg(input),
         _ => ingest_image(input),
     }
+}
+
+/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade profile entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL and JPEG paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
+fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str) -> Decoded {
+    let img = SpectralImage {
+        width: w,
+        height: h,
+        channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+        layout: PlaneLayout::Planar,
+        samples: BitPackedTensor::pack(16, vec![3, h, w], &planar),
+        black: vec![0.; 3],
+        white: vec![65535.; 3],
+        make: String::new(),
+        model: String::new(),
+        provenance: Provenance::default(),
+        profile: Some(ColourProfile {
+            target: "vsf_rgb".to_string(),
+            entries: vec![ProfileEntry {
+                matrix: cam_to_vsf,
+                source: source.to_string(),
+                class: IdtClass::Absolute,
+                grade: ProfileGrade::Assumed,
+                illuminant: 21, // D65 — the white point of every accepted display space.
+                transfer: Transfer::Linear,
+            }],
+            dng_colormatrix: [None, None],
+            patches: None,
+            cal: None,
+        }),
+        view: None,
+    };
+    Decoded { img }
+}
+
+/// Untagged-convention JPEG → [`Decoded`]: decoded RGB8 assumed sRGB (the web's defined default — same assumption every platform makes), sRGB EOTF un-done to linear via a 256-entry LUT, stored planar u16 with an sRGB→VSF-RGB `Assumed` entry. ICC profiles, if present, are ignored — the whole point of this path is the sRGB convention. EXIF orientation is not parsed yet (most posts are pre-rotated); greyscale JPEGs come back RGB from the decoder's requested output space.
+#[allow(deprecated)]
+fn ingest_jpeg(input: &Path) -> Result<Decoded, String> {
+    let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let options = zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
+    let rgb = dec.decode().map_err(|e| format!("{}: {e}", input.display()))?;
+    let info = dec.info().ok_or_else(|| format!("{}: no dimensions", input.display()))?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let n = w * h;
+    if rgb.len() != n * 3 {
+        return Err(format!("{}: decoded {} bytes for {w}×{h}×3", input.display(), rgb.len()));
+    }
+    // sRGB byte → linear u16, 256 entries once per process.
+    static LUT: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        let mut t = [0u16; 256];
+        for (v, out) in t.iter_mut().enumerate() {
+            *out = (vsf::colour::srgb_eotf(v as f32 / 255.) * 65535.).round() as u16;
+        }
+        t
+    });
+    let mut planar = vec![0u16; n * 3];
+    let (rp, rest) = planar.split_at_mut(n);
+    let (gp, bp) = rest.split_at_mut(n);
+    rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
+        let s = i * 3;
+        *r = lut[rgb[s] as usize];
+        *g = lut[rgb[s + 1] as usize];
+        *b = lut[rgb[s + 2] as usize];
+    });
+    Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "jpeg_assumed_srgb"))
+}
+
+/// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. ICC-profiled and HDR (PQ/HLG) streams are rejected rather than guessed at.
+fn ingest_jxl(input: &Path) -> Result<Decoded, String> {
+    use jxl_oxide::color::{ColourEncoding, Primaries, TransferFunction};
+    let image = jxl_oxide::JxlImage::builder().open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let ColourEncoding::Enum(enc) = &image.image_header().metadata.colour_encoding else {
+        return Err(format!("{}: ICC-profiled JXL not supported (enum colour encodings only)", input.display()));
+    };
+    // Display space → linear VSF RGB, from the tagged primaries (white D65 for both). This is the profile entry's matrix — the stored plane is linear in the TAGGED primaries; VSF RGB is reached at read time like every other source.
+    let cam_to_vsf: [f32; 9] = match enc.primaries {
+        Primaries::Srgb => t3(vsf::colour::SRGB2VSF_RGB),
+        Primaries::Bt2100 => inv3(&VSF_RGB_TO_REC2020).ok_or("Rec.2020 primaries matrix singular")?,
+        other => return Err(format!("{}: unsupported JXL primaries {other:?}", input.display())),
+    };
+    // EOTF exponent/curve to LINEARIZE the decoded samples. jxl gamma signalling is the OETF gamma (lumis writes 0.5 for its sqrt encode), parsed with `inverted: true` ⇒ EOTF exponent = 1e7/g.
+    enum Eotf {
+        Linear,
+        Srgb,
+        Pow(f32),
+    }
+    let eotf = match enc.tf {
+        TransferFunction::Linear => Eotf::Linear,
+        TransferFunction::Srgb => Eotf::Srgb,
+        TransferFunction::Gamma { g, inverted } if g > 0 => Eotf::Pow(if inverted { 1e7 / g as f32 } else { g as f32 / 1e7 }),
+        other => return Err(format!("{}: unsupported JXL transfer function {other:?}", input.display())),
+    };
+
+    let render = image.render_frame(0).map_err(|e| format!("{}: {e}", input.display()))?;
+    let fb = render.image_all_channels();
+    let (w, h, ch) = (fb.width(), fb.height(), fb.channels());
+    if ch < 3 {
+        return Err(format!("{}: {ch}-channel JXL — RGB only", input.display()));
+    }
+    let n = w * h;
+    let buf = fb.buf();
+    // Interleaved f32 [h,w,ch] → linear planar u16 [3,h,w], alpha (ch 4) dropped. Rows are independent — rayon over the three planes' output rows via one pass per plane keeps it simple: iterate output rows of the planar buffer jointly instead.
+    let mut planar = vec![0u16; n * 3];
+    let (rp, rest) = planar.split_at_mut(n);
+    let (gp, bp) = rest.split_at_mut(n);
+    let lin_of = |e: f32| -> u16 {
+        let e = e.clamp(0., 1.);
+        #[allow(deprecated)]
+        let l = match eotf {
+            Eotf::Linear => e,
+            Eotf::Srgb => vsf::colour::srgb_eotf(e),
+            Eotf::Pow(p) => e.powf(p),
+        };
+        (l * 65535.).round() as u16
+    };
+    rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
+        let s = i * ch;
+        *r = lin_of(buf[s]);
+        *g = lin_of(buf[s + 1]);
+        *b = lin_of(buf[s + 2]);
+    });
+
+    Ok(display_referred(w, h, planar, cam_to_vsf, "jxl_colour_encoding"))
 }
 
 /// Camera RAW / DNG → [`Decoded`], in memory (no file written). Decodes via limbus, packs the sensor plane as a `BitPackedTensor` at native bit depth, records the CFA as a channel-index tile, and derives the camera→Rec.2020 cmx from the DNG ColorMatrix1 when present (3-channel sources only).
@@ -232,6 +384,34 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     };
 
     Ok(Decoded { img })
+}
+
+/// Export the rendered view as an sRGB JPEG — the ONE legacy-space concession, for posts on platforms that assume sRGB and strip everything else. Input is [`to_linear`]'s output (signed linear Rec.2020, white = 65535, orientation already applied); the live exposure is baked as a linear gain, then Rec.2020 → sRGB (thru vsf's deprecated legacy constants — deliberately: sRGB IS the legacy), clamp to gamut (the single display clamp, same boundary rule as the viewer), sRGB OETF, quality-95 JPEG. Untagged on purpose — an untagged JPEG is defined-sRGB everywhere that matters, which is exactly the consistency being bought. Nothing is written back to the source: the sensor plane stays as captured, the JPEG is a rendering.
+#[allow(deprecated)]
+pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, out: &Path) -> Result<(), String> {
+    if lin.len() != w * h * 3 {
+        return Err(format!("linear buffer {} != {w}×{h}×3", lin.len()));
+    }
+    if w > u16::MAX as usize || h > u16::MAX as usize {
+        return Err(format!("{w}×{h} exceeds JPEG's 65535 dimension limit"));
+    }
+    const SRGB_FROM_VSF_RGB: [f32; 9] = t3(vsf::colour::VSF_RGB2SRGB);
+    let m = matmul3(&SRGB_FROM_VSF_RGB, &inv3(&VSF_RGB_TO_REC2020).ok_or("Rec.2020 matrix singular")?);
+    let gain = (2f32).powf(ev) / 65535.;
+    let mut rgb8 = vec![0u8; w * h * 3];
+    rgb8.par_chunks_mut(w * 3).zip(lin.par_chunks(w * 3)).for_each(|(orow, irow)| {
+        for x in 0..w {
+            let c = [irow[x * 3] as f32 * gain, irow[x * 3 + 1] as f32 * gain, irow[x * 3 + 2] as f32 * gain];
+            for o in 0..3 {
+                let v = (m[o * 3] * c[0] + m[o * 3 + 1] * c[1] + m[o * 3 + 2] * c[2]).clamp(0., 1.);
+                orow[x * 3 + o] = (vsf::colour::srgb_oetf(v) * 255.).round() as u8;
+            }
+        }
+    });
+    let encoder = jpeg_encoder::Encoder::new_file(out, 95).map_err(|e| format!("{}: {e}", out.display()))?;
+    encoder
+        .encode(&rgb8, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+        .map_err(|e| format!("{}: {e}", out.display()))
 }
 
 /// Serialize a `SpectralImage` to a VSF-Image file.
@@ -337,41 +517,17 @@ fn apply_orientation(w: usize, h: usize, rgb: Vec<i32>, code: u16) -> (usize, us
     (ow, oh, out)
 }
 
-/// Render to linear SIGNED interleaved RGB, white at 65535 — values outside 0..65535 are preserved (negative = read noise below black / out-of-Rec.2020-gamut; above = speculars past the illuminant peak), so exposure can recover them; the single display clamp happens at the encode boundary. Mosaic: each CFA tile → one output pixel (2:1 for a 2×2 Bayer). The debayer bin, the black/white normalisation, and the camera→Rec.2020 cmx are **baked into integer Q24 constants** — the per-pixel work is one `i64` multiply-accumulate per (sample × output) and a shift; no float touches a pixel (see [`build_coefs`]). Without a cmx the constants encode a plain channel-averaged bin (raw camera space). Planar sources take the first three channels. Last, the view log's `orientation` op (EXIF tag 274, recorded at ingest) permutes the OUTPUT buffer — display honours the camera's claim while the stored plane stays exactly as captured.
-///
-/// `clip_show` is lumis's `preview_sub` indicator at opsin's levels, applied to raw counts BEFORE every other step: a sample at/above its channel's white level zeroes (blown highlights render DARK, channel-wise — a red-only clip drops only red), and a sample below its black level saturates to container max (crushed shadows render BLOWN). Display-only; the stored plane never changes.
-pub fn to_linear(dec: &Decoded, clip_show: bool) -> Result<(usize, usize, Vec<i32>), String> {
+/// Render to linear SIGNED interleaved RGB, white at 65535 — values outside 0..65535 are preserved (negative = read noise below black / out-of-Rec.2020-gamut; above = speculars past the illuminant peak), so exposure can recover them; the single display clamp happens at the encode boundary, and so does the clip indicator (lumis `preview_sub` semantics after the display matrix + EV gain — see `encode_pixels`), so this buffer stays clean for both re-encoding and JPEG export. Mosaic: each CFA tile → one output pixel (2:1 for a 2×2 Bayer). The debayer bin, the black/white normalisation, and the camera→Rec.2020 cmx are **baked into integer Q24 constants** — the per-pixel work is one `i64` multiply-accumulate per (sample × output) and a shift; no float touches a pixel (see [`build_coefs`]). Without a cmx the constants encode a plain channel-averaged bin (raw camera space). Planar sources take the first three channels. Last, the view log's `orientation` op (EXIF tag 274, recorded at ingest) permutes the OUTPUT buffer — display honours the camera's claim while the stored plane stays exactly as captured.
+pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
+    to_linear_in(dec, Target::Rec2020)
+}
+
+/// [`to_linear`] with the landing space chosen: the same integer pipeline, only the matrix differs.
+pub fn to_linear_in(dec: &Decoded, target: Target) -> Result<(usize, usize, Vec<i32>), String> {
     let img = &dec.img;
     // Display matrix derived fresh from the stored VSF-RGB profile: VSF_RGB2REC2020 × elected entry, illuminant-normalized. None ⇒ raw-camera bin.
-    let cmx = display_matrix(img);
+    let cmx = display_matrix(img, target);
     let counts = img.samples.unpack_u16();
-
-    let clip_levels: Option<Vec<(u16, u16)>> = if clip_show {
-        let k = img.channel_count();
-        let mut lv = Vec::with_capacity(k);
-        for ch in 0..k {
-            lv.push((level(&img.black, ch, k, "black")?.round() as u16, level(&img.white, ch, k, "white")?.round() as u16));
-        }
-        Some(lv)
-    } else {
-        None
-    };
-    // Identity when off; the lumis inversion when on.
-    let clip_v = |v: u16, ch: usize| -> u16 {
-        match &clip_levels {
-            Some(lv) => {
-                let (black, white) = lv[ch];
-                if v >= white {
-                    0
-                } else if v < black {
-                    u16::MAX
-                } else {
-                    v
-                }
-            }
-            None => v,
-        }
-    };
 
     let (out_w, out_h, rgb) = match &img.layout {
         PlaneLayout::Mosaic { cfa } => {
@@ -398,7 +554,7 @@ pub fn to_linear(dec: &Decoded, clip_show: bool) -> Result<(usize, usize, Vec<i3
                         for tx in 0..tw {
                             let ch = cfa.data[ty * tw + tx] as usize;
                             let c = &rows[ch].coef;
-                            let v = clip_v(counts[row + tx], ch) as i64;
+                            let v = counts[row + tx] as i64;
                             acc[0] += c[0] * v;
                             acc[1] += c[1] * v;
                             acc[2] += c[2] * v;
@@ -423,7 +579,7 @@ pub fn to_linear(dec: &Decoded, clip_show: bool) -> Result<(usize, usize, Vec<i3
             rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, out_row)| {
                 for x in 0..w {
                     let i = y * w + x;
-                    let cam = [clip_v(counts[i], 0) as i64, clip_v(counts[n + i], 1) as i64, clip_v(counts[2 * n + i], 2) as i64];
+                    let cam = [counts[i] as i64, counts[n + i] as i64, counts[2 * n + i] as i64];
                     for o in 0..3 {
                         let acc = rows[0].coef[o] * cam[0] + rows[1].coef[o] * cam[1] + rows[2].coef[o] * cam[2] - bias[o];
                         out_row[x * 3 + o] = q_to_lin(acc);
@@ -497,7 +653,7 @@ mod tests {
                 ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
             }),
         };
-        let (w, h, lin) = to_linear(&Decoded { img }, false).unwrap();
+        let (w, h, lin) = to_linear(&Decoded { img }).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
     }
@@ -515,3 +671,4 @@ mod tests {
         assert_eq!(px(3), &[3, 4, 5]); // B
     }
 }
+

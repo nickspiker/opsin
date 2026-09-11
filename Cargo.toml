@@ -16,5 +16,23 @@ vsf = { version = "0.9.3", path = "../vsf", features = ["inspect", "rayon"] }
 # Sensor intake — decodes RAW/DNG to counts + gives us both DNG ColorMatrices and illuminant codes to build the tiered colour_profile.
 limbus = { version = "0.0.1", path = "../limbus" }
 # CPU softbuffer compositor — hosts the viewer's event loop, chrome, paint primitives. Same dep shape as Photon's desktop block.
-fluor = { version = "0.0.4", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"] }
+fluor = { version = "0.0.4", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon", "host-winit"], optional = true }
 rayon = "1.12.0"
+jpeg-encoder = "0.7"
+jxl-oxide = "0.12.6"
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
+
+# LIBRARY + VIEWER (2026-09-11): photon renders its attachments thru opsin's colour pipeline (convert + render) and must not drag the winit host into an Android build, so the viewer's host dependency sits behind the default `viewer` feature; `default-features = false` gives a library of just the pipeline.
+[features]
+default = ["viewer"]
+viewer = ["dep:fluor"]
+
+[lib]
+name = "opsin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opsin"
+path = "src/main.rs"
+required-features = ["viewer"]
