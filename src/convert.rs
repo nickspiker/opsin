@@ -329,10 +329,22 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     let k = channels.len();
 
     // Tiered colour_profile only for 3-channel sources with a DNG colour matrix — Absolute-IDT `model`-grade entries (see derive_profile). BOTH matrices become entries, daylight-characterized one FIRST (better fit for typical scenes; ordering is a reader policy, not a destroyed decision — the loser is still carried). The verbatim DNG tags ride alongside so the derivation is auditable and re-derivable. Multispectral (k≠3) awaits the spectral resolve.
-    let profile = if k == 3 {
+    // An IDENTITY ColorMatrix1 with no ColorMatrix2 is lumis's explicit "uncalibrated" sentinel (chameleon hasn't scanned this camera yet) — not a characterization. Treating it as one would push raw camera counts through XYZ→VSF-RGB as if they were XYZ: the green, desaturated render. No profile ⇒ honest raw-camera rendering, and the HUD says so.
+    let identity = |m: &[f32; 9]| m.iter().zip(&[1f32, 0., 0., 0., 1., 0., 0., 0., 1.]).all(|(a, b)| (a - b).abs() < 1e-6);
+    let uncalibrated = info.colourmatrix1.as_ref().is_some_and(identity) && info.colourmatrix2.is_none();
+    // A "Verichrome scene-relative IDT" profile name means the matrix came from a chameleon target scan of THIS camera: `unit` grade, `relative` (DSR) class — elected first over any factory matrix. Header read only; a non-TIFF or missing tag just leaves the factory grading.
+    let verichrome = crate::tiff::FrameMeta::read_path(input).ok().and_then(|m| m.profile_name).is_some_and(|n| n.to_ascii_lowercase().contains("verichrome"));
+    let profile = if k == 3 && !uncalibrated {
         let daylight = |code: u16| matches!(code, 0 | 1 | 9 | 10 | 20 | 21 | 22 | 23);
-        let e1 = info.colourmatrix1.and_then(|m| derive_profile(m, info.calibrationilluminant1, "dng_colormatrix1"));
-        let e2 = info.colourmatrix2.and_then(|m| derive_profile(m, info.calibrationilluminant2, "dng_colormatrix2"));
+        let grade = |mut e: ProfileEntry| {
+            if verichrome {
+                e.grade = ProfileGrade::Unit;
+                e.class = IdtClass::Relative;
+            }
+            e
+        };
+        let e1 = info.colourmatrix1.and_then(|m| derive_profile(m, info.calibrationilluminant1, "dng_colormatrix1")).map(grade);
+        let e2 = info.colourmatrix2.and_then(|m| derive_profile(m, info.calibrationilluminant2, "dng_colormatrix2")).map(grade);
         // Order best-first: put the daylight-family entry ahead of the other.
         let cm2_first = daylight(info.calibrationilluminant2) && !daylight(info.calibrationilluminant1);
         let entries: Vec<ProfileEntry> = if cm2_first {

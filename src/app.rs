@@ -83,6 +83,8 @@ pub struct OpsinApp {
     btn_fit: fluor::widgets::Button,
     /// sRGB JPEG export pill — the visible face of the `E` key.
     btn_export: fluor::widgets::Button,
+    /// Frame-info HUD toggle pill — the visible face of the `I` key; filled while the HUD is shown.
+    btn_info: fluor::widgets::Button,
     /// True while dragging the exposure slider handle.
     ev_drag: bool,
     /// True while dragging inside the navigator — every cursor move re-centers the main view live.
@@ -94,6 +96,14 @@ pub struct OpsinApp {
     chord_lb_release: Option<Instant>,
     chord_rb_press: Option<Instant>,
     chord_rb_release: Option<Instant>,
+    /// Frame info HUD (metadata + live stats) over the image area's bottom-left; `I` toggles. Default on — opsin is an instrument, the readings are the point.
+    show_info: bool,
+    /// DNG header metadata for the HUD (EXIF exposure fields, profile name, baseline exposure); `None` for non-TIFF sources.
+    meta: Option<crate::tiff::FrameMeta>,
+    file_size: u64,
+    file_name: String,
+    /// Image pixel under the cursor at the last HUD-relevant redraw — the redraw gate for cursor motion (only a CHANGE of image pixel repaints, so high zoom doesn't repaint per screen pixel).
+    info_px: Option<(usize, usize)>,
     /// Hitmask debug overlay active ([]h) — render's last act replaces every pixel with its hit id's palette colour.
     show_hitmask: bool,
     /// 256 random opaque colours (α+darkness), regenerated on each []h enable so distinct ids always pop.
@@ -105,6 +115,12 @@ const CHORD_RELEASE_GRACE: Duration = Duration::from_millis(40);
 
 /// Clip pill fill while the indicator is live — a warning red so the false-colour preview can't be mistaken for the image.
 const CLIP_ON_FILL: u32 = argb(0x8B, 0x30, 0x30, 0xFF);
+
+/// Info pill fill while the HUD is shown — a quiet blue-grey, distinct from the clip pill's warning red.
+const INFO_ON_FILL: u32 = argb(0x30, 0x48, 0x70, 0xFF);
+
+/// HUD backdrop — translucent near-black so the readings stay legible over any image content.
+const HUD_BG: u32 = argb(0x10, 0x10, 0x10, 0xB8);
 
 /// Exposure slider half-range in stops.
 const EV_RANGE: f32 = (1 << 2) as f32;
@@ -128,6 +144,9 @@ struct Loaded {
     /// The decode itself, retained so the clip toggle re-renders without touching disk. `None` only for the empty drop-target state.
     dec: Option<crate::convert::Decoded>,
     title: String,
+    meta: Option<crate::tiff::FrameMeta>,
+    file_size: u64,
+    file_name: String,
 }
 
 /// The raw sensor plane retained for the view-live histogram: unpacked counts, CFA channel routing, black/white levels, and the orientation bridge from display coords back to sensor tiles. Everything the per-frame binning needs, nothing borrowed from the decode.
@@ -228,6 +247,29 @@ impl RawView {
                     codes[self.counts[base + ty * self.sensor_w + tx] as usize][ch] += 1;
                 }
             }
+        }
+    }
+
+    /// Every raw sample under display pixel (dx, dy) as (channel, count), tile order — the HUD's cursor readout. Same orientation bridge as the histogram, so the two can't disagree about which sensor tile a screen pixel shows.
+    fn samples_at(&self, dx: usize, dy: usize) -> Vec<(usize, u16)> {
+        // Display dims are the pre-orientation dims, swapped for the transposing codes (5..=8); check BEFORE the bridge — its subtractions assume in-range input.
+        let (dw, dh) = if self.orient >= 5 { (self.pre_h, self.pre_w) } else { (self.pre_w, self.pre_h) };
+        if self.counts.is_empty() || dx >= dw || dy >= dh {
+            return Vec::new();
+        }
+        let (sx, sy) = crate::convert::orientation_src(self.orient, self.pre_w, self.pre_h, dx, dy);
+        if self.planar_n > 0 {
+            let idx = sy * self.sensor_w + sx;
+            (0..3).map(|ch| (ch, self.counts[ch * self.planar_n + idx])).collect()
+        } else {
+            let base = sy * self.tile_h * self.sensor_w + sx * self.tile_w;
+            let mut out = Vec::with_capacity(self.tile_w * self.tile_h);
+            for ty in 0..self.tile_h {
+                for tx in 0..self.tile_w {
+                    out.push((self.cfa[ty * self.tile_w + tx] as usize, self.counts[base + ty * self.sensor_w + tx]));
+                }
+            }
+            out
         }
     }
 
@@ -334,7 +376,11 @@ fn load_image(path: &Path) -> Result<Loaded, String> {
         dec.img.channel_count(),
         dec.img.bit_depth()
     );
-    Ok(Loaded { pixels, lin, w, h, raw, dec: Some(dec), title })
+    // Header-only reads for the HUD; a non-TIFF source (JXL/JPEG/VSF) simply has no EXIF block here.
+    let meta = crate::tiff::FrameMeta::read_path(path).ok();
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok(Loaded { pixels, lin, w, h, raw, dec: Some(dec), title, meta, file_size, file_name })
 }
 
 /// Sorted list of supported images in `dir`.
@@ -377,6 +423,9 @@ impl OpsinApp {
             h: 0,
             raw: RawView::empty(),
             dec: None,
+            meta: None,
+            file_size: 0,
+            file_name: String::new(),
             title: "opsin — drop an image".to_string(),
         };
         Self::from_loaded(loaded, Vec::new(), 0)
@@ -406,6 +455,8 @@ impl OpsinApp {
         let btn_one = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "1:1");
         let btn_fit = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Fit");
         let btn_export = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "JPEG");
+        let mut btn_info = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Info");
+        btn_info.set_fill(Some(INFO_ON_FILL));
         let btn_xscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "X Lin");
         let btn_yscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Y Lin");
         let btn_clip = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Clip");
@@ -444,6 +495,7 @@ impl OpsinApp {
             btn_one,
             btn_fit,
             btn_export,
+            btn_info,
             ev_drag: false,
             nav_drag: false,
             hit_count: hit_counter,
@@ -451,6 +503,11 @@ impl OpsinApp {
             chord_lb_release: None,
             chord_rb_press: None,
             chord_rb_release: None,
+            show_info: true,
+            meta: loaded.meta,
+            file_size: loaded.file_size,
+            file_name: loaded.file_name,
+            info_px: None,
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
         }
@@ -600,7 +657,7 @@ impl OpsinApp {
         ctx.window.request_redraw();
     }
 
-    /// Swap the decoded image into the view: title, pixels, dims, panel tools, redraw. Same dimensions ⇒ the view state carries over — pan, zoom, and exposure stay put so stepping through a burst or LED sequence compares like with like. Different dimensions ⇒ refit and reset exposure. Dims arrive from `to_linear` with EXIF orientation already applied, so they remain the whole test — a 90°-tagged frame in a landscape burst lands portrait and correctly refits.
+    /// Swap the decoded image into the view: title, pixels, dims, panel tools, redraw. EVERY setting the operator holds survives a load — exposure, clip, histogram axes, the HUD, the panel split, the window — whether the frame arrives by arrow, drop, or socket handoff. Same dimensions ⇒ pan and zoom stay put too, so stepping through a burst or LED sequence compares like with like; different dimensions ⇒ refit (the one thing that can't sensibly carry: a composition framed on one sensor's dims). Dims arrive from `to_linear` with EXIF orientation already applied, so they remain the whole test — a 90°-tagged frame in a landscape burst lands portrait and correctly refits.
     fn install(&mut self, loaded: Loaded, ctx: &mut Context) {
         let same_geometry = loaded.w == self.img_w && loaded.h == self.img_h && self.img_w > 0;
         self.chrome.set_title(&loaded.title);
@@ -611,17 +668,17 @@ impl OpsinApp {
         self.lin = loaded.lin;
         self.raw = loaded.raw;
         self.dec = loaded.dec;
-        if self.clip_show || (same_geometry && self.ev.abs() > 1e-4) {
-            // Carry the exposure and/or the live clip indicator into the new frame (loaded.pixels were encoded plain at EV 0). Exposure only carries over same geometry; the indicator is a mode and carries always.
-            let ev = if same_geometry { self.ev } else { 0. };
-            self.pixels = encode_pixels(&self.lin, ev, self.clip_show);
+        self.meta = loaded.meta;
+        self.file_size = loaded.file_size;
+        self.file_name = loaded.file_name;
+        if self.clip_show || self.ev.abs() > 1e-4 {
+            // Carry the exposure and the clip indicator into the new frame (loaded.pixels were encoded plain at EV 0) — both are the operator's settings, not the frame's.
+            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show);
             self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
         } else {
             self.pixels = loaded.pixels;
         }
         if !same_geometry {
-            self.ev = 0.;
-            self.ev_slider.set_value(0.5);
             self.fit(ctx.viewport);
         }
         ctx.window.request_redraw();
@@ -758,6 +815,68 @@ impl OpsinApp {
         x >= ox && y >= oy && x < ox + self.img_w as f32 * zoom && y < oy + self.img_h as f32 * zoom
     }
 
+    /// Frame-info HUD on/off — the `I` key and the Info pill share this; the pill's fill tracks the state.
+    fn toggle_info(&mut self, ctx: &mut Context) {
+        self.show_info = !self.show_info;
+        self.btn_info.set_fill(self.show_info.then_some(INFO_ON_FILL));
+        ctx.window.request_redraw();
+    }
+
+    /// The image pixel under screen point (x, y), if it's on the drawn image.
+    fn image_px_at(&self, x: f32, y: f32, viewport: Viewport) -> Option<(usize, usize)> {
+        if !self.on_image(x, y, viewport) {
+            return None;
+        }
+        let (zoom, ox, oy) = self.view_px(viewport);
+        Some((((x - ox) / zoom) as usize, ((y - oy) / zoom) as usize))
+    }
+
+    /// The HUD's lines: file → camera/sensor → exposure → levels → IDT (grade, class, illuminant, the nine numbers) → live view state → the raw samples and linear display value under the cursor. Everything here is a reading, not an interpretation: raw counts are the sensor's own ADC codes, `lin` is the signed Rec.2020 the display encodes from (white = 1).
+    fn info_lines(&self) -> Vec<String> {
+        let Some(dec) = &self.dec else { return Vec::new() };
+        let img = &dec.img;
+        let mut v = Vec::new();
+        let size = |b: u64| if b >= 1 << 20 { format!("{:.1} MB", b as f64 / (1u64 << 20) as f64) } else { format!("{:.0} kB", b as f64 / 1024.) };
+        let rat = |(n, d): (u32, u32)| if d == 0 { 0. } else { n as f64 / d as f64 };
+        let meta = self.meta.as_ref();
+        let datetime = meta.and_then(|m| m.datetime.clone()).unwrap_or_default();
+        v.push(format!("{}  {}  {datetime}", self.file_name, size(self.file_size)));
+        let layout = match &img.layout {
+            vsf::spectral_image::PlaneLayout::Mosaic { cfa } => format!("CFA {}×{} {:?}", cfa.shape[1], cfa.shape[0], cfa.data),
+            vsf::spectral_image::PlaneLayout::Planar => "planar".to_string(),
+        };
+        v.push(format!("{} {}  {}×{}  {} ch  {}-bit  {layout}", img.make, img.model, img.width, img.height, img.channel_count(), img.bit_depth()));
+        if let Some(m) = meta {
+            let mut parts = Vec::new();
+            if let Some(f) = m.focal { parts.push(format!("{} mm", trim_f(rat(f), 3))); }
+            if let Some(f) = m.f_number { parts.push(format!("f/{:.1}", rat(f))); }
+            if let Some(t) = m.exposure_s {
+                let t = rat(t);
+                parts.push(if t > 0. && t < 1. { format!("1/{:.0} s ({:.4} s)", 1. / t, t) } else { format!("{t:.3} s") });
+            }
+            if let Some(i) = m.iso { parts.push(format!("ISO {i}")); }
+            if let Some(b) = m.baseline_exposure { parts.push(format!("baseline {:+.2} EV", if b.1 == 0 { 0. } else { b.0 as f64 / b.1 as f64 })); }
+            if !parts.is_empty() { v.push(parts.join("  ")); }
+        }
+        let orient = crate::convert::orientation_code(img);
+        let level = |l: &[f32]| if l.iter().all(|v| v == &l[0]) { trim_f(l[0] as f64, 2) } else { format!("{l:?}") };
+        v.push(format!("black {}  white {}  orientation {orient}", level(&img.black), level(&img.white)));
+        match img.profile.as_ref().and_then(|p| p.entries.first().map(|e| (p, e))) {
+            Some((p, e)) => {
+                let ill = match e.illuminant { 17 | 2 => "A", 20 => "D55", 21 => "D65", 22 => "D75", 23 => "D50", 0 => "-", _ => "?" };
+                let name = meta.and_then(|m| m.profile_name.clone()).map(|n| format!("  \"{n}\"")).unwrap_or_default();
+                v.push(format!("IDT {}  {}  {}  {ill}{name}", e.source, e.grade.as_str(), e.class.as_str()));
+                if let Some((m, _)) = p.dng_colormatrix[0] {
+                    for r in 0..3 {
+                        v.push(format!("   {:>9.5} {:>9.5} {:>9.5}", m[r * 3], m[r * 3 + 1], m[r * 3 + 2]));
+                    }
+                }
+            }
+            None => v.push(if matches!(&img.layout, vsf::spectral_image::PlaneLayout::Mosaic { .. }) { "IDT none — uncalibrated (identity ColorMatrix), rendering raw camera".to_string() } else { "IDT none".to_string() }),
+        }
+        v
+    }
+
     /// Rescale around a screen-space anchor so the image point under the cursor stays put — computed in derived pixel space, stored back as relative state. Zoom is unbounded — the blit cost is capped by screen area at any zoom, and the wheel factor is strictly positive so zoom can't reach 0 (the old clamp was defensive theater).
     fn zoom_around(&mut self, factor: f32, ax: f32, ay: f32, viewport: Viewport) {
         let (zoom, ox, oy) = self.view_px(viewport);
@@ -820,6 +939,12 @@ impl OpsinApp {
     }
 }
 
+/// Fixed-precision float with trailing zeros (and a bare point) trimmed — "6.9", not "6.900".
+fn trim_f(v: f64, prec: usize) -> String {
+    let s = format!("{v:.prec$}");
+    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+}
+
 /// Under-compose one pixel, bounds-unchecked by construction (callers clamp rects to the buffer).
 #[inline]
 fn put(target: &mut [u32], buf_w: usize, x: usize, y: usize, colour: u32) {
@@ -833,14 +958,44 @@ impl Container for OpsinApp {
         f(&mut self.btn_one);
         f(&mut self.btn_fit);
         f(&mut self.btn_export);
+        f(&mut self.btn_info);
         f(&mut self.btn_xscale);
         f(&mut self.btn_yscale);
         f(&mut self.btn_clip);
     }
 }
 
+/// The single-instance socket path once bound (so main can unlink it on exit). A process-wide cell because the app is moved into the host's event loop and main never sees it again.
+static SOCKET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+impl OpsinApp {
+    pub fn socket_cell() -> &'static std::sync::Mutex<Option<PathBuf>> {
+        &SOCKET
+    }
+}
+
 impl FluorApp for OpsinApp {
-    type UserEvent = ();
+    /// A path handed over by a later `opsin <file>` launch (see `instance.rs`); `None` = bare `opsin`, just raise the window.
+    type UserEvent = Option<PathBuf>;
+
+    /// The host's wake-sender arrives once before init: become the single instance now — bind the socket and ship the sender to the listener thread, which forwards each handed-over path to `on_user_event`.
+    fn set_event_proxy(&mut self, proxy: std::sync::Arc<dyn fluor::host::WakeSender<Self::UserEvent>>) {
+        if let Some(sock) = crate::instance::listen(move |path| {
+            let _ = proxy.send(path);
+        }) {
+            if let Ok(mut cell) = SOCKET.lock() {
+                *cell = Some(sock);
+            }
+        }
+    }
+
+    fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) -> EventResponse {
+        if let Some(path) = event {
+            self.show_path(&path, ctx);
+        }
+        // Front + focus even if the load failed (the user just asked for this window) — WITHOUT moving it: the composition, panel, and window rect are the operator's and survive a handoff.
+        EventResponse::Raise
+    }
 
     fn title(&self) -> &str {
         &self.title
@@ -901,8 +1056,16 @@ impl FluorApp for OpsinApp {
                 }
                 let hit = self.chrome.hit_at(cx, cy);
                 let mut dirty = self.chrome.set_hover(hit);
+                // HUD cursor readout: repaint only when the IMAGE pixel under the cursor changes (or the cursor leaves the image), never per screen pixel.
+                if self.show_info && self.img_w > 0 {
+                    let px = self.image_px_at(cx, cy, ctx.viewport);
+                    if px != self.info_px {
+                        self.info_px = px;
+                        dirty = true;
+                    }
+                }
                 // Pill button hover — driven by the same stamped hit map as the chrome controls.
-                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
+                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_info, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
                     let over = hit == b.hit_id();
                     if b.is_hovered() != over {
                         b.set_hovered(over);
@@ -950,6 +1113,9 @@ impl FluorApp for OpsinApp {
                             Ok(out) => println!("opsin: wrote {}", out.display()),
                             Err(e) => eprintln!("opsin: JPEG export failed: {e}"),
                         }
+                    }
+                    if self.btn_info.take_click() {
+                        self.toggle_info(ctx);
                     }
                     if self.btn_xscale.take_click() {
                         // X: linear counts ↔ log2 stops — an explicit, labelled remap; the pill always reads the CURRENT mode.
@@ -1076,6 +1242,7 @@ impl FluorApp for OpsinApp {
                 if event.state != ElementState::Pressed {
                     return EventResponse::Pass;
                 }
+                let ctrl = ctx.modifiers.control_key() || ctx.modifiers.super_key();
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) => EventResponse::Close,
                     Key::Named(NamedKey::ArrowLeft) => {
@@ -1084,6 +1251,31 @@ impl FluorApp for OpsinApp {
                     }
                     Key::Named(NamedKey::ArrowRight) => {
                         self.navigate(1, ctx);
+                        EventResponse::Handled
+                    }
+                    // Ctrl+C / Ctrl+V: the IDT clipboard — copy the current frame's DSR magic-9, paste it into the current frame (same camera only). Checked BEFORE the bare V (convert) arm so the modifier wins.
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => {
+                        match self.dir_list.get(self.dir_idx).ok_or_else(|| "no image loaded".to_string()).and_then(|p| crate::idt::IdtClip::copy_from(p)).and_then(|clip| clip.save().map(|path| (clip, path))) {
+                            Ok((clip, path)) => println!("opsin: copied IDT from {} → {}\n{}", clip.source, path.display(), clip.to_text()),
+                            Err(e) => eprintln!("opsin: copy IDT failed: {e}"),
+                        }
+                        EventResponse::Handled
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                        let Some(target) = self.dir_list.get(self.dir_idx).cloned() else {
+                            eprintln!("opsin: paste IDT: no image loaded");
+                            return EventResponse::Handled;
+                        };
+                        // Shift = force: paste over a fingerprint mismatch (the lens-change case). The report line carries the WARNING.
+                        let force = ctx.modifiers.shift_key();
+                        match crate::idt::IdtClip::load().and_then(|clip| clip.paste_into(&target, force)) {
+                            Ok(report) => {
+                                println!("opsin: {report}");
+                                // The file changed under us — reload so the display renders through the pasted IDT.
+                                self.show_path(&target, ctx);
+                            }
+                            Err(e) => eprintln!("opsin: paste IDT failed: {e}"),
+                        }
                         EventResponse::Handled
                     }
                     Key::Character(c) if c.eq_ignore_ascii_case("v") => {
@@ -1098,6 +1290,10 @@ impl FluorApp for OpsinApp {
                             Ok(out) => println!("opsin: wrote {}", out.display()),
                             Err(e) => eprintln!("opsin: JPEG export failed: {e}"),
                         }
+                        EventResponse::Handled
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("i") => {
+                        self.toggle_info(ctx);
                         EventResponse::Handled
                     }
                     Key::Character(c) if c.eq_ignore_ascii_case("f") => {
@@ -1168,10 +1364,10 @@ impl FluorApp for OpsinApp {
             for &(sx, sy, sw, sh) in &[btns, hist] {
                 paint::fill_rect(&mut canvas, sx as isize, (sy + sh) as isize + 4, sw as isize, 0, HAIRLINE, clip, None);
             }
-            // 1:1 / magnification / Fit / JPEG — the band splits in quarters: fluor pill Buttons (same widget family as the slider and chrome) around the LIVE magnification readout (screen px per image px: 1x = pixel-exact certificate, 2.00x = zoomed in past it). The readout derives from the same per-frame span-relative transform as the blit, so it tracks every window op — press 1:1, resize, and it honestly drifts; that's the relative model reporting itself. JPEG is the export pill — the visible face of the E key.
+            // 1:1 / magnification / Fit / JPEG / Info — the band splits in fifths: fluor pill Buttons (same widget family as the slider and chrome) around the LIVE magnification readout (screen px per image px: 1x = pixel-exact certificate, 2.00x = zoomed in past it). The readout derives from the same per-frame span-relative transform as the blit, so it tracks every window op — press 1:1, resize, and it honestly drifts; that's the relative model reporting itself. JPEG is the export pill — the visible face of the E key.
             let (bx, by, bw, bh) = btns;
             if bw > 2 && bh > 0 && self.img_w > 0 {
-                let quarter = bw as f32 / 4.;
+                let quarter = bw as f32 / 5.;
                 let font = bh as f32 / 2.;
                 let bcy = by as f32 + bh as f32 / 2.;
                 self.btn_one.set_rect(bx as f32 + quarter * 0.5, bcy, quarter, bh as f32);
@@ -1180,6 +1376,10 @@ impl FluorApp for OpsinApp {
                 self.btn_fit.set_font_size(font);
                 self.btn_export.set_rect(bx as f32 + quarter * 3.5, bcy, quarter, bh as f32);
                 self.btn_export.set_font_size(font);
+                self.btn_info.set_rect(bx as f32 + quarter * 4.5, bcy, quarter, bh as f32);
+                self.btn_info.set_font_size(font);
+                let id = self.btn_info.hit_id();
+                self.btn_info.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
                 let id = self.btn_one.hit_id();
                 self.btn_one.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
                 let id = self.btn_fit.hit_id();
@@ -1398,6 +1598,37 @@ impl FluorApp for OpsinApp {
             paint::fill_rect(&mut canvas, (divider_px + 1) as isize, 0, (buf_w - divider_px - 1) as isize, buf_h as isize, PANEL_BG, clip, None);
         }
 
+        // Frame info HUD — bottom-left of the image area, drawn BEFORE the image so the under-compose order puts it on top: static frame lines from `info_lines`, then the live view state and the cursor readout (raw ADC codes of every sample in the tile under the cursor + the linear display value). A translucent dark backdrop keeps it legible over any content.
+        if self.show_info && self.img_w > 0 {
+            let band = (ctx.viewport.effective_span() / (1 << 6) as f32).ceil();
+            // Readable at a glance, not a footnote: the same size as the pill labels' band, ~2× the panel captions.
+            let font = band * 0.9;
+            let line_h = font * 1.3;
+            let pad = band / 2.;
+            let mut lines = self.info_lines();
+            lines.push(format!("EV {:+.2}  zoom {}x  clip {}", self.ev, trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }));
+            if let Some((px, py)) = self.image_px_at(ctx.cursor_x, ctx.cursor_y, ctx.viewport) {
+                let names: Vec<String> = self.dec.as_ref().map(|d| d.img.channels.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
+                let raw: Vec<String> = self.raw.samples_at(px, py).into_iter().map(|(ch, v)| format!("{} {v}", names.get(ch).map(String::as_str).unwrap_or("?"))).collect();
+                let i = (py * self.img_w + px) * 3;
+                let lin = if i + 2 < self.lin.len() { format!("  lin {:.4} {:.4} {:.4}", self.lin[i] as f32 / 65535., self.lin[i + 1] as f32 / 65535., self.lin[i + 2] as f32 / 65535.) } else { String::new() };
+                lines.push(format!("px {px},{py}  raw {}{lin}", raw.join(" ")));
+            }
+            let style = fluor::text::TextStyle::new(font, TEXT_GREY);
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            let x0 = pad;
+            let box_h = line_h * lines.len() as f32 + pad;
+            let y_top = buf_h as f32 - pad - box_h;
+            let mut max_w: f32 = 0.;
+            for (i, line) in lines.iter().enumerate() {
+                let y = y_top + pad / 2. + line_h * (i as f32 + 0.5);
+                let w = ctx.text.draw_text_left(&mut canvas, line, x0 + pad / 2., y, &style, clip, None);
+                max_w = max_w.max(w);
+            }
+            let box_w = (max_w + pad).min(divider_px as f32 - x0);
+            paint::fill_rect(&mut canvas, x0 as isize, y_top as isize, box_w as isize, box_h as isize, HUD_BG, clip, None);
+        }
+
         // Nearest-neighbour blit of the image rect ∩ image area (left of the divider, below the bar). Per-row source index precomputed once; per-pixel work is one under() compose.
         let x0 = img_ox.max(0.) as usize;
         let y0 = (img_oy.max(0.) as usize).max(bar_h);
@@ -1460,7 +1691,7 @@ impl FluorApp for OpsinApp {
         if self.chrome.owns_hit(hit) && hit != self.chrome.app_icon_btn.id() {
             return CursorIcon::Pointer;
         }
-        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
+        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_info.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
             return CursorIcon::Pointer;
         }
         // Resize arrows only where a press would actually resize — the bar body below the sliver stays Default (it moves the window).
