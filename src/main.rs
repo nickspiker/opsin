@@ -9,6 +9,8 @@
 
 mod app;
 mod convert;
+mod headerless;
+mod sniff;
 mod idt;
 mod instance;
 mod tiff;

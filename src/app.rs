@@ -767,7 +767,7 @@ impl OpsinApp {
         let Some(src) = self.dir_list.get(self.dir_idx) else {
             return Err("no image loaded".to_string());
         };
-        if src.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("vsf")).unwrap_or(false) {
+        if crate::sniff::sniff_path(src) == Some(crate::sniff::Kind::Vsf) {
             return Err("already a VSF image".to_string());
         }
         let out = src.with_extension("vsf");

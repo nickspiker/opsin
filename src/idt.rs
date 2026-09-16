@@ -149,8 +149,7 @@ fn rational_of_f32(v: f32) -> SRational {
 impl IdtClip {
     /// Lift the IDT out of `path`: a DNG (verbatim rationals from ColorMatrix1) or a VSF-Image carrying a verbatim DNG matrix in its colour_profile.
     pub fn copy_from(path: &Path) -> Result<IdtClip, String> {
-        let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-        if ext.as_deref() == Some("vsf") {
+        if crate::sniff::sniff_path(path) == Some(crate::sniff::Kind::Vsf) {
             return Self::copy_from_vsf(path);
         }
         let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;

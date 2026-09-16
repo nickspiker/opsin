@@ -9,17 +9,9 @@ use std::path::Path;
 use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
 use vsf::{BitPackedTensor, Tensor};
 
-/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the RAW/TIFF family goes through limbus (50+ RAW formats — this is a representative common subset, not exhaustive); `jxl`/`jpg`/`webp` are the display-referred ingests (lumis exports and web files — JPEG and WebP are assumed sRGB, the format convention).
-pub const SUPPORTED_EXTS: &[&str] = &[
-    "vsf", "dng", "arw", "cr2", "cr3", "nef", "nrw", "raf", "rw2", "orf", "pef", "srw", "raw", "tif", "tiff", "jxl", "jpg", "jpeg", "webp",
-];
-
-/// Is `path` a file the viewer can open (by extension)?
+/// Is `path` a file the viewer lists for arrow navigation? Decided by its first bytes ([`crate::sniff`]), never its name: a file whose bytes carry a signature we decode. A file with no signature still OPENS (the headerless guesser takes it) — it just isn't swept up when arrowing thru a folder of images.
 pub fn is_supported(path: &Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => SUPPORTED_EXTS.contains(&e.to_ascii_lowercase().as_str()),
-        None => false,
-    }
+    matches!(crate::sniff::sniff_path(path), Some(k) if k != crate::sniff::Kind::Unknown)
 }
 
 /// A decoded image ready to render: the spectral data, carrying its own tiered [`vsf::spectral_image::ColourProfile`] in `img.profile` (`None` ⇒ render raw-camera). The display matrix is derived from the profile at render time — nothing display-space is stored.
@@ -147,19 +139,28 @@ fn display_matrix(img: &SpectralImage, target: Target) -> Option<[f32; 9]> {
     Some(disp)
 }
 
-/// Decode any supported source into a [`Decoded`]: VSF-Image files are read directly (no cmx yet); everything else is ingested through limbus (camera RAW / DNG) with a camera→Rec.2020 cmx when a ColorMatrix1 is present.
+/// Decode any file into a [`Decoded`]. The bytes say what they are ([`crate::sniff`]); the name is never consulted. VSF-Image files are read directly (the profile round-trips inside the file, so a reopened VSF renders colour-managed); JPEG, WebP and JXL take their display-referred ingests; the TIFF/RAW family goes thru limbus with a camera→VSF-RGB profile when a ColorMatrix is present. Bytes with no signature, or a recognised file its decoder rejects, become a picture anyway thru [`crate::headerless`] — the decoder's complaint rides in `model` so the HUD says why you are looking at bytes.
 pub fn load_any(input: &Path) -> Result<Decoded, String> {
-    match input.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-        Some("vsf") => {
-            let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
-            let img = spectral_image::read(&bytes).map_err(|e| e.to_string())?;
-            // The profile round-trips inside the file, so a reopened VSF renders colour-managed — no separate cmx to reconstruct.
-            Ok(Decoded { img })
+    use crate::sniff::Kind;
+    let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let kind = crate::sniff::sniff(&bytes);
+    let known = match kind {
+        Kind::Vsf => spectral_image::read(&bytes).map(|img| Decoded { img }).map_err(|e| e.to_string()),
+        Kind::Jxl => ingest_jxl(&bytes),
+        Kind::Jpeg => ingest_jpeg(&bytes),
+        Kind::WebP => ingest_webp(&bytes),
+        Kind::Tiff | Kind::Cr3 | Kind::Raf | Kind::Crw => ingest_image(input),
+        Kind::Unknown => Err(String::new()),
+    };
+    match known {
+        Ok(dec) => Ok(dec),
+        Err(why) => {
+            let mut dec = crate::headerless::guess(&bytes).map_err(|e| format!("{}: {e}", input.display()))?;
+            if kind != Kind::Unknown {
+                dec.img.model = format!("{} ({}: {why})", dec.img.model, kind.label());
+            }
+            Ok(dec)
         }
-        Some("jxl") => ingest_jxl(input),
-        Some("jpg" | "jpeg") => ingest_jpeg(input),
-        Some("webp") => ingest_webp(input),
-        _ => ingest_image(input),
     }
 }
 
@@ -197,16 +198,15 @@ fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], 
 
 /// Untagged-convention JPEG → [`Decoded`]: decoded RGB8 assumed sRGB (the web's defined default — same assumption every platform makes), sRGB EOTF un-done to linear via a 256-entry LUT, stored planar u16 with an sRGB→VSF-RGB `Assumed` entry. ICC profiles, if present, are ignored — the whole point of this path is the sRGB convention. EXIF orientation is not parsed yet (most posts are pre-rotated); greyscale JPEGs come back RGB from the decoder's requested output space.
 #[allow(deprecated)]
-fn ingest_jpeg(input: &Path) -> Result<Decoded, String> {
-    let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     let options = zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
     let mut dec = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
-    let rgb = dec.decode().map_err(|e| format!("{}: {e}", input.display()))?;
-    let info = dec.info().ok_or_else(|| format!("{}: no dimensions", input.display()))?;
+    let rgb = dec.decode().map_err(|e| e.to_string())?;
+    let info = dec.info().ok_or_else(|| format!("no dimensions"))?;
     let (w, h) = (info.width as usize, info.height as usize);
     let n = w * h;
     if rgb.len() != n * 3 {
-        return Err(format!("{}: decoded {} bytes for {w}×{h}×3", input.display(), rgb.len()));
+        return Err(format!("decoded {} bytes for {w}×{h}×3", rgb.len()));
     }
     let planar = srgb8_to_linear_planar(&rgb, 3, n);
     Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "jpeg_assumed_srgb"))
@@ -243,35 +243,34 @@ fn srgb8_to_linear_planar(px: &[u8], stride: usize, n: usize) -> Vec<u16> {
 }
 
 /// Untagged-convention WebP → [`Decoded`]: the JPEG path's twin. Lossy and lossless both decode to RGB8 (RGBA8 when the extended header carries alpha — composited over black in linear), assumed sRGB like every web file, linearized and stored planar u16 with the same sRGB→VSF-RGB `Assumed` entry. An animated file yields its first frame. The ICC chunk is ignored on purpose (the sRGB convention IS this path) and EXIF orientation is not parsed, matching JPEG.
-fn ingest_webp(input: &Path) -> Result<Decoded, String> {
-    let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
-    let mut dec = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("{}: {e}", input.display()))?;
+fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
+    let mut dec = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let (w, h) = dec.dimensions();
     let (w, h) = (w as usize, h as usize);
     let n = w * h;
     let stride = if dec.has_alpha() { 4 } else { 3 };
-    let len = dec.output_buffer_size().ok_or_else(|| format!("{}: {w}×{h} does not fit in memory", input.display()))?;
+    let len = dec.output_buffer_size().ok_or_else(|| format!("{w}×{h} does not fit in memory"))?;
     let mut px = vec![0u8; len];
-    dec.read_image(&mut px).map_err(|e| format!("{}: {e}", input.display()))?;
+    dec.read_image(&mut px).map_err(|e| e.to_string())?;
     if px.len() != n * stride {
-        return Err(format!("{}: decoded {} bytes for {w}×{h}×{stride}", input.display(), px.len()));
+        return Err(format!("decoded {} bytes for {w}×{h}×{stride}", px.len()));
     }
     let planar = srgb8_to_linear_planar(&px, stride, n);
     Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "webp_assumed_srgb"))
 }
 
 /// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. ICC-profiled and HDR (PQ/HLG) streams are rejected rather than guessed at.
-fn ingest_jxl(input: &Path) -> Result<Decoded, String> {
+fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     use jxl_oxide::color::{ColourEncoding, Primaries, TransferFunction};
-    let image = jxl_oxide::JxlImage::builder().open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let image = jxl_oxide::JxlImage::builder().read(bytes).map_err(|e| e.to_string())?;
     let ColourEncoding::Enum(enc) = &image.image_header().metadata.colour_encoding else {
-        return Err(format!("{}: ICC-profiled JXL not supported (enum colour encodings only)", input.display()));
+        return Err(format!("ICC-profiled JXL not supported (enum colour encodings only)"));
     };
     // Display space → linear VSF RGB, from the tagged primaries (white D65 for both). This is the profile entry's matrix — the stored plane is linear in the TAGGED primaries; VSF RGB is reached at read time like every other source.
     let cam_to_vsf: [f32; 9] = match enc.primaries {
         Primaries::Srgb => t3(vsf::colour::SRGB2VSF_RGB),
         Primaries::Bt2100 => inv3(&VSF_RGB_TO_REC2020).ok_or("Rec.2020 primaries matrix singular")?,
-        other => return Err(format!("{}: unsupported JXL primaries {other:?}", input.display())),
+        other => return Err(format!("unsupported JXL primaries {other:?}")),
     };
     // EOTF exponent/curve to LINEARIZE the decoded samples. jxl gamma signalling is the OETF gamma (lumis writes 0.5 for its sqrt encode), parsed with `inverted: true` ⇒ EOTF exponent = 1e7/g.
     enum Eotf {
@@ -283,14 +282,14 @@ fn ingest_jxl(input: &Path) -> Result<Decoded, String> {
         TransferFunction::Linear => Eotf::Linear,
         TransferFunction::Srgb => Eotf::Srgb,
         TransferFunction::Gamma { g, inverted } if g > 0 => Eotf::Pow(if inverted { 1e7 / g as f32 } else { g as f32 / 1e7 }),
-        other => return Err(format!("{}: unsupported JXL transfer function {other:?}", input.display())),
+        other => return Err(format!("unsupported JXL transfer function {other:?}")),
     };
 
-    let render = image.render_frame(0).map_err(|e| format!("{}: {e}", input.display()))?;
+    let render = image.render_frame(0).map_err(|e| e.to_string())?;
     let fb = render.image_all_channels();
     let (w, h, ch) = (fb.width(), fb.height(), fb.channels());
     if ch < 3 {
-        return Err(format!("{}: {ch}-channel JXL — RGB only", input.display()));
+        return Err(format!("{ch}-channel JXL — RGB only"));
     }
     let n = w * h;
     let buf = fb.buf();
@@ -476,7 +475,7 @@ pub fn write_vsf(img: &SpectralImage, output: &Path) -> Result<(), String> {
     std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))
 }
 
-fn rgb_channel_names() -> [String; 3] {
+pub(crate) fn rgb_channel_names() -> [String; 3] {
     ["R".to_string(), "G".to_string(), "B".to_string()]
 }
 
