@@ -9,9 +9,9 @@ use std::path::Path;
 use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
 use vsf::{BitPackedTensor, Tensor};
 
-/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the RAW/TIFF family goes through limbus (50+ RAW formats — this is a representative common subset, not exhaustive); `jxl`/`jpg` are the display-referred ingests (lumis exports and web files — JPEG is assumed sRGB, the format convention).
+/// Extensions the viewer will try to open + arrow-navigate. `vsf` is the native container; the RAW/TIFF family goes through limbus (50+ RAW formats — this is a representative common subset, not exhaustive); `jxl`/`jpg`/`webp` are the display-referred ingests (lumis exports and web files — JPEG and WebP are assumed sRGB, the format convention).
 pub const SUPPORTED_EXTS: &[&str] = &[
-    "vsf", "dng", "arw", "cr2", "cr3", "nef", "nrw", "raf", "rw2", "orf", "pef", "srw", "raw", "tif", "tiff", "jxl", "jpg", "jpeg",
+    "vsf", "dng", "arw", "cr2", "cr3", "nef", "nrw", "raf", "rw2", "orf", "pef", "srw", "raw", "tif", "tiff", "jxl", "jpg", "jpeg", "webp",
 ];
 
 /// Is `path` a file the viewer can open (by extension)?
@@ -158,6 +158,7 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
         }
         Some("jxl") => ingest_jxl(input),
         Some("jpg" | "jpeg") => ingest_jpeg(input),
+        Some("webp") => ingest_webp(input),
         _ => ingest_image(input),
     }
 }
@@ -207,7 +208,12 @@ fn ingest_jpeg(input: &Path) -> Result<Decoded, String> {
     if rgb.len() != n * 3 {
         return Err(format!("{}: decoded {} bytes for {w}×{h}×3", input.display(), rgb.len()));
     }
-    // sRGB byte → linear u16, 256 entries once per process.
+    let planar = srgb8_to_linear_planar(&rgb, 3, n);
+    Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "jpeg_assumed_srgb"))
+}
+
+/// Interleaved sRGB8 (`stride` bytes a pixel: 3 for RGB, 4 for RGBA) → LINEAR planar u16 RGB, `n` pixels. sRGB EOTF un-done via a 256-entry LUT built once per process. With a fourth byte the pixel is composited over black (the linear value scaled by alpha) — opsin has no alpha plane, and a transparent region carrying leftover colour would otherwise render as garbage; over black is what a viewer with no backdrop honestly shows.
+fn srgb8_to_linear_planar(px: &[u8], stride: usize, n: usize) -> Vec<u16> {
     static LUT: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
     let lut = LUT.get_or_init(|| {
         let mut t = [0u16; 256];
@@ -220,12 +226,38 @@ fn ingest_jpeg(input: &Path) -> Result<Decoded, String> {
     let (rp, rest) = planar.split_at_mut(n);
     let (gp, bp) = rest.split_at_mut(n);
     rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
-        let s = i * 3;
-        *r = lut[rgb[s] as usize];
-        *g = lut[rgb[s + 1] as usize];
-        *b = lut[rgb[s + 2] as usize];
+        let s = i * stride;
+        let (lr, lg, lb) = (lut[px[s] as usize] as u32, lut[px[s + 1] as usize] as u32, lut[px[s + 2] as usize] as u32);
+        if stride == 4 {
+            let a = px[s + 3] as u32;
+            *r = ((lr * a + 127) / 255) as u16;
+            *g = ((lg * a + 127) / 255) as u16;
+            *b = ((lb * a + 127) / 255) as u16;
+        } else {
+            *r = lr as u16;
+            *g = lg as u16;
+            *b = lb as u16;
+        }
     });
-    Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "jpeg_assumed_srgb"))
+    planar
+}
+
+/// Untagged-convention WebP → [`Decoded`]: the JPEG path's twin. Lossy and lossless both decode to RGB8 (RGBA8 when the extended header carries alpha — composited over black in linear), assumed sRGB like every web file, linearized and stored planar u16 with the same sRGB→VSF-RGB `Assumed` entry. An animated file yields its first frame. The ICC chunk is ignored on purpose (the sRGB convention IS this path) and EXIF orientation is not parsed, matching JPEG.
+fn ingest_webp(input: &Path) -> Result<Decoded, String> {
+    let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let mut dec = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("{}: {e}", input.display()))?;
+    let (w, h) = dec.dimensions();
+    let (w, h) = (w as usize, h as usize);
+    let n = w * h;
+    let stride = if dec.has_alpha() { 4 } else { 3 };
+    let len = dec.output_buffer_size().ok_or_else(|| format!("{}: {w}×{h} does not fit in memory", input.display()))?;
+    let mut px = vec![0u8; len];
+    dec.read_image(&mut px).map_err(|e| format!("{}: {e}", input.display()))?;
+    if px.len() != n * stride {
+        return Err(format!("{}: decoded {} bytes for {w}×{h}×{stride}", input.display(), px.len()));
+    }
+    let planar = srgb8_to_linear_planar(&px, stride, n);
+    Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "webp_assumed_srgb"))
 }
 
 /// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. ICC-profiled and HDR (PQ/HLG) streams are rejected rather than guessed at.
@@ -398,9 +430,19 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     Ok(Decoded { img })
 }
 
-/// Export the rendered view as an sRGB JPEG — the ONE legacy-space concession, for posts on platforms that assume sRGB and strip everything else. Input is [`to_linear`]'s output (signed linear Rec.2020, white = 65535, orientation already applied); the live exposure is baked as a linear gain, then Rec.2020 → sRGB (thru vsf's deprecated legacy constants — deliberately: sRGB IS the legacy), clamp to gamut (the single display clamp, same boundary rule as the viewer), sRGB OETF, quality-95 JPEG. Untagged on purpose — an untagged JPEG is defined-sRGB everywhere that matters, which is exactly the consistency being bought. Nothing is written back to the source: the sensor plane stays as captured, the JPEG is a rendering.
+/// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input clamp is load-bearing: past the rail the cubic FOLDS BACK, so overs must pin to the rail first (the encode boundary's clamp already does). Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
+#[inline]
+pub fn hdr_rail(x: i64) -> i64 {
+    let x = x.clamp(0, 65535);
+    ((3 * x - ((x * x * x) >> 32)) >> 1).clamp(0, 65535)
+}
+
+/// `dr_curve` view-op params for [`hdr_rail`]: polynomial coefficients [c0, c1, c2, c3] of f(x) = Σ cᵢxⁱ.
+pub const HDR_CURVE_COEFS: [f32; 4] = [0., 1.5, 0., -0.5];
+
+/// Export the rendered view as an sRGB JPEG — the ONE legacy-space concession, for posts on platforms that assume sRGB and strip everything else. Input is [`to_linear`]'s output (signed linear Rec.2020, white = 65535, orientation already applied); the live exposure is baked as a linear gain, then Rec.2020 → sRGB (thru vsf's deprecated legacy constants — deliberately: sRGB IS the legacy), clamp to gamut (the single display clamp, same boundary rule as the viewer), the HDR rolloff when on (same [`hdr_rail`] the viewer encodes with, so the JPEG is the screen), sRGB OETF, quality-95 JPEG. Untagged on purpose — an untagged JPEG is defined-sRGB everywhere that matters, which is exactly the consistency being bought. Nothing is written back to the source: the sensor plane stays as captured, the JPEG is a rendering.
 #[allow(deprecated)]
-pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, out: &Path) -> Result<(), String> {
+pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool, out: &Path) -> Result<(), String> {
     if lin.len() != w * h * 3 {
         return Err(format!("linear buffer {} != {w}×{h}×3", lin.len()));
     }
@@ -416,6 +458,8 @@ pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, out: &Path) ->
             let c = [irow[x * 3] as f32 * gain, irow[x * 3 + 1] as f32 * gain, irow[x * 3 + 2] as f32 * gain];
             for o in 0..3 {
                 let v = (m[o * 3] * c[0] + m[o * 3 + 1] * c[1] + m[o * 3 + 2] * c[2]).clamp(0., 1.);
+                // Through the integer rail so the export's shoulder is bit-identical to the viewer's LUT.
+                let v = if hdr { hdr_rail((v * 65535.).round() as i64) as f32 / 65535. } else { v };
                 orow[x * 3 + o] = (vsf::colour::srgb_oetf(v) * 255.).round() as u8;
             }
         }
@@ -499,6 +543,25 @@ pub fn orientation_src(code: u16, w: usize, h: usize, dx: usize, dy: usize) -> (
         8 => (w - 1 - dy, dx),
         _ => (dx, dy),
     }
+}
+
+/// Compose an EXIF orientation code with a further 90° display rotation: the code `r` such that `display(r) = rot(display(code))`. The eight codes are the dihedral group of the frame; each is a signed 2×2 map from source axes to display axes (x right, y down; 6 = rotate 90 CW ⇒ x' = h−1−y, y' = x ⇒ [[0,−1],[1,0]] — the same convention [`orientation_src`] inverts), so composition is a 2×2 integer product and a table lookup. `cw` false ⇒ counter-clockwise. Applying CW four times from any code returns it.
+pub fn rotate_code(code: u16, cw: bool) -> u16 {
+    const M: [[i8; 4]; 8] = [
+        [1, 0, 0, 1],   // 1 normal
+        [-1, 0, 0, 1],  // 2 mirror H
+        [-1, 0, 0, -1], // 3 rotate 180
+        [1, 0, 0, -1],  // 4 mirror V
+        [0, 1, 1, 0],   // 5 transpose
+        [0, -1, 1, 0],  // 6 rotate 90 CW
+        [0, -1, -1, 0], // 7 transverse
+        [0, 1, -1, 0],  // 8 rotate 90 CCW
+    ];
+    let m = M[(code.clamp(1, 8) - 1) as usize];
+    let r: [i8; 4] = if cw { M[5] } else { M[7] };
+    // r · m
+    let p = [r[0] * m[0] + r[1] * m[2], r[0] * m[1] + r[1] * m[3], r[2] * m[0] + r[3] * m[2], r[2] * m[1] + r[3] * m[3]];
+    M.iter().position(|c| *c == p).map(|i| i as u16 + 1).unwrap_or(1)
 }
 
 /// The EXIF orientation code from the view log: the `orientation` op's first param when present and a real transform (2..=8), else 1 (display as stored).
@@ -645,6 +708,41 @@ mod tests {
         }
     }
 
+    /// A lossless 2×2 WebP with alpha thru the ingest: the fully opaque sRGB white and mid-grey pixels land at their linear u16 values, the transparent one composites to black, the half-alpha one to half its linear value.
+    #[test]
+    fn webp_ingests_srgb_and_composites_alpha_over_black() {
+        // Pixels row-major: white α255, sRGB 128 α255, white α0, white α128.
+        let px: [u8; 16] = [255, 255, 255, 255, 128, 128, 128, 255, 255, 255, 255, 0, 255, 255, 255, 128];
+        let mut bytes = Vec::new();
+        image_webp::WebPEncoder::new(&mut bytes).encode(&px, 2, 2, image_webp::ColorType::Rgba8).unwrap();
+        let path = std::env::temp_dir().join(format!("opsin-webp-test-{}.webp", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let dec = load_any(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((dec.img.width, dec.img.height), (2, 2));
+        assert_eq!(dec.img.profile.as_ref().unwrap().entries[0].source, "webp_assumed_srgb");
+        // Planar [3, h, w]: the red plane is the first four samples.
+        let all = dec.img.samples.unpack_u16();
+        let r = &all[..4];
+        let grey = (vsf::colour::srgb_eotf(128. / 255.) * 65535.).round() as u16;
+        assert_eq!(r[0], 65535);
+        assert_eq!(r[1], grey);
+        assert_eq!(r[2], 0);
+        assert_eq!(r[3], ((65535u32 * 128 + 127) / 255) as u16);
+        // The green and blue planes agree with red for the neutral pixels.
+        assert_eq!(all[4 + 1], grey);
+        assert_eq!(all[8 + 3], ((65535u32 * 128 + 127) / 255) as u16);
+    }
+
+    /// The crate's own hero image is a lossy VP8 WebP: it opens, at its known size, thru the same path.
+    #[test]
+    fn webp_lossy_hero_opens() {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/opsin.webp"));
+        let dec = load_any(path).unwrap();
+        assert_eq!((dec.img.width, dec.img.height), (1024, 1024));
+        assert!(is_supported(path));
+    }
+
     #[test]
     fn to_linear_honours_view_orientation() {
         // 2×1 planar RGB, uncharacterized (identity render), tagged rotate-90-CCW (code 8): display comes back 1×2 with the right pixel on top. The stored plane is untouched — only the render output moves.
@@ -668,6 +766,29 @@ mod tests {
         let (w, h, lin) = to_linear(&Decoded { img }).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
+    }
+
+    #[test]
+    fn rotate_code_is_the_dihedral_group() {
+        // Four CW turns is the identity from every code; CW then CCW is the identity; the pure rotations cycle 1→6→3→8→1.
+        for c in 1..=8u16 {
+            let mut x = c;
+            for _ in 0..4 {
+                x = rotate_code(x, true);
+            }
+            assert_eq!(x, c, "4×CW from {c}");
+            assert_eq!(rotate_code(rotate_code(c, true), false), c, "CW·CCW from {c}");
+        }
+        assert_eq!(rotate_code(1, true), 6);
+        assert_eq!(rotate_code(6, true), 3);
+        assert_eq!(rotate_code(3, true), 8);
+        assert_eq!(rotate_code(8, true), 1);
+        // And the composed code renders as the composed transform: rotating a 6-oriented render once more CW must equal a 3 (180°) render of the same plane.
+        let src: Vec<i32> = (0..12).collect();
+        let (w6, h6, r6) = apply_orientation(2, 2, src.clone(), 6);
+        let (_, _, r6_then_cw) = apply_orientation(w6, h6, r6, 6);
+        let (_, _, r3) = apply_orientation(2, 2, src, rotate_code(6, true));
+        assert_eq!(r6_then_cw, r3);
     }
 
     #[test]

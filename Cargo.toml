@@ -22,6 +22,8 @@ jpeg-encoder = "0.7"
 jxl-oxide = "0.12.6"
 zune-jpeg = "0.5.15"
 zune-core = "0.5.3"
+# WebP ingest (2026-09-15): pure-Rust lossy + lossless decoder, already in the graph thru limbus → rawler → image; same untagged-sRGB convention as the JPEG path.
+image-webp = "0.2"
 
 # LIBRARY + VIEWER (2026-09-11): photon renders its attachments thru opsin's colour pipeline (convert + render) and must not drag the winit host into an Android build, so the viewer's host dependency sits behind the default `viewer` feature; `default-features = false` gives a library of just the pipeline.
 [features]

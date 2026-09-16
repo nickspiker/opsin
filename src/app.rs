@@ -74,9 +74,9 @@ pub struct OpsinApp {
     btn_xscale: fluor::widgets::Button,
     btn_yscale: fluor::widgets::Button,
     btn_clip: fluor::widgets::Button,
-    /// Exposure in stops (gain = 2^ev in linear). ±[EV_RANGE].
+    /// Exposure in stops (gain = 2^ev in linear), [EV_MIN]..=[EV_MAX].
     ev: f32,
-    /// The panel's exposure slider (fluor widget, value 0..1 ↔ −EV_RANGE..+EV_RANGE).
+    /// The panel's exposure slider (fluor widget, value 0..1 ↔ EV_MIN..EV_MAX; 0 EV sits at [EV_ZERO]).
     ev_slider: fluor::widgets::Slider,
     /// 1:1 / Fit — fluor pill Buttons, same widget family as the slider and chrome (squircle, AA edge, hover tint thru the host overlay pipe). Geometry is set every frame from panel_rects; hit silhouettes stamp into the chrome hit map at render, so dispatch rides the same Container walk as the chrome controls.
     btn_one: fluor::widgets::Button,
@@ -96,6 +96,17 @@ pub struct OpsinApp {
     chord_lb_release: Option<Instant>,
     chord_rb_press: Option<Instant>,
     chord_rb_release: Option<Instant>,
+    /// Crop rect in DISPLAY pixels (after orientation), `[x0, x1) × [y0, y1)`; `Some` = crop mode on. Toggling on seeds the full frame and fits; a click or drag on the image moves the NEAREST corner to the cursor (no handles, no modes); toggling off clears and fits. Armed = the JPEG exports the rect and `V` records a `crop` view op. A view op: it culls, the plane never changes.
+    crop: Option<(usize, usize, usize, usize)>,
+    /// The corner being dragged (0 = x0y0, 1 = x1y0, 2 = x0y1, 3 = x1y1) while the button is down in crop mode.
+    crop_drag: Option<usize>,
+    btn_crop: fluor::widgets::Button,
+    /// 90° rotates: compose onto the orientation view op, re-render from the retained decode. Display-only, recorded by `V`; the stored plane is never touched.
+    btn_rot_ccw: fluor::widgets::Button,
+    btn_rot_cw: fluor::widgets::Button,
+    /// HDR highlight rolloff at the encode boundary (screen AND JPEG export — they must agree): `(3x − x³)/2` after the clamp, per channel, in linear. Brightens (slope 1.5 at black) and compresses the top into a soft shoulder instead of a hard stop; pull EV down ~3× and the reclaimed range is ~1.5 stops of highlight. `H` / the HDR pill. A CREATIVE op — recorded as `dr_curve` when converting to VSF, never silent.
+    hdr: bool,
+    btn_hdr: fluor::widgets::Button,
     /// Frame info HUD (metadata + live stats) over the image area's bottom-left; `I` toggles. Default on — opsin is an instrument, the readings are the point.
     show_info: bool,
     /// DNG header metadata for the HUD (EXIF exposure fields, profile name, baseline exposure); `None` for non-TIFF sources.
@@ -122,8 +133,20 @@ const INFO_ON_FILL: u32 = argb(0x30, 0x48, 0x70, 0xFF);
 /// HUD backdrop — translucent near-black so the readings stay legible over any image content.
 const HUD_BG: u32 = argb(0x10, 0x10, 0x10, 0xB8);
 
-/// Exposure slider half-range in stops.
-const EV_RANGE: f32 = (1 << 2) as f32;
+/// Exposure slider range in stops — asymmetric on purpose: −4 is as far as pulling down ever needs to go, but a sensor holds ~12 stops above its noise floor and the signed-linear pipe keeps every one of them, so pushing up runs all the way to +12 to blow a whole frame's highlights through the clip indicator. Gain at +12 is 2^12 · 2^16 (Q16) = 2^28 per i32 sample — nowhere near i64.
+const EV_MIN: f32 = -((1 << 2) as f32);
+const EV_MAX: f32 = (12) as f32;
+/// Slider position (0..1) of 0 EV.
+const EV_ZERO: f32 = -EV_MIN / (EV_MAX - EV_MIN);
+
+/// Slider 0..1 → stops.
+fn ev_of_slider(v: f32) -> f32 {
+    EV_MIN + v * (EV_MAX - EV_MIN)
+}
+/// Stops → slider 0..1 (clamped to the range).
+fn slider_of_ev(ev: f32) -> f32 {
+    (ev.clamp(EV_MIN, EV_MAX) - EV_MIN) / (EV_MAX - EV_MIN)
+}
 
 /// Panel section rects (x0, y0, w, h) — named fields, no position-coded indexing.
 struct PanelRects {
@@ -333,11 +356,18 @@ impl RawView {
 /// Linear signed Rec.2020 → gamma-2 u8 visible → darkness-packed u32. Exposure is a Q16 integer multiply — the gain constant is the only float, precomputed once (a scalar commutes with the cmx, shifts no hue). The SINGLE display clamp in the whole pipe follows the multiply: negative light and beyond-white cannot display, and the bare integer cast would wrap (a −1 shadow pixel would speckle full-white), so the clamp is the u16 container boundary, applied at the last possible moment — everything before it is signed and recoverable. Then the EV-independent sqrt LUT (64Ki sqrts, built ONCE per process — it never varies with EV) maps to display bytes. Each output pixel depends only on its own three samples, so the pass splits across the rayon pool — this runs on every exposure-slider tick and must stay interactive at full resolution.
 ///
 /// `clip_show` is lumis's `preview_sub` indicator relocated to opsin's one display clamp — HERE, after the magic-9 and the EV gain, so it marks what is clipping AT DISPLAY under the current exposure and moves live with the slider. Channel-wise, same inversion as lumis: a channel at/over display white renders DARK, a channel below zero renders BLOWN. Indicator-only — `lin` is never touched, so re-encodes and the JPEG export (which takes `lin` directly) stay clean of it by construction.
-fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool) -> Vec<u32> {
+///
+/// `hdr` applies the highlight rolloff [`crate::convert::hdr_rail`] after the clamp and before the transfer — per channel, in linear, exactly where oriel applies its `sin(πx/2)` twin. A second 64Ki LUT bakes curve+sqrt together, so the per-pixel cost is unchanged. The clip indicator is untouched by it: the inversion fires on the pre-curve over/under test, and `f(1) = 1` keeps "at display white" meaning the same thing.
+fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool, hdr: bool) -> Vec<u32> {
     use rayon::prelude::*;
     const GAIN_SHIFT: u32 = 1 << 4;
     static LUT: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    let lut = LUT.get_or_init(|| (0..65536u32).map(|v| 255 - ((v as f32 / 65535.).sqrt() * 255.) as u32).collect());
+    static LUT_HDR: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let lut = if hdr {
+        LUT_HDR.get_or_init(|| (0..65536u32).map(|v| 255 - ((crate::convert::hdr_rail(v as i64) as f32 / 65535.).sqrt() * 255.) as u32).collect())
+    } else {
+        LUT.get_or_init(|| (0..65536u32).map(|v| 255 - ((v as f32 / 65535.).sqrt() * 255.) as u32).collect())
+    };
     let gain = (2f64.powf(ev as f64) * (1u64 << GAIN_SHIFT) as f64).round() as i64;
     lin.par_chunks_exact(3)
         .map(|px| {
@@ -366,7 +396,7 @@ fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool) -> Vec<u32> {
 fn load_image(path: &Path) -> Result<Loaded, String> {
     let dec = crate::convert::load_any(path)?;
     let (w, h, lin) = crate::convert::to_linear(&dec)?;
-    let pixels = encode_pixels(&lin, 0., false);
+    let pixels = encode_pixels(&lin, 0., false, false);
     let raw = RawView::from_image(&dec.img);
     let title = format!(
         "opsin — {} ({}×{}, {} ch, {}-bit)",
@@ -451,10 +481,14 @@ impl OpsinApp {
         let mut hit_counter: HitId = HIT_NONE;
         let chrome = DefaultChrome::new(viewport, loaded.title.clone(), orb, None, &mut hit_counter);
         // Geometry is placeholder — set_rect runs every frame from panel_rects.
-        let ev_slider = fluor::widgets::Slider::new(&mut hit_counter, 0., 0., 1., 1., 0.5);
+        let ev_slider = fluor::widgets::Slider::new(&mut hit_counter, 0., 0., 1., 1., EV_ZERO);
         let btn_one = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "1:1");
         let btn_fit = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Fit");
         let btn_export = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "JPEG");
+        let btn_hdr = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "HDR");
+        let btn_crop = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Crop");
+        let btn_rot_ccw = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "CCW");
+        let btn_rot_cw = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "CW");
         let mut btn_info = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "Info");
         btn_info.set_fill(Some(INFO_ON_FILL));
         let btn_xscale = fluor::widgets::Button::new(&mut hit_counter, 0., 0., 1., 1., 1., "X Lin");
@@ -503,6 +537,13 @@ impl OpsinApp {
             chord_lb_release: None,
             chord_rb_press: None,
             chord_rb_release: None,
+            hdr: false,
+            btn_hdr,
+            crop: None,
+            crop_drag: None,
+            btn_crop,
+            btn_rot_ccw,
+            btn_rot_cw,
             show_info: true,
             meta: loaded.meta,
             file_size: loaded.file_size,
@@ -647,12 +688,12 @@ impl OpsinApp {
 
     /// Apply the slider's 0..1 value as stops and re-encode the display pixels. The panel thumbnail tracks (cheap), the histogram tracks too (the same gain remaps its bins — see the render arm), and the chart alone stays put (chromaticity ratios shrug at a scalar).
     fn apply_ev(&mut self, value01: f32, ctx: &mut Context) {
-        let ev = (value01 * 2. - 1.) * EV_RANGE;
+        let ev = ev_of_slider(value01);
         if (ev - self.ev).abs() < 1e-4 || self.lin.is_empty() {
             return;
         }
         self.ev = ev;
-        self.pixels = encode_pixels(&self.lin, ev, self.clip_show);
+        self.pixels = encode_pixels(&self.lin, ev, self.clip_show, self.hdr);
         self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
         ctx.window.request_redraw();
     }
@@ -671,14 +712,18 @@ impl OpsinApp {
         self.meta = loaded.meta;
         self.file_size = loaded.file_size;
         self.file_name = loaded.file_name;
-        if self.clip_show || self.ev.abs() > 1e-4 {
+        if self.clip_show || self.hdr || self.ev.abs() > 1e-4 {
             // Carry the exposure and the clip indicator into the new frame (loaded.pixels were encoded plain at EV 0) — both are the operator's settings, not the frame's.
-            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show);
+            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
             self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
         } else {
             self.pixels = loaded.pixels;
         }
         if !same_geometry {
+            // A crop is framed on one sensor's dims: it can't mean anything on another's, and an out-of-range rect would be a bad slice at export. Same dims (a burst) keep it.
+            self.crop = None;
+            self.crop_drag = None;
+            self.btn_crop.set_fill(None);
             self.fit(ctx.viewport);
         }
         ctx.window.request_redraw();
@@ -727,21 +772,36 @@ impl OpsinApp {
         }
         let out = src.with_extension("vsf");
         let mut dec = crate::convert::load_any(src)?;
-        // Record the live exposure as a Technical view op (a scalar shifts no hue) — APPENDED to the translateration log, so the ingest-recorded orientation op rides ahead of it. EV 0 adds nothing (and an op-less log was never created).
-        if self.ev.abs() > 1e-4 {
-            let op = vsf::spectral_image::ViewOp {
-                name: "exposure".to_string(),
-                class: vsf::spectral_image::IdtClass::Technical,
-                params: vec![self.ev],
-            };
+        // Record the live view ops — APPENDED to the translateration log, so the ingest-recorded orientation op rides ahead. `exposure` (Technical: a scalar shifts no hue) when EV ≠ 0; `dr_curve` (CREATIVE: a curve is a deliberate look) when HDR is on, params = the polynomial coefficients [c0, c1, c2, c3] of f(x) = Σ cᵢxⁱ applied per channel to the clamped linear display value — self-describing, so a reader can replay it without knowing opsin. Neither is ever baked into the plane; an op-less log is never created.
+        // The display orientation as the viewer holds it NOW (ingest's EXIF code composed with any 90° turns): replace the ingest-recorded op's param, or insert one at the head so it rides ahead of everything else.
+        if let Some(cur) = self.dec.as_ref() {
+            let code = crate::convert::orientation_code(&cur.img);
+            let op = vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] };
             match &mut dec.img.view {
-                Some(v) => v.ops.push(op),
-                None => {
-                    dec.img.view = Some(vsf::spectral_image::ViewTransform {
-                        space: "vsf_rgb_linear".to_string(),
-                        ops: vec![op],
-                    })
-                }
+                Some(v) => match v.ops.iter_mut().find(|o| o.name == "orientation") {
+                    Some(o) => o.params = vec![code as f32],
+                    None if code != 1 => v.ops.insert(0, op),
+                    None => {}
+                },
+                None if code != 1 => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops: vec![op] }),
+                None => {}
+            }
+        }
+        let mut ops = Vec::new();
+        // `crop [x, y, w, h]` in display pixels AFTER orientation — ops replay in order, so the rect means what the screen showed. Technical: it culls, it shifts no hue.
+        if let Some((x0, y0, x1, y1)) = self.crop {
+            ops.push(vsf::spectral_image::ViewOp { name: "crop".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32] });
+        }
+        if self.ev.abs() > 1e-4 {
+            ops.push(vsf::spectral_image::ViewOp { name: "exposure".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![self.ev] });
+        }
+        if self.hdr {
+            ops.push(vsf::spectral_image::ViewOp { name: "dr_curve".to_string(), class: vsf::spectral_image::IdtClass::Creative, params: crate::convert::HDR_CURVE_COEFS.to_vec() });
+        }
+        if !ops.is_empty() {
+            match &mut dec.img.view {
+                Some(v) => v.ops.extend(ops),
+                None => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops }),
             }
         }
         crate::convert::write_vsf(&dec.img, &out)?;
@@ -757,7 +817,18 @@ impl OpsinApp {
             return Err("no image loaded".to_string());
         }
         let out = src.with_extension("jpg");
-        crate::convert::export_srgb_jpeg(&self.lin, self.img_w, self.img_h, self.ev, &out)?;
+        match self.crop {
+            Some((x0, y0, x1, y1)) => {
+                // Armed crop: export exactly the rect — row slices of the oriented linear buffer.
+                let (cw, ch) = (x1 - x0, y1 - y0);
+                let mut sub = Vec::with_capacity(cw * ch * 3);
+                for y in y0..y1 {
+                    sub.extend_from_slice(&self.lin[(y * self.img_w + x0) * 3..(y * self.img_w + x1) * 3]);
+                }
+                crate::convert::export_srgb_jpeg(&sub, cw, ch, self.ev, self.hdr, &out)?;
+            }
+            None => crate::convert::export_srgb_jpeg(&self.lin, self.img_w, self.img_h, self.ev, self.hdr, &out)?,
+        }
         Ok(out)
     }
 
@@ -796,11 +867,80 @@ impl OpsinApp {
         if self.img_w == 0 || self.img_h == 0 {
             return;
         }
+        // With a crop armed, the crop IS the frame: fit and centre on it.
+        let (rx0, ry0, rx1, ry1) = self.crop.unwrap_or((0, 0, self.img_w, self.img_h));
+        let (rw, rh) = ((rx1 - rx0).max(1) as f32, (ry1 - ry0).max(1) as f32);
         let (aw, ah, _) = self.image_area(viewport);
-        let zoom = (aw / self.img_w as f32).min(ah / self.img_h as f32) * (1. - 1. / (1 << 6) as f32);
+        let zoom = (aw / rw).min(ah / rh) * (1. - 1. / (1 << 6) as f32);
         self.zoom_rel = zoom / Self::area_span(aw, ah);
-        self.cx_frac = 0.5;
-        self.cy_frac = 0.5;
+        self.cx_frac = (rx0 as f32 + rw / 2.) / self.img_w as f32;
+        self.cy_frac = (ry0 as f32 + rh / 2.) / self.img_h as f32;
+    }
+
+    /// Continuous image coordinate of a screen point (unclamped — the caller decides what off-image means).
+    fn image_pt(&self, x: f32, y: f32, viewport: Viewport) -> (f32, f32) {
+        let (zoom, ox, oy) = self.view_px(viewport);
+        ((x - ox) / zoom, (y - oy) / zoom)
+    }
+
+    /// Move crop corner `k` to image point (px, py), clamped to the frame, then re-normalise so x0 < x1 and y0 < y1 (a corner dragged past its opposite just swaps roles) with at least one pixel of extent.
+    fn move_crop_corner(&mut self, k: usize, px: f32, py: f32) {
+        let Some((mut x0, mut y0, mut x1, mut y1)) = self.crop else { return };
+        let nx = px.round().clamp(0., self.img_w as f32) as usize;
+        let ny = py.round().clamp(0., self.img_h as f32) as usize;
+        match k {
+            0 => (x0, y0) = (nx, ny),
+            1 => (x1, y0) = (nx, ny),
+            2 => (x0, y1) = (nx, ny),
+            _ => (x1, y1) = (nx, ny),
+        }
+        let (ax0, ax1) = (x0.min(x1), x0.max(x1).max(x0.min(x1) + 1).min(self.img_w));
+        let (ay0, ay1) = (y0.min(y1), y0.max(y1).max(y0.min(y1) + 1).min(self.img_h));
+        self.crop = Some((ax0.min(ax1 - 1), ay0.min(ay1 - 1), ax1, ay1));
+    }
+
+    /// Crop mode on/off — `C` and the Crop pill share this. On: the rect seeds as the full frame (nothing dimmed yet; pull corners in), off: cleared. Both refit, so the composition always frames what's armed.
+    fn toggle_crop(&mut self, ctx: &mut Context) {
+        if self.img_w == 0 {
+            return;
+        }
+        self.crop = if self.crop.is_none() { Some((0, 0, self.img_w, self.img_h)) } else { None };
+        self.crop_drag = None;
+        self.btn_crop.set_fill(self.crop.is_some().then_some(INFO_ON_FILL));
+        self.fit(ctx.viewport);
+        ctx.window.request_redraw();
+    }
+
+    /// Rotate the DISPLAY 90° (cw or ccw): compose onto the orientation view op in the retained decode, re-render the linear buffer from it (the plane itself never moves), carry the crop rect through the same rotation, refit. `V` records the composed orientation; the JPEG lands the way the screen shows.
+    fn rotate(&mut self, cw: bool, ctx: &mut Context) {
+        let Some(dec) = self.dec.as_mut() else { return };
+        let code = crate::convert::rotate_code(crate::convert::orientation_code(&dec.img), cw);
+        let op = vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] };
+        match &mut dec.img.view {
+            Some(v) => match v.ops.iter_mut().find(|o| o.name == "orientation") {
+                Some(o) => o.params = vec![code as f32],
+                None => v.ops.insert(0, op),
+            },
+            None => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops: vec![op] }),
+        }
+        let (w, h, lin) = match crate::convert::to_linear(dec) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("opsin: rotate: {e}");
+                return;
+            }
+        };
+        // The crop rides the rotation: CW maps (x, y) → (H − y, x) on the old W×H frame; CCW maps (x, y) → (y, W − x).
+        let (ow, oh) = (self.img_w, self.img_h);
+        self.crop = self.crop.map(|r| rotate_rect(r, ow, oh, cw));
+        self.img_w = w;
+        self.img_h = h;
+        self.lin = lin;
+        self.raw.orient = code;
+        self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+        self.tools = PanelTools::new(&self.pixels, w, h);
+        self.fit(ctx.viewport);
+        ctx.window.request_redraw();
     }
 
     /// 1:1 — one image pixel per screen pixel, EXACTLY: stores `zoom_rel = 1/span` bitwise so the readout's `==` test can certify pixel-exactness (and lose it the moment a resize changes the span). Zooms about the image-area centre for free — the anchored fractions ARE the centre point, so changing only the scale is a centre zoom by construction.
@@ -813,6 +953,17 @@ impl OpsinApp {
     fn on_image(&self, x: f32, y: f32, viewport: Viewport) -> bool {
         let (zoom, ox, oy) = self.view_px(viewport);
         x >= ox && y >= oy && x < ox + self.img_w as f32 * zoom && y < oy + self.img_h as f32 * zoom
+    }
+
+    /// HDR rolloff on/off — `H` and the HDR pill share this. A re-encode, same cost as an EV tick.
+    fn toggle_hdr(&mut self, ctx: &mut Context) {
+        self.hdr = !self.hdr;
+        self.btn_hdr.set_fill(self.hdr.then_some(INFO_ON_FILL));
+        if !self.lin.is_empty() {
+            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+            self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
+        }
+        ctx.window.request_redraw();
     }
 
     /// Frame-info HUD on/off — the `I` key and the Info pill share this; the pill's fill tracks the state.
@@ -911,7 +1062,8 @@ impl OpsinApp {
         let nav = (x0, y, w, nav_h);
         y += nav_h + pad;
 
-        let btn_h = if self.img_w > 0 { band } else { 0 };
+        // Two rows: [1:1][mag][Fit][JPEG][Info] over [CCW][CW][Crop], a half-pad between.
+        let btn_h = if self.img_w > 0 { band * 2 + pad / 2 } else { 0 };
         let btns = (x0, y.min(vh), w, btn_h);
         y += btn_h + pad;
 
@@ -939,6 +1091,11 @@ impl OpsinApp {
     }
 }
 
+/// Carry a display-space rect `[x0, x1) × [y0, y1)` on an `ow × oh` frame through a 90° turn of that frame. CW maps a point (x, y) → (oh − 1 − y, x), so the x-extent becomes [oh − y1, oh − y0) and the y-extent [x0, x1); CCW maps (x, y) → (y, ow − 1 − x).
+fn rotate_rect((x0, y0, x1, y1): (usize, usize, usize, usize), ow: usize, oh: usize, cw: bool) -> (usize, usize, usize, usize) {
+    if cw { (oh - y1, x0, oh - y0, x1) } else { (y0, ow - x1, y1, ow - x0) }
+}
+
 /// Fixed-precision float with trailing zeros (and a bare point) trimmed — "6.9", not "6.900".
 fn trim_f(v: f64, prec: usize) -> String {
     let s = format!("{v:.prec$}");
@@ -959,6 +1116,10 @@ impl Container for OpsinApp {
         f(&mut self.btn_fit);
         f(&mut self.btn_export);
         f(&mut self.btn_info);
+        f(&mut self.btn_hdr);
+        f(&mut self.btn_crop);
+        f(&mut self.btn_rot_ccw);
+        f(&mut self.btn_rot_cw);
         f(&mut self.btn_xscale);
         f(&mut self.btn_yscale);
         f(&mut self.btn_clip);
@@ -1045,6 +1206,12 @@ impl FluorApp for OpsinApp {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
+                if let Some(k) = self.crop_drag {
+                    let (px, py) = self.image_pt(cx, cy, ctx.viewport);
+                    self.move_crop_corner(k, px, py);
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 if let Some((lx, ly)) = self.drag {
                     // Pan: shift the anchored fraction by the cursor delta in image-fraction space. Guarded by construction — drag only starts on_image, so img dims and zoom are nonzero.
                     let (zoom, _, _) = self.view_px(ctx.viewport);
@@ -1065,7 +1232,7 @@ impl FluorApp for OpsinApp {
                     }
                 }
                 // Pill button hover — driven by the same stamped hit map as the chrome controls.
-                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_info, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
+                for b in [&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_info, &mut self.btn_hdr, &mut self.btn_crop, &mut self.btn_rot_ccw, &mut self.btn_rot_cw, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip] {
                     let over = hit == b.hit_id();
                     if b.is_hovered() != over {
                         b.set_hovered(over);
@@ -1117,6 +1284,18 @@ impl FluorApp for OpsinApp {
                     if self.btn_info.take_click() {
                         self.toggle_info(ctx);
                     }
+                    if self.btn_hdr.take_click() {
+                        self.toggle_hdr(ctx);
+                    }
+                    if self.btn_crop.take_click() {
+                        self.toggle_crop(ctx);
+                    }
+                    if self.btn_rot_ccw.take_click() {
+                        self.rotate(false, ctx);
+                    }
+                    if self.btn_rot_cw.take_click() {
+                        self.rotate(true, ctx);
+                    }
                     if self.btn_xscale.take_click() {
                         // X: linear counts ↔ log2 stops — an explicit, labelled remap; the pill always reads the CURRENT mode.
                         self.hist_xlog = !self.hist_xlog;
@@ -1134,7 +1313,7 @@ impl FluorApp for OpsinApp {
                         self.clip_show = !self.clip_show;
                         self.btn_clip.set_fill(self.clip_show.then_some(CLIP_ON_FILL));
                         if !self.lin.is_empty() {
-                            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show);
+                            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
                             self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
                         }
                         ctx.window.request_redraw();
@@ -1180,6 +1359,18 @@ impl FluorApp for OpsinApp {
                     return EventResponse::StartWindowDrag;
                 }
                 if self.on_image(ctx.cursor_x, ctx.cursor_y, ctx.viewport) {
+                    if self.crop.is_some() {
+                        // Crop mode: the nearest corner comes to the cursor and follows it until release. Pan is the navigator's job while cropping.
+                        let (px, py) = self.image_pt(ctx.cursor_x, ctx.cursor_y, ctx.viewport);
+                        let (x0, y0, x1, y1) = self.crop.unwrap();
+                        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+                        let d2 = |(cx, cy): (usize, usize)| (cx as f32 - px).powi(2) + (cy as f32 - py).powi(2);
+                        let k = (0..4).min_by(|&a, &b| d2(corners[a]).total_cmp(&d2(corners[b]))).unwrap();
+                        self.crop_drag = Some(k);
+                        self.move_crop_corner(k, px, py);
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
                     self.drag = Some((ctx.cursor_x, ctx.cursor_y));
                     return EventResponse::Handled;
                 }
@@ -1188,6 +1379,7 @@ impl FluorApp for OpsinApp {
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 self.drag = None;
+                self.crop_drag = None;
                 self.divider_drag = false;
                 self.ev_drag = false;
                 self.nav_drag = false;
@@ -1296,6 +1488,19 @@ impl FluorApp for OpsinApp {
                         self.toggle_info(ctx);
                         EventResponse::Handled
                     }
+                    Key::Character(c) if c.eq_ignore_ascii_case("h") => {
+                        self.toggle_hdr(ctx);
+                        EventResponse::Handled
+                    }
+                    Key::Character(c) if !ctrl && c.eq_ignore_ascii_case("c") => {
+                        self.toggle_crop(ctx);
+                        EventResponse::Handled
+                    }
+                    // r = rotate CW, R (shift) = CCW.
+                    Key::Character(c) if c.eq_ignore_ascii_case("r") => {
+                        self.rotate(!ctx.modifiers.shift_key(), ctx);
+                        EventResponse::Handled
+                    }
                     Key::Character(c) if c.eq_ignore_ascii_case("f") => {
                         self.fit(ctx.viewport);
                         ctx.window.request_redraw();
@@ -1310,14 +1515,14 @@ impl FluorApp for OpsinApp {
                     // Exposure: +/− nudge a third of a stop, 0 resets.
                     Key::Character(c) if c == "+" || c == "=" || c == "-" => {
                         let delta = if c == "-" { -1. / 3. } else { 1. / 3. };
-                        let v = (((self.ev + delta).clamp(-EV_RANGE, EV_RANGE)) + EV_RANGE) / (2. * EV_RANGE);
+                        let v = slider_of_ev(self.ev + delta);
                         self.ev_slider.set_value(v);
                         self.apply_ev(v, ctx);
                         EventResponse::Handled
                     }
                     Key::Character(c) if c == "0" => {
-                        self.ev_slider.set_value(0.5);
-                        self.apply_ev(0.5, ctx);
+                        self.ev_slider.set_value(EV_ZERO);
+                        self.apply_ev(EV_ZERO, ctx);
                         EventResponse::Handled
                     }
                     _ => EventResponse::Pass,
@@ -1365,11 +1570,22 @@ impl FluorApp for OpsinApp {
                 paint::fill_rect(&mut canvas, sx as isize, (sy + sh) as isize + 4, sw as isize, 0, HAIRLINE, clip, None);
             }
             // 1:1 / magnification / Fit / JPEG / Info — the band splits in fifths: fluor pill Buttons (same widget family as the slider and chrome) around the LIVE magnification readout (screen px per image px: 1x = pixel-exact certificate, 2.00x = zoomed in past it). The readout derives from the same per-frame span-relative transform as the blit, so it tracks every window op — press 1:1, resize, and it honestly drifts; that's the relative model reporting itself. JPEG is the export pill — the visible face of the E key.
-            let (bx, by, bw, bh) = btns;
-            if bw > 2 && bh > 0 && self.img_w > 0 {
+            let (bx, by, bw, bh2) = btns;
+            if bw > 2 && bh2 > 0 && self.img_w > 0 {
+                let band = (ctx.viewport.effective_span() / (1 << 6) as f32).ceil() as usize;
+                let bh = band.min(bh2);
                 let quarter = bw as f32 / 5.;
                 let font = bh as f32 / 2.;
                 let bcy = by as f32 + bh as f32 / 2.;
+                // Row 2: rotate CCW / CW, crop — thirds.
+                let r2y = (by + bh2 - bh) as f32 + bh as f32 / 2.;
+                let third = bw as f32 / 3.;
+                for (i, b) in [&mut self.btn_rot_ccw, &mut self.btn_rot_cw, &mut self.btn_crop].into_iter().enumerate() {
+                    b.set_rect(bx as f32 + third * (i as f32 + 0.5), r2y, third, bh as f32);
+                    b.set_font_size(font);
+                    let id = b.hit_id();
+                    b.render_content_into(&mut canvas, 0., 0., ctx.text, clip, Some(&mut self.chrome.hit_test_map), id);
+                }
                 self.btn_one.set_rect(bx as f32 + quarter * 0.5, bcy, quarter, bh as f32);
                 self.btn_one.set_font_size(font);
                 self.btn_fit.set_rect(bx as f32 + quarter * 2.5, bcy, quarter, bh as f32);
@@ -1414,16 +1630,17 @@ impl FluorApp for OpsinApp {
                 }
             }
 
-            // Histogram pills in their OWN band carved from the top of the hist rect — above the plot, never on it. Right-aligned row: [X ..][Y ..][Clip]. Geometry derives from the hist rect (RU-coherent, no pixel constants).
+            // Histogram pills in their OWN band carved from the top of the hist rect — above the plot, never on it. Right-aligned row: [HDR][X ..][Y ..][Clip]. Geometry derives from the hist rect (RU-coherent, no pixel constants).
             let (hx, hy, hw, hh) = hist;
             let pill_h = (hh as f32 / 5.).max(8.);
             let pill_pad = hh as f32 / (1 << 4) as f32;
             let pill_band = (pill_h + pill_pad * 2.) as usize;
             if hw > 0 && hh > pill_band && !self.raw.counts.is_empty() {
-                let pill_w = pill_h * 3.;
+                // Four pills must fit the row: shrink from the 3:1 pill when the panel is narrow rather than spill over the divider.
+                let pill_w = (pill_h * 3.).min((hw as f32 - pill_pad * 5.) / 4.);
                 let cy_pill = hy as f32 + pill_pad + pill_h / 2.;
                 let mut right = hx as f32 + hw as f32 - pill_pad;
-                for b in [&mut self.btn_clip, &mut self.btn_yscale, &mut self.btn_xscale] {
+                for b in [&mut self.btn_clip, &mut self.btn_yscale, &mut self.btn_xscale, &mut self.btn_hdr] {
                     b.set_rect(right - pill_w / 2., cy_pill, pill_w, pill_h);
                     b.set_font_size(pill_h * (3. / 4.));
                     let id = b.hit_id();
@@ -1529,6 +1746,25 @@ impl FluorApp for OpsinApp {
                 mark(rx1, y);
             }
         }
+        // Navigator crop rect — the armed crop in thumb space, same XOR marker so it reads on any content (a slitscan band is a sliver of a 32k-tall strip; this is where you see where it sits).
+        if let (Some((fx, fy, fw, fh)), Some((x0, y0, x1, y1))) = (fitted, self.crop) {
+            let tx = |x: usize| (fx + x * fw / self.img_w.max(1)) as isize;
+            let ty = |y: usize| (fy + y * fh / self.img_h.max(1)) as isize;
+            let (rx0, ry0, rx1, ry1) = (tx(x0), ty(y0), tx(x1).min((fx + fw) as isize - 1), ty(y1).min((fy + fh) as isize - 1));
+            let mut mark = |x: isize, y: isize| {
+                if x >= 0 && y >= 0 && (x as usize) < buf_w && (y as usize) < buf_h {
+                    target[y as usize * buf_w + x as usize] ^= 0x0080_8080;
+                }
+            };
+            for x in rx0..=rx1 {
+                mark(x, ry0);
+                mark(x, ry1);
+            }
+            for y in (ry0 + 1)..ry1 {
+                mark(rx0, y);
+                mark(rx1, y);
+            }
+        }
         // Chromaticity chart — oriel's Maxwell triangle, recomputed THIS FRAME at exactly this rect's size from exactly the pixels visible in the image area: walk the image-area screen pixels, invert the view transform, splat each visible sample's chromaticity into a chart-pixel density grid, render. No base resolution, no resampling — chart pixels ARE screen pixels, and the cloud tracks pan/zoom live. The √3/2 height is the equilateral triangle's geometry, not a pixel ratio.
         let (cx, cy, cw, chh) = chart;
         if cw > 0 && chh > 0 {
@@ -1606,7 +1842,10 @@ impl FluorApp for OpsinApp {
             let line_h = font * 1.3;
             let pad = band / 2.;
             let mut lines = self.info_lines();
-            lines.push(format!("EV {:+.2}  zoom {}x  clip {}", self.ev, trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }));
+            lines.push(format!("EV {:+.2}  zoom {}x  clip {}  hdr {}", self.ev, trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }, if self.hdr { "on (3x−x³)/2" } else { "off" }));
+            if let Some((x0, y0, x1, y1)) = self.crop {
+                lines.push(format!("crop {x0},{y0}  {}×{}  (click: nearest corner to cursor)", x1 - x0, y1 - y0));
+            }
             if let Some((px, py)) = self.image_px_at(ctx.cursor_x, ctx.cursor_y, ctx.viewport) {
                 let names: Vec<String> = self.dec.as_ref().map(|d| d.img.channels.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
                 let raw: Vec<String> = self.raw.samples_at(px, py).into_iter().map(|(ch, v)| format!("{} {v}", names.get(ch).map(String::as_str).unwrap_or("?"))).collect();
@@ -1627,6 +1866,32 @@ impl FluorApp for OpsinApp {
             }
             let box_w = (max_w + pad).min(divider_px as f32 - x0);
             paint::fill_rect(&mut canvas, x0 as isize, y_top as isize, box_w as isize, box_h as isize, HUD_BG, clip, None);
+        }
+
+        // Crop overlay — drawn BEFORE the image so under-compose puts it on top: everything outside the rect dims to the HUD tone, and a hairline rings the rect. Screen coords straight from the same per-frame transform as the blit.
+        if let Some((x0, y0, x1, y1)) = self.crop {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            let sx0 = (img_ox + x0 as f32 * zoom).round() as isize;
+            let sy0 = (img_oy + y0 as f32 * zoom).round() as isize;
+            let sx1 = (img_ox + x1 as f32 * zoom).round() as isize;
+            let sy1 = (img_oy + y1 as f32 * zoom).round() as isize;
+            let (ax0, ay0, ax1, ay1) = (0isize, bar_h as isize, divider_px as isize, buf_h as isize);
+            // Four bands: above, below, left, right of the rect — clipped to the image area.
+            let band = |c: &mut Canvas, x0: isize, y0: isize, x1: isize, y1: isize| {
+                let (x0, y0, x1, y1) = (x0.max(ax0), y0.max(ay0), x1.min(ax1), y1.min(ay1));
+                if x1 > x0 && y1 > y0 {
+                    paint::fill_rect(c, x0, y0, x1 - x0, y1 - y0, HUD_BG, clip, None);
+                }
+            };
+            band(&mut canvas, ax0, ay0, ax1, sy0);
+            band(&mut canvas, ax0, sy1, ax1, ay1);
+            band(&mut canvas, ax0, sy0, sx0, sy1);
+            band(&mut canvas, sx1, sy0, ax1, sy1);
+            for (x, y, w, h) in [(sx0, sy0, sx1 - sx0, 0), (sx0, sy1 - 1, sx1 - sx0, 0), (sx0, sy0, 0, sy1 - sy0), (sx1 - 1, sy0, 0, sy1 - sy0)] {
+                if x >= ax0 && x < ax1 && y >= ay0 && y < ay1 {
+                    paint::fill_rect(&mut canvas, x, y, w.min(ax1 - x), h.min(ay1 - y), TEXT_GREY, clip, None);
+                }
+            }
         }
 
         // Nearest-neighbour blit of the image rect ∩ image area (left of the divider, below the bar). Per-row source index precomputed once; per-pixel work is one under() compose.
@@ -1691,7 +1956,7 @@ impl FluorApp for OpsinApp {
         if self.chrome.owns_hit(hit) && hit != self.chrome.app_icon_btn.id() {
             return CursorIcon::Pointer;
         }
-        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_info.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
+        if [self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_info.hit_id(), self.btn_hdr.hit_id(), self.btn_crop.hit_id(), self.btn_rot_ccw.hit_id(), self.btn_rot_cw.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()].contains(&hit) {
             return CursorIcon::Pointer;
         }
         // Resize arrows only where a press would actually resize — the bar body below the sliver stays Default (it moves the window).
@@ -1726,17 +1991,60 @@ mod tests {
             40000, mid, mid, // legal at EV 0, blows past white at +1 EV
         ];
         // Indicator OFF: everything clamps, over-white renders WHITE (darkness 0), negative renders BLACK (darkness 255).
-        let plain = encode_pixels(&lin, 0., false);
+        let plain = encode_pixels(&lin, 0., false, false);
         assert_eq!(darkness_r(plain[0]), 0);
         assert_eq!(darkness_r(plain[1]), 255);
         // Indicator ON at EV 0: preview_sub inversion — over-white DARK, under-black BLOWN; the legal pixel unaffected.
-        let clip0 = encode_pixels(&lin, 0., true);
+        let clip0 = encode_pixels(&lin, 0., true, false);
         assert_eq!(darkness_r(clip0[0]), 255, "blown renders dark");
         assert_eq!(darkness_r(clip0[1]), 0, "crushed renders blown");
         assert_eq!(darkness_r(clip0[2]), darkness_r(plain[2]), "legal pixel untouched");
         // Indicator ON at +1 EV: the 40000 pixel now exceeds display white and flips to dark — the indicator tracks the live exposure.
-        let clip1 = encode_pixels(&lin, 1., true);
+        let clip1 = encode_pixels(&lin, 1., true, false);
         assert_eq!(darkness_r(clip1[2]), 255, "EV pushes it past white; the mark follows");
+    }
+
+    #[test]
+    fn hdr_rail_is_photons_cubic_on_the_display_domain() {
+        use crate::convert::hdr_rail as f;
+        assert_eq!(f(0), 0);
+        assert_eq!(f(65535), 65535);
+        // Matches the real-valued (3x − x³)/2 to within one code everywhere; monotonic; never below identity (brightens, never darkens); slope 3/2 at black.
+        let mut prev = 0;
+        for x in 0..=65535i64 {
+            let y = f(x);
+            let exact = (3. * x as f64 - (x as f64).powi(3) / 65535f64.powi(2)) / 2.;
+            assert!((y as f64 - exact).abs() <= 1.5, "x={x} y={y} exact={exact}");
+            assert!(y >= prev && y >= x, "x={x}");
+            prev = y;
+        }
+        assert_eq!(f(1000), 1500);
+        // Overs pin to the rail (the cubic folds back past it — the clamp is load-bearing).
+        assert_eq!(f(80000), 65535);
+        // The viewer's HDR encode = plain encode of the railed value: screen and export share the one definition.
+        let lin = vec![32768, 32768, 32768];
+        let hdr = encode_pixels(&lin, 0., false, true);
+        let curved = vec![f(32768) as i32; 3];
+        let plain = encode_pixels(&curved, 0., false, false);
+        assert_eq!(darkness_r(hdr[0]), darkness_r(plain[0]));
+        // Clip indicator still fires on the pre-curve boundary under HDR.
+        assert_eq!(darkness_r(encode_pixels(&[70000, 100, 100], 0., true, true)[0]), 255);
+    }
+
+    #[test]
+    fn rotate_rect_rides_the_frame() {
+        // A 10×4 frame, rect x∈[2,5) y∈[1,3). CW: the frame becomes 4×10, the rect's x-extent is the old y mirrored: [4−3, 4−1) = [1,3), y-extent = old x [2,5).
+        let r = (2, 1, 5, 3);
+        assert_eq!(rotate_rect(r, 10, 4, true), (1, 2, 3, 5));
+        // CCW undoes CW (dims swap in between); four CW turns are the identity.
+        assert_eq!(rotate_rect(rotate_rect(r, 10, 4, true), 4, 10, false), r);
+        let mut x = r;
+        let (mut w, mut h) = (10, 4);
+        for _ in 0..4 {
+            x = rotate_rect(x, w, h, true);
+            std::mem::swap(&mut w, &mut h);
+        }
+        assert_eq!(x, r);
     }
 
     #[test]
