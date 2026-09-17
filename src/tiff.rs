@@ -48,6 +48,8 @@ pub const TAG_BASELINE_EXPOSURE: u16 = 50730;
 pub const TAG_ILL1: u16 = 50778;
 pub const TAG_ILL2: u16 = 50779;
 pub const TAG_PROFILE_NAME: u16 = 50936;
+pub const TAG_ICC: u16 = 34675;
+pub const TYPE_UNDEFINED: u16 = 7;
 
 pub fn read_exact_at(f: &mut File, off: u64, buf: &mut [u8]) -> Result<(), String> {
     f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
@@ -154,6 +156,8 @@ pub struct FrameMeta {
     pub profile_name: Option<String>,
     /// DNG BaselineExposure (stops) — lumis writes the on-screen display gain here so raw converters open at the same brightness. Informational only in opsin.
     pub baseline_exposure: Option<(i32, i32)>,
+    /// Embedded ICC profile (34675) bytes, verbatim — an RGB TIFF's declared characterization.
+    pub icc: Option<Vec<u8>>,
     pub cm1: Option<Entry>,
     pub cm2: Option<Entry>,
     pub ill1: Option<Entry>,
@@ -165,9 +169,15 @@ impl FrameMeta {
         let (be, ifd0) = header(f)?;
         let mut m = FrameMeta { be, ..Default::default() };
         let mut exif_ifd = None;
-        for (tag, e) in walk_ifd(f, ifd0, be, &[TAG_EXIF_IFD, TAG_CM1, TAG_CM2, TAG_ILL1, TAG_ILL2, TAG_PROFILE_NAME, TAG_BASELINE_EXPOSURE])? {
+        for (tag, e) in walk_ifd(f, ifd0, be, &[TAG_EXIF_IFD, TAG_CM1, TAG_CM2, TAG_ILL1, TAG_ILL2, TAG_PROFILE_NAME, TAG_BASELINE_EXPOSURE, TAG_ICC])? {
             match tag {
                 TAG_EXIF_IFD => exif_ifd = Some(u32e(&e.value, be) as u64),
+                TAG_ICC if e.ty == TYPE_UNDEFINED && e.count > 4 => {
+                    let mut b = vec![0u8; e.count as usize];
+                    if read_exact_at(f, u32e(&e.value, be) as u64, &mut b).is_ok() {
+                        m.icc = Some(b);
+                    }
+                }
                 TAG_CM1 => m.cm1 = Some(e),
                 TAG_CM2 => m.cm2 = Some(e),
                 TAG_ILL1 => m.ill1 = Some(e),

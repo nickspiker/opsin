@@ -30,7 +30,7 @@ const XYZ_TO_VSF_RGB: [f32; 9] = t3(vsf::colour::XYZ2VSF_RGB);
 /// linear VSF RGB → linear Rec.2020 (row-major) — the DISPLAY concatenation applied to the stored camera→VSF-RGB matrix. Never stored; the monitor assumption lives only here.
 const VSF_RGB_TO_REC2020: [f32; 9] = t3(vsf::colour::VSF_RGB2REC2020);
 
-fn matmul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
+pub(crate) fn matmul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
     let mut m = [0f32; 9];
     for r in 0..3 {
         for c in 0..3 {
@@ -40,7 +40,7 @@ fn matmul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
     m
 }
 
-fn inv3(m: &[f32; 9]) -> Option<[f32; 9]> {
+pub(crate) fn inv3(m: &[f32; 9]) -> Option<[f32; 9]> {
     let det = m[0] * (m[4] * m[8] - m[5] * m[7])
         - m[1] * (m[3] * m[8] - m[5] * m[6])
         + m[2] * (m[3] * m[7] - m[4] * m[6]);
@@ -165,7 +165,12 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
 }
 
 /// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade profile entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL and JPEG paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
-fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str) -> Decoded {
+/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] under an identity `Assumed` entry, so the view treats it like any other display-referred ingest.
+pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str) -> Decoded {
+    display_referred(w, h, planar, [1., 0., 0., 0., 1., 0., 0., 0., 1.], source, ProfileGrade::Assumed, 0)
+}
+
+fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16) -> Decoded {
     let img = SpectralImage {
         width: w,
         height: h,
@@ -183,8 +188,8 @@ fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], 
                 matrix: cam_to_vsf,
                 source: source.to_string(),
                 class: IdtClass::Absolute,
-                grade: ProfileGrade::Assumed,
-                illuminant: 21, // D65 — the white point of every accepted display space.
+                grade,
+                illuminant,
                 transfer: Transfer::Linear,
             }],
             dng_colormatrix: [None, None],
@@ -196,7 +201,61 @@ fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], 
     Decoded { img }
 }
 
-/// Untagged-convention JPEG → [`Decoded`]: decoded RGB8 assumed sRGB (the web's defined default — same assumption every platform makes), sRGB EOTF un-done to linear via a 256-entry LUT, stored planar u16 with an sRGB→VSF-RGB `Assumed` entry. ICC profiles, if present, are ignored — the whole point of this path is the sRGB convention. EXIF orientation is not parsed yet (most posts are pre-rotated); greyscale JPEGs come back RGB from the decoder's requested output space.
+/// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` grade, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` grade, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the grade.
+fn display_referred_8bit(px: &[u8], stride: usize, n: usize, icc: Option<&[u8]>, convention: &str) -> (Vec<u16>, [f32; 9], String, ProfileGrade, u16) {
+    match icc.and_then(crate::icc::parse) {
+        Some(p) => {
+            let cam_to_vsf = matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz);
+            (icc8_to_linear_planar(px, stride, n, &p.trc), cam_to_vsf, format!("icc:{}", p.description), ProfileGrade::Model, illuminant_code_of(p.white))
+        }
+        None => {
+            let source = if icc.is_some() { format!("{convention} (embedded ICC not matrix/TRC — declined)") } else { convention.to_string() };
+            (srgb8_to_linear_planar(px, stride, n), t3(vsf::colour::SRGB2VSF_RGB), source, ProfileGrade::Assumed, 21)
+        }
+    }
+}
+
+/// The EXIF LightSource code nearest an XYZ white — so a profile's own white drives the display exposure scalar (D65 for sRGB/Rec.2020/P3; D50 for a print-side profile).
+fn illuminant_code_of(w: [f32; 3]) -> u16 {
+    [21u16, 23, 20, 22, 17].into_iter().min_by(|&a, &b| {
+        let d = |c: u16| { let x = illuminant_xyz(c); (x[0] - w[0]).powi(2) + (x[2] - w[2]).powi(2) };
+        d(a).total_cmp(&d(b))
+    }).unwrap()
+}
+
+/// Interleaved 8-bit → LINEAR planar u16 through per-channel ICC curves (three 256-entry LUTs built per call — the curves are the file's). Alpha composited over black like the sRGB path.
+fn icc8_to_linear_planar(px: &[u8], stride: usize, n: usize, trc: &[crate::icc::Trc; 3]) -> Vec<u16> {
+    let lut: Vec<[u16; 256]> = trc
+        .iter()
+        .map(|t| {
+            let mut l = [0u16; 256];
+            for (v, out) in l.iter_mut().enumerate() {
+                *out = (t.linear(v as f32 / 255.) * 65535.).round() as u16;
+            }
+            l
+        })
+        .collect();
+    let mut planar = vec![0u16; n * 3];
+    let (rp, rest) = planar.split_at_mut(n);
+    let (gp, bp) = rest.split_at_mut(n);
+    rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
+        let s = i * stride;
+        let (lr, lg, lb) = (lut[0][px[s] as usize] as u32, lut[1][px[s + 1] as usize] as u32, lut[2][px[s + 2] as usize] as u32);
+        if stride == 4 {
+            let a = px[s + 3] as u32;
+            *r = ((lr * a + 127) / 255) as u16;
+            *g = ((lg * a + 127) / 255) as u16;
+            *b = ((lb * a + 127) / 255) as u16;
+        } else {
+            *r = lr as u16;
+            *g = lg as u16;
+            *b = lb as u16;
+        }
+    });
+    planar
+}
+
+/// JPEG → [`Decoded`]: an embedded matrix/TRC ICC (APP2) is honoured — see [`display_referred_8bit`] — else assumed sRGB (the web's defined default — same assumption every platform makes), sRGB EOTF un-done to linear via a 256-entry LUT, stored planar u16 with an sRGB→VSF-RGB `Assumed` entry.  EXIF orientation is not parsed yet (most posts are pre-rotated); greyscale JPEGs come back RGB from the decoder's requested output space.
 #[allow(deprecated)]
 fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     let options = zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
@@ -208,8 +267,9 @@ fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     if rgb.len() != n * 3 {
         return Err(format!("decoded {} bytes for {w}×{h}×3", rgb.len()));
     }
-    let planar = srgb8_to_linear_planar(&rgb, 3, n);
-    Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "jpeg_assumed_srgb"))
+    let icc = dec.icc_profile();
+    let (planar, m, source, grade, ill) = display_referred_8bit(&rgb, 3, n, icc.as_deref(), "jpeg_assumed_srgb");
+    Ok(display_referred(w, h, planar, m, &source, grade, ill))
 }
 
 /// Interleaved sRGB8 (`stride` bytes a pixel: 3 for RGB, 4 for RGBA) → LINEAR planar u16 RGB, `n` pixels. sRGB EOTF un-done via a 256-entry LUT built once per process. With a fourth byte the pixel is composited over black (the linear value scaled by alpha) — opsin has no alpha plane, and a transparent region carrying leftover colour would otherwise render as garbage; over black is what a viewer with no backdrop honestly shows.
@@ -242,7 +302,7 @@ fn srgb8_to_linear_planar(px: &[u8], stride: usize, n: usize) -> Vec<u16> {
     planar
 }
 
-/// Untagged-convention WebP → [`Decoded`]: the JPEG path's twin. Lossy and lossless both decode to RGB8 (RGBA8 when the extended header carries alpha — composited over black in linear), assumed sRGB like every web file, linearized and stored planar u16 with the same sRGB→VSF-RGB `Assumed` entry. An animated file yields its first frame. The ICC chunk is ignored on purpose (the sRGB convention IS this path) and EXIF orientation is not parsed, matching JPEG.
+/// Untagged-convention WebP → [`Decoded`]: the JPEG path's twin. Lossy and lossless both decode to RGB8 (RGBA8 when the extended header carries alpha — composited over black in linear), assumed sRGB like every web file, linearized and stored planar u16 with the same sRGB→VSF-RGB `Assumed` entry. An animated file yields its first frame. An embedded matrix/TRC ICC chunk is honoured, else the sRGB convention and EXIF orientation is not parsed, matching JPEG.
 fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
     let mut dec = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let (w, h) = dec.dimensions();
@@ -255,34 +315,42 @@ fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
     if px.len() != n * stride {
         return Err(format!("decoded {} bytes for {w}×{h}×{stride}", px.len()));
     }
-    let planar = srgb8_to_linear_planar(&px, stride, n);
-    Ok(display_referred(w, h, planar, t3(vsf::colour::SRGB2VSF_RGB), "webp_assumed_srgb"))
+    let icc = dec.icc_profile().ok().flatten();
+    let (planar, m, source, grade, ill) = display_referred_8bit(&px, stride, n, icc.as_deref(), "webp_assumed_srgb");
+    Ok(display_referred(w, h, planar, m, &source, grade, ill))
 }
 
-/// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. ICC-profiled and HDR (PQ/HLG) streams are rejected rather than guessed at.
+/// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. An embedded matrix/TRC ICC is honoured (its curves and colorants, `Model` grade); other ICC kinds and HDR (PQ/HLG) enum streams are declined rather than guessed at.
 fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     use jxl_oxide::color::{ColourEncoding, Primaries, TransferFunction};
     let image = jxl_oxide::JxlImage::builder().read(bytes).map_err(|e| e.to_string())?;
-    let ColourEncoding::Enum(enc) = &image.image_header().metadata.colour_encoding else {
-        return Err(format!("ICC-profiled JXL not supported (enum colour encodings only)"));
-    };
-    // Display space → linear VSF RGB, from the tagged primaries (white D65 for both). This is the profile entry's matrix — the stored plane is linear in the TAGGED primaries; VSF RGB is reached at read time like every other source.
-    let cam_to_vsf: [f32; 9] = match enc.primaries {
-        Primaries::Srgb => t3(vsf::colour::SRGB2VSF_RGB),
-        Primaries::Bt2100 => inv3(&VSF_RGB_TO_REC2020).ok_or("Rec.2020 primaries matrix singular")?,
-        other => return Err(format!("unsupported JXL primaries {other:?}")),
-    };
-    // EOTF exponent/curve to LINEARIZE the decoded samples. jxl gamma signalling is the OETF gamma (lumis writes 0.5 for its sqrt encode), parsed with `inverted: true` ⇒ EOTF exponent = 1e7/g.
+    // EOTF to LINEARIZE the decoded samples. jxl gamma signalling is the OETF gamma (lumis writes 0.5 for its sqrt encode), parsed with `inverted: true` ⇒ EOTF exponent = 1e7/g. An ICC-profiled stream decodes in the profile's own space: its curves and colorants apply, matrix/TRC only.
     enum Eotf {
         Linear,
         Srgb,
         Pow(f32),
+        Icc([crate::icc::Trc; 3]),
     }
-    let eotf = match enc.tf {
-        TransferFunction::Linear => Eotf::Linear,
-        TransferFunction::Srgb => Eotf::Srgb,
-        TransferFunction::Gamma { g, inverted } if g > 0 => Eotf::Pow(if inverted { 1e7 / g as f32 } else { g as f32 / 1e7 }),
-        other => return Err(format!("unsupported JXL transfer function {other:?}")),
+    let (cam_to_vsf, eotf, source, grade, illuminant): ([f32; 9], Eotf, String, ProfileGrade, u16) = match &image.image_header().metadata.colour_encoding {
+        ColourEncoding::Enum(enc) => {
+            // Display space → linear VSF RGB, from the tagged primaries (white D65 for both). This is the profile entry's matrix — the stored plane is linear in the TAGGED primaries; VSF RGB is reached at read time like every other source.
+            let m: [f32; 9] = match enc.primaries {
+                Primaries::Srgb => t3(vsf::colour::SRGB2VSF_RGB),
+                Primaries::Bt2100 => inv3(&VSF_RGB_TO_REC2020).ok_or("Rec.2020 primaries matrix singular")?,
+                other => return Err(format!("unsupported JXL primaries {other:?}")),
+            };
+            let eotf = match enc.tf {
+                TransferFunction::Linear => Eotf::Linear,
+                TransferFunction::Srgb => Eotf::Srgb,
+                TransferFunction::Gamma { g, inverted } if g > 0 => Eotf::Pow(if inverted { 1e7 / g as f32 } else { g as f32 / 1e7 }),
+                other => return Err(format!("unsupported JXL transfer function {other:?}")),
+            };
+            (m, eotf, "jxl_colour_encoding".to_string(), ProfileGrade::Assumed, 21)
+        }
+        ColourEncoding::IccProfile(_) => {
+            let p = image.original_icc().and_then(crate::icc::parse).ok_or("ICC-profiled JXL: embedded profile is not matrix/TRC — declined")?;
+            (matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz), Eotf::Icc(p.trc.clone()), format!("icc:{}", p.description), ProfileGrade::Model, illuminant_code_of(p.white))
+        }
     };
 
     let render = image.render_frame(0).map_err(|e| e.to_string())?;
@@ -297,24 +365,25 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     let mut planar = vec![0u16; n * 3];
     let (rp, rest) = planar.split_at_mut(n);
     let (gp, bp) = rest.split_at_mut(n);
-    let lin_of = |e: f32| -> u16 {
+    let lin_of = |e: f32, c: usize| -> u16 {
         let e = e.clamp(0., 1.);
         #[allow(deprecated)]
-        let l = match eotf {
+        let l = match &eotf {
             Eotf::Linear => e,
             Eotf::Srgb => vsf::colour::srgb_eotf(e),
-            Eotf::Pow(p) => e.powf(p),
+            Eotf::Pow(p) => e.powf(*p),
+            Eotf::Icc(trc) => trc[c].linear(e),
         };
         (l * 65535.).round() as u16
     };
     rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
         let s = i * ch;
-        *r = lin_of(buf[s]);
-        *g = lin_of(buf[s + 1]);
-        *b = lin_of(buf[s + 2]);
+        *r = lin_of(buf[s], 0);
+        *g = lin_of(buf[s + 1], 1);
+        *b = lin_of(buf[s + 2], 2);
     });
 
-    Ok(display_referred(w, h, planar, cam_to_vsf, "jxl_colour_encoding"))
+    Ok(display_referred(w, h, planar, cam_to_vsf, &source, grade, illuminant))
 }
 
 /// Camera RAW / DNG → [`Decoded`], in memory (no file written). Decodes via limbus, packs the sensor plane as a `BitPackedTensor` at native bit depth, records the CFA as a channel-index tile, and derives the camera→Rec.2020 cmx from the DNG ColorMatrix1 when present (3-channel sources only).
@@ -323,24 +392,53 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
 
     let bit_depth = if info.bitdepth >= 1 && info.bitdepth <= 16 { info.bitdepth } else { 16 };
 
-    let (channels, layout, samples) = if info.rgb {
-        // Already-demosaiced source (RGB TIFF-like): de-interleave [h,w,3] → planar [3,h,w].
+    if info.rgb {
+        // An already-demosaiced RGB TIFF is DISPLAY-REFERRED, not sensor counts: it takes the JPEG/WebP rule — an embedded matrix/TRC ICC (tag 34675) is honoured, else assumed sRGB — through the shared display-referred path, linearized to planar u16. (lumis's own 16-bit TIFFs are sqrt-encoded Rec.2020; the ones it tags say so via ICC, the early untagged ones fall to the sRGB convention.) EXIF orientation rides as a view op like every TIFF-family source.
         let n = info.width * info.height;
         if pixels.len() != n * 3 {
             return Err(format!("RGB source pixel count {} != {}×{}×3", pixels.len(), info.width, info.height));
         }
+        let meta = crate::tiff::FrameMeta::read_path(input).ok();
+        let icc = meta.as_ref().and_then(|m| m.icc.as_deref());
+        let white = ((1u32 << bit_depth) - 1) as f32;
+        let (m, source, grade, illuminant, trc) = match icc.and_then(crate::icc::parse) {
+            Some(p) => (matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz), format!("icc:{}", p.description), ProfileGrade::Model, illuminant_code_of(p.white), Some(p.trc)),
+            None => (t3(vsf::colour::SRGB2VSF_RGB), if icc.is_some() { "tiff_assumed_srgb (embedded ICC not matrix/TRC — declined)".to_string() } else { "tiff_assumed_srgb".to_string() }, ProfileGrade::Assumed, 21, None),
+        };
+        // Per-channel LUT over the native code range (256 or 65536 entries): the ICC curve, or sRGB's.
+        let lut: Vec<Vec<u16>> = (0..3)
+            .map(|c| {
+                (0..=white as usize)
+                    .map(|v| {
+                        let e = v as f32 / white;
+                        #[allow(deprecated)]
+                        let l = match &trc {
+                            Some(t) => t[c].linear(e),
+                            None => vsf::colour::srgb_eotf(e),
+                        };
+                        (l * 65535.).round() as u16
+                    })
+                    .collect()
+            })
+            .collect();
         let mut planar = vec![0u16; n * 3];
-        for i in 0..n {
-            planar[i] = pixels[i * 3];
-            planar[n + i] = pixels[i * 3 + 1];
-            planar[2 * n + i] = pixels[i * 3 + 2];
-        }
-        (
-            rgb_channel_names().to_vec(),
-            PlaneLayout::Planar,
-            BitPackedTensor::pack(bit_depth, vec![3, info.height, info.width], &planar),
-        )
-    } else {
+        let (rp, rest) = planar.split_at_mut(n);
+        let (gp, bp) = rest.split_at_mut(n);
+        rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
+            *r = lut[0][(pixels[i * 3] as usize).min(white as usize)];
+            *g = lut[1][(pixels[i * 3 + 1] as usize).min(white as usize)];
+            *b = lut[2][(pixels[i * 3 + 2] as usize).min(white as usize)];
+        });
+        let mut dec = display_referred(info.width, info.height, planar, m, &source, grade, illuminant);
+        dec.img.make = info.make.trim_end_matches('\0').trim().to_string();
+        dec.img.model = info.model.trim_end_matches('\0').trim().to_string();
+        dec.img.view = (2..=8).contains(&info.orientation).then(|| ViewTransform {
+            space: "vsf_rgb_linear".to_string(),
+            ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![info.orientation as f32] }],
+        });
+        return Ok(dec);
+    }
+    let (channels, layout, samples) = {
         let tile_h = info.cfah as usize;
         let tile_w = info.cfaw as usize;
         if tile_h * tile_w == 0 || info.cfa.len() != tile_h * tile_w {
@@ -803,4 +901,8 @@ mod tests {
         assert_eq!(px(3), &[3, 4, 5]); // B
     }
 }
+
+
+
+
 

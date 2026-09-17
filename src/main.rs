@@ -5,12 +5,19 @@
 //!   opsin <dir>               open the first supported image in a directory.
 //!   opsin --convert <in> [out]  headless: decode <in> to a VSF-Image (default <in>.vsf). The GUI's V without a window.
 //!   opsin --copy-idt <frame>    lift the DSR IDT (DNG ColorMatrix1 + illuminant + camera fingerprint) into the clip file. The GUI's Ctrl+C.
+//!   opsin --live               headless virtual webcam (live feature): camera → saved matrix → /dev/video10, no window. Ctrl+C stops.
 //!   opsin --paste-idt [--force] <frame>...  patch the clipped IDT into each frame in place — only where the camera fingerprint matches; --force overrides a mismatch (a lens change on an interchangeable-lens body) with a warning. The GUI's Ctrl+V / Ctrl+Shift+V, for a whole folder.
 
 mod app;
+mod view;
+#[cfg(feature = "live")]
+mod live;
+#[cfg(feature = "calibrate")]
+mod calibrate;
 mod convert;
 mod headerless;
 mod sniff;
+mod icc;
 mod idt;
 mod instance;
 mod tiff;
@@ -48,6 +55,25 @@ fn run_viewer(viewer: app::OpsinApp) {
         eprintln!("opsin: event loop: {e}");
         std::process::exit(1);
     }
+}
+
+/// SIGINT → the closure, once. libc-free: `signal(2)` with a static hook; only used by the headless `--live` loop to stop cleanly.
+#[cfg(feature = "live")]
+fn ctrlc_handler(f: impl Fn() + Send + Sync + 'static) -> Result<(), ()> {
+    static HOOK: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+    extern "C" fn on_sigint(_: i32) {
+        if let Some(h) = HOOK.get() {
+            h();
+        }
+    }
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    HOOK.set(Box::new(f)).map_err(|_| ())?;
+    unsafe {
+        signal(2, on_sigint);
+    }
+    Ok(())
 }
 
 fn main() {
@@ -121,6 +147,26 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "live")]
+        Some("--live") => {
+            // Headless virtual webcam: the saved matrix, the camera → loopback stream, no window, no viewfinder. Ctrl+C stops.
+            let shared = live::Shared::new(live::load_matrix().unwrap_or(live::default_matrix()));
+            shared.viewfinder.store(false, std::sync::atomic::Ordering::Relaxed);
+            let handle = match live::start(shared.clone(), |m| {
+                if let live::LiveMsg::Status(s) = m {
+                    eprintln!("opsin: {s}");
+                }
+            }) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("opsin: live: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let stop = shared.clone();
+            let _ = ctrlc_handler(move || stop.stop.store(true, std::sync::atomic::Ordering::Relaxed));
+            let _ = handle.join();
+        }
         Some("--check") => {
             // Headless: run the full open() (load + colour + panel tools) and report, without a window. Times the decode and render stages.
             let path = args.get(1).map(String::as_str).unwrap_or("");
@@ -186,3 +232,14 @@ fn main() {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
