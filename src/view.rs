@@ -2003,7 +2003,7 @@ impl View {
                         let (tx, ty, tw, th) = (mx + label_w, my + band * 4 + pad_of(viewport) * 2, mw.saturating_sub(label_w + band * 3), (band * 3 / 5).max(3));
                         let cy = ty as f32 + th as f32 / 2.;
                         text.draw_text_left(canvas, "mic", mx as f32, cy, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
-                        paint::fill_rect(canvas, tx as isize, ty as isize, tw as isize, th as isize, METER_TROUGH, clip, None);
+                        // Front-to-back: the level fill and the hairlines first, the trough LAST so it shows only where nothing else did.
                         let fill = ((db + 60.) / 60. * tw as f32) as usize;
                         let zone = |lo_db: f32, hi_db: f32| -> (usize, usize) { (((lo_db + 60.) / 60. * tw as f32) as usize, ((hi_db + 60.) / 60. * tw as f32) as usize) };
                         for (lo, hi, colour) in [(-60., -12., METER_GREEN), (-12., -3., METER_YELLOW), (-3., 0., METER_RED)] {
@@ -2017,6 +2017,7 @@ impl View {
                             let x = tx + ((mark + 60.) / 60. * tw as f32) as usize;
                             paint::fill_rect(canvas, x as isize, ty as isize, 0, th as isize, HAIRLINE, clip, None);
                         }
+                        paint::fill_rect(canvas, tx as isize, ty as isize, tw as isize, th as isize, METER_TROUGH, clip, None);
                         text.draw_text_right(canvas, &format!("{db:.0} dB"), (mx + mw) as f32, cy, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
                     }
                 }
