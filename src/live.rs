@@ -437,7 +437,16 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
     use v4l::io::traits::CaptureStream;
     use v4l::video::Capture;
     let path = find_device()?;
-    let mut dev = v4l::Device::with_path(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut dev = v4l::Device::with_path(&path).map_err(|e| format!("{path}: {e} (another process has the camera? `fuser {path}`)"))?;
+    // Close-on-exec on the camera fd: every child we spawn (ffmpeg, pipewire, pw-record) would otherwise inherit it and keep the camera busy after we're gone — an orphaned pipewire from a killed session did exactly that (2026-09-17).
+    {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        }
+        unsafe {
+            fcntl(dev.handle().fd(), 2, 1); // F_SETFD, FD_CLOEXEC
+        }
+    }
     let mut fmt = Capture::format(&dev).map_err(|e| e.to_string())?;
     fmt.width = WIDTH as u32;
     fmt.height = HEIGHT as u32;
