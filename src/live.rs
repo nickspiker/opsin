@@ -175,6 +175,41 @@ pub fn save_matrix_and_extra(s: &Sliders, extra_ms: u32) -> Result<PathBuf, Stri
     Ok(path)
 }
 
+/// rgb24 (full-range gamma-encoded bytes) → yuv420p, limited range, BT.2020 NCL (Kr 0.2627, Kb 0.0593): Y per pixel, Cb/Cr averaged over each 2×2. Parallel over row pairs; integer Q16 arithmetic.
+fn rgb_to_yuv420(rgb: &[u8], yuv: &mut [u8]) {
+    use rayon::prelude::*;
+    let (w, h) = (WIDTH, HEIGHT);
+    let (yp, cp) = yuv.split_at_mut(w * h);
+    let (up, vp) = cp.split_at_mut(w * h / 4);
+    // Y = 16 + 219·(Kr R + Kg G + Kb B)/255 ; Cb = 128 + 224·((B − Y')/(2(1−Kb)))/255 ; Cr likewise with R. Coefficients ×65536.
+    const KR: i32 = (0.2627 * 65536.) as i32;
+    const KB: i32 = (0.0593 * 65536.) as i32;
+    const KG: i32 = 65536 - KR - KB;
+    let y_scale = (219 * 65536) / 255;
+    let cb_den = 2. * (1. - 0.0593);
+    let cr_den = 2. * (1. - 0.2627);
+    let cb_scale = ((224. / 255.) / cb_den * 65536.) as i64;
+    let cr_scale = ((224. / 255.) / cr_den * 65536.) as i64;
+    yp.par_chunks_mut(w * 2).zip(up.par_chunks_mut(w / 2)).zip(vp.par_chunks_mut(w / 2)).enumerate().for_each(|(py, ((yrows, urow), vrow))| {
+        let (y0, y1) = yrows.split_at_mut(w);
+        for x in 0..w / 2 {
+            let (mut sb, mut sr) = (0i64, 0i64);
+            for (dy, yrow) in [y0.as_mut(), y1.as_mut()].into_iter().enumerate() {
+                for dx in 0..2 {
+                    let i = ((py * 2 + dy) * w + x * 2 + dx) * 3;
+                    let (r, g, b) = (rgb[i] as i32, rgb[i + 1] as i32, rgb[i + 2] as i32);
+                    let yl = (KR * r + KG * g + KB * b) >> 16; // 0..255 luma, full range
+                    yrow[x * 2 + dx] = (16 + ((yl * y_scale) >> 16)) as u8;
+                    sb += (b - yl) as i64;
+                    sr += (r - yl) as i64;
+                }
+            }
+            urow[x] = (128 + ((sb * cb_scale) >> 18)).clamp(16, 240) as u8;
+            vrow[x] = (128 + ((sr * cr_scale) >> 18)).clamp(16, 240) as u8;
+        }
+    });
+}
+
 /// Wall clock in milliseconds since the epoch — the clock the recorder aligns audio and video on.
 fn wall_ms() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1e3).unwrap_or(0.)
@@ -309,8 +344,11 @@ impl Recorder {
         }
         let mut child = std::process::Command::new("ffmpeg")
             .args([
-                "-loglevel", "info", "-stats",
-                "-thread_queue_size", "64", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-framerate", "15", "-i", "pipe:0",
+                "-loglevel", "error",
+                // Raw inputs need no probing: without this ffmpeg's find_stream_info sat on the audio FIFO waiting for its default 5 s of data, reading no video meanwhile — four seconds of dropped frames at the start of every recording.
+                "-probesize", "32", "-analyzeduration", "0",
+                "-thread_queue_size", "64", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", "15", "-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "bt709", "-i", "pipe:0",
+                "-probesize", "32", "-analyzeduration", "0",
                 "-thread_queue_size", "1024", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i",
             ])
             .arg(audio_fifo)
@@ -442,7 +480,8 @@ fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) 
             const BLOCK: usize = RATE / 50; // 20 ms
             let mut buf = vec![0u8; BLOCK * 2];
             let mut ticks = 0u32;
-            let mut feed: Option<(PathBuf, std::fs::File)> = None;
+            // The recording's audio feeder: an unbounded queue drained by its own thread, so a stalled FIFO (ffmpeg throttles audio to the video timeline) never stalls THIS thread — a stall here overflows pw-record's pipe and drops real samples, and dropped samples are a shorter audio timeline than the video's.
+            let mut feed: Option<(PathBuf, std::sync::mpsc::Sender<Vec<u8>>, std::thread::JoinHandle<()>)> = None;
             while !shared.stop.load(Ordering::Relaxed) {
                 if out.read_exact(&mut buf).is_err() {
                     break;
@@ -463,26 +502,42 @@ fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) 
                 let want = shared.audio_feed.lock().unwrap().clone();
                 match (&want, &mut feed) {
                     (Some((path, from_ms)), None) => {
-                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-                            let backlog: Vec<i16> = {
-                                let ring = shared.mic_ring.lock().unwrap();
-                                let n = (((ring.1 - from_ms) / 1000. * RATE as f64).round().max(0.) as usize).min(ring.0.len());
-                                ring.0.iter().skip(ring.0.len() - n).copied().collect()
-                            };
-                            let mut f = f;
-                            let bytes: Vec<u8> = backlog.iter().flat_map(|v| v.to_le_bytes()).collect();
-                            if f.write_all(&bytes).is_ok() {
-                                feed = Some((path.clone(), f));
-                            }
+                        // Backlog from the moment the first frame was captured (the ring's newest sample is "now"), then every block as it comes.
+                        let backlog: Vec<u8> = {
+                            let ring = shared.mic_ring.lock().unwrap();
+                            let n = (((ring.1 - from_ms) / 1000. * RATE as f64).round().max(0.) as usize).min(ring.0.len());
+                            ring.0.iter().skip(ring.0.len() - n).flat_map(|v| v.to_le_bytes()).collect()
+                        };
+                        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                        let fifo = path.clone();
+                        let handle = std::thread::Builder::new()
+                            .name("opsin-rec-audio".into())
+                            .spawn(move || {
+                                // Blocking open: pairs with ffmpeg's read side. Then drain until the sender is dropped; closing the file is the encoder's EOF.
+                                let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
+                                while let Ok(block) = rx.recv() {
+                                    if f.write_all(&block).is_err() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .ok();
+                        if let Some(h) = handle {
+                            let _ = tx.send(backlog);
+                            feed = Some((path.clone(), tx, h));
                         }
                     }
-                    (Some(_), Some((_, f))) => {
-                        if f.write_all(&buf).is_err() {
-                            feed = None;
-                        }
+                    (Some(_), Some((_, tx, _))) => {
+                        let _ = tx.send(buf.clone());
                     }
                     (None, Some(_)) => {
-                        feed = None; // drop closes the FIFO: EOF to the encoder
+                        // Dropping the sender lets the feeder flush its queue and close the FIFO (EOF); don't wait on it here.
+                        if let Some((_, tx, h)) = feed.take() {
+                            drop(tx);
+                            std::thread::spawn(move || {
+                                let _ = h.join();
+                            });
+                        }
                     }
                     (None, None) => {}
                 }
@@ -494,7 +549,10 @@ fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) 
                     }
                 }
             }
-            drop(feed);
+            if let Some((_, tx, h)) = feed.take() {
+                drop(tx);
+                let _ = h.join();
+            }
             let _ = child.kill();
             let _ = child.wait();
             shared.mic_peak.store(0, Ordering::Relaxed);
@@ -555,7 +613,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
     let mut ffmpeg = if std::path::Path::new(LOOPBACK).exists() {
         let size = format!("{WIDTH}x{HEIGHT}");
         std::process::Command::new("ffmpeg")
-            .args(["-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-framerate", "15", "-color_range", "pc", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-i", "pipe:0", "-f", "v4l2", "-pix_fmt", "yuv420p", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-color_range", "pc", "-vsync", "0", LOOPBACK])
+            .args(["-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", "15", "-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-i", "pipe:0", "-f", "v4l2", "-pix_fmt", "yuv420p", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-color_range", "tv", "-vsync", "0", LOOPBACK])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
@@ -603,6 +661,10 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
             let mut rec_next_due = 0f64;
             const FRAME_MS: f64 = 1000. / 15.;
             let fifo = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("opsin-rec-audio.fifo");
+            // The per-frame pass on its own pool, sized to leave the encoders room (see REC_ENCODE).
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(12).thread_name(|i| format!("opsin-live-{i}")).build().expect("live pool");
+            // yuv420p planes for both ffmpegs (limited range, BT.2020 non-constant luminance): half the bytes of rgb24, and no swscale on the far side — ffmpeg's rgb→yuv conversion is single-threaded and at 4K it was the bottleneck of both the loopback and the recorder.
+            let mut yuv = vec![0u8; n * 3 / 2];
             let mut frame_no = 0u32;
             while !shared.stop.load(Ordering::Relaxed) {
                 // Recording requests from the UI: a new path starts (or replaces) a recording, None ends it.
@@ -775,13 +837,16 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                         }
                     }
                 };
-                if want_frame {
-                    out.par_chunks_mut(row_w).zip(lin_buf.par_chunks_mut(row_w)).zip(codes_buf.par_chunks_mut(row_w)).enumerate().for_each(|(h, ((orow, lrow), crow))| work(h, orow, Some(lrow), Some(crow)));
-                } else {
-                    out.par_chunks_mut(row_w).enumerate().for_each(|(h, orow)| work(h, orow, None, None));
-                }
+                pool.install(|| {
+                    if want_frame {
+                        out.par_chunks_mut(row_w).zip(lin_buf.par_chunks_mut(row_w)).zip(codes_buf.par_chunks_mut(row_w)).enumerate().for_each(|(h, ((orow, lrow), crow))| work(h, orow, Some(lrow), Some(crow)));
+                    } else {
+                        out.par_chunks_mut(row_w).enumerate().for_each(|(h, orow)| work(h, orow, None, None));
+                    }
+                    rgb_to_yuv420(&out, &mut yuv);
+                });
                 if let Some(s) = stdin.as_mut() {
-                    if s.write_all(&out).is_err() {
+                    if s.write_all(&yuv).is_err() {
                         stdin = None;
                         send(LiveMsg::Status(format!("live: {LOOPBACK} stream ended — viewfinder only")));
                     }
@@ -790,12 +855,18 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                     // CFR conform on the wall clock: this frame stands for every output slot that has come due (a slow camera duplicates), and none if its slot hasn't (a fast one drops).
                     let now = wall_ms();
                     let mut ok = true;
+                    let mut slots = 0;
                     while rec_next_due <= now + FRAME_MS / 2. && ok {
-                        ok = r.write(&out);
+                        ok = r.write(&yuv);
                         if ok {
                             shared.rec_frames.fetch_add(1, Ordering::Relaxed);
                         }
                         rec_next_due += FRAME_MS;
+                        slots += 1;
+                        if slots >= 4 && rec_next_due < now - FRAME_MS * 4. {
+                            // Far behind (the encoder stalled): resync rather than flood the queue with duplicates that would only be dropped.
+                            rec_next_due = now;
+                        }
                     }
                     if !ok {
                         let p = r.path.clone();
