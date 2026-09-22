@@ -417,7 +417,7 @@ fn frame_lines(dec: &crate::convert::Decoded, meta: Option<&crate::tiff::FrameMe
         vsf::spectral_image::PlaneLayout::Mosaic { cfa } => format!("CFA {}×{} {:?}", cfa.shape[1], cfa.shape[0], cfa.data),
         vsf::spectral_image::PlaneLayout::Planar => "planar".to_string(),
     };
-    v.push(format!("{} {}  {}×{}  {} ch  {}-bit  {layout}", img.make, img.model, img.width, img.height, img.channel_count(), img.bit_depth()));
+    v.push(format!("{} {}  {}×{}  {} ch  {}-bit  {layout}", img.make, img.model, img.width, img.height, img.channel_count(), dec.src_bits));
     if let Some(m) = meta {
         let mut parts = Vec::new();
         if let Some(f) = m.focal {
@@ -479,7 +479,7 @@ impl Loaded {
         raw.fold_w = w;
         raw.fold_h = h;
         let pixels = encode_pixels(&lin, 0., false, false);
-        let title = format!("opsin — {file_name} ({}×{}, {} ch, {}-bit)", dec.img.width, dec.img.height, dec.img.channel_count(), dec.img.bit_depth());
+        let title = format!("opsin — {file_name} ({}×{}, {} ch, {}-bit)", dec.img.width, dec.img.height, dec.img.channel_count(), dec.src_bits);
         let frame_lines = frame_lines(&dec, meta.as_ref(), file_name, file_size);
         let channel_names = dec.img.channels.iter().map(|c| c.name.clone()).collect();
         Ok(Loaded { pixels, lin, w, h, raw, dec: keep_decode.then_some(dec), title, file_name: file_name.to_string(), frame_lines, channel_names })

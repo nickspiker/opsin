@@ -17,6 +17,8 @@ pub fn is_supported(path: &Path) -> bool {
 /// A decoded image ready to render: the spectral data, carrying its own tiered [`vsf::spectral_image::ColourProfile`] in `img.profile` (`None` ⇒ render raw-camera). The display matrix is derived from the profile at render time — nothing display-space is stored.
 pub struct Decoded {
     pub img: SpectralImage,
+    /// The SOURCE file's sample depth, which is not `img.bit_depth()`. Every display-referred ingest expands its samples into linear u16 and packs the plane at 16, so the stored depth describes opsin's buffer, not the file — an 8-bit WebP would otherwise report itself as 16-bit in the HUD (Nick 2026-09-22: "it says 16 bit planar, and it's 8 bit three channel"). The plane's depth still drives the histogram, which reads actual stored counts; this is for the reading shown to the operator.
+    pub src_bits: u8,
 }
 
 /// Transpose a 3×3 — bridges vsf::colour's column-major storage to opsin's row-major convention. const so the bridged constants are compile-time.
@@ -145,7 +147,7 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let kind = crate::sniff::sniff(&bytes);
     let known = match kind {
-        Kind::Vsf => spectral_image::read(&bytes).map(|img| Decoded { img }).map_err(|e| e.to_string()),
+        Kind::Vsf => spectral_image::read(&bytes).map(|img| Decoded { src_bits: img.bit_depth(), img }).map_err(|e| e.to_string()),
         Kind::Jxl => ingest_jxl(&bytes),
         Kind::Jpeg => ingest_jpeg(&bytes),
         Kind::WebP => ingest_webp(&bytes),
@@ -167,10 +169,11 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
 /// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade profile entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL and JPEG paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
 /// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] under an identity `Assumed` entry, so the view treats it like any other display-referred ingest.
 pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str) -> Decoded {
-    display_referred(w, h, planar, [1., 0., 0., 0., 1., 0., 0., 0., 1.], source, ProfileGrade::Assumed, 0)
+    // The caller handed us linear u16 — that IS the source depth as far as opsin can see.
+    display_referred(w, h, planar, [1., 0., 0., 0., 1., 0., 0., 0., 1.], source, ProfileGrade::Assumed, 0, 16)
 }
 
-fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16) -> Decoded {
+fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16, src_bits: u8) -> Decoded {
     let img = SpectralImage {
         width: w,
         height: h,
@@ -198,7 +201,7 @@ fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], 
         }),
         view: None,
     };
-    Decoded { img }
+    Decoded { img, src_bits }
 }
 
 /// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` grade, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` grade, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the grade.
@@ -269,7 +272,7 @@ fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     }
     let icc = dec.icc_profile();
     let (planar, m, source, grade, ill) = display_referred_8bit(&rgb, 3, n, icc.as_deref(), "jpeg_assumed_srgb");
-    Ok(display_referred(w, h, planar, m, &source, grade, ill))
+    Ok(display_referred(w, h, planar, m, &source, grade, ill, 8))
 }
 
 /// Interleaved sRGB8 (`stride` bytes a pixel: 3 for RGB, 4 for RGBA) → LINEAR planar u16 RGB, `n` pixels. sRGB EOTF un-done via a 256-entry LUT built once per process. With a fourth byte the pixel is composited over black (the linear value scaled by alpha) — opsin has no alpha plane, and a transparent region carrying leftover colour would otherwise render as garbage; over black is what a viewer with no backdrop honestly shows.
@@ -317,7 +320,7 @@ fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
     }
     let icc = dec.icc_profile().ok().flatten();
     let (planar, m, source, grade, ill) = display_referred_8bit(&px, stride, n, icc.as_deref(), "webp_assumed_srgb");
-    Ok(display_referred(w, h, planar, m, &source, grade, ill))
+    Ok(display_referred(w, h, planar, m, &source, grade, ill, 8))
 }
 
 /// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. An embedded matrix/TRC ICC is honoured (its curves and colorants, `Model` grade); other ICC kinds and HDR (PQ/HLG) enum streams are declined rather than guessed at.
@@ -383,7 +386,9 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
         *b = lin_of(buf[s + 2], 2);
     });
 
-    Ok(display_referred(w, h, planar, cam_to_vsf, &source, grade, illuminant))
+    // JXL declares its sample depth in the image header; it is not always 8.
+    let src_bits = image.image_header().metadata.bit_depth.bits_per_sample().clamp(1, 32) as u8;
+    Ok(display_referred(w, h, planar, cam_to_vsf, &source, grade, illuminant, src_bits))
 }
 
 /// Camera RAW / DNG → [`Decoded`], in memory (no file written). Decodes via limbus, packs the sensor plane as a `BitPackedTensor` at native bit depth, records the CFA as a channel-index tile, and derives the camera→Rec.2020 cmx from the DNG ColorMatrix1 when present (3-channel sources only).
@@ -429,7 +434,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
             *g = lut[1][(pixels[i * 3 + 1] as usize).min(white as usize)];
             *b = lut[2][(pixels[i * 3 + 2] as usize).min(white as usize)];
         });
-        let mut dec = display_referred(info.width, info.height, planar, m, &source, grade, illuminant);
+        let mut dec = display_referred(info.width, info.height, planar, m, &source, grade, illuminant, bit_depth as u8);
         dec.img.make = info.make.trim_end_matches('\0').trim().to_string();
         dec.img.model = info.model.trim_end_matches('\0').trim().to_string();
         dec.img.view = (2..=8).contains(&info.orientation).then(|| ViewTransform {
@@ -524,7 +529,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         view,
     };
 
-    Ok(Decoded { img })
+    Ok(Decoded { img, src_bits: bit_depth as u8 })
 }
 
 /// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input clamp is load-bearing: past the rail the cubic FOLDS BACK, so overs must pin to the rail first (the encode boundary's clamp already does). Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
@@ -860,7 +865,7 @@ mod tests {
                 ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
             }),
         };
-        let (w, h, lin) = to_linear(&Decoded { img }).unwrap();
+        let (w, h, lin) = to_linear(&Decoded { img, src_bits: 16 }).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
     }

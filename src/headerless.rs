@@ -304,7 +304,7 @@ pub fn guess(bytes: &[u8]) -> Result<Decoded, String> {
         }),
         view: None,
     };
-    Ok(Decoded { img })
+    Ok(Decoded { img, src_bits: (fmt.bytes() * 8) as u8 })
 }
 
 #[cfg(test)]
