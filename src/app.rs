@@ -243,6 +243,8 @@ impl OpsinApp {
         self.view.set_source(Some(path.to_path_buf()));
         self.title = self.view.title().to_string();
         self.chrome.set_title(&self.title);
+        // The chrome title is DRAWN; this one is the OS's, for the task switcher and Mission Control. Both have to be set — opsin decorates itself, so the window manager only ever knows the name we hand it here.
+        ctx.window.set_title(&self.title);
     }
 
     /// Step `delta` (±1) through the folder, skipping images that fail to decode. Reloads the view and refits.

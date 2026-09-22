@@ -1,0 +1,8 @@
+# `cargo fmt` is OFF for this crate, deliberately.
+#
+# opsin is written wide and dense on purpose: long single-line expressions, packed match arms, and doc comments that run to paragraph length on one line because they are prose, not code. Default rustfmt rewrites 11065 lines of that — it wraps at 100 columns, explodes one-line conditionals across seven lines, and reorders module declarations.
+#
+# Widening it is not enough. `max_width = 600` + `use_small_heuristics = "Max"` + `reorder_modules/imports = false` still rewrites 1633 lines, because some of the style rustfmt simply cannot express: it refuses to keep an `if / else if / else` chain on one line at ANY width, which is a shape this codebase uses throughout (see `render.rs`'s clip branch). A config that gets close is worse than none — it leaves a trap where an innocent `cargo fmt` produces a thousand lines of churn mixed into an unrelated diff, which is exactly what happened on 2026-09-22.
+#
+# So: formatting is by hand, and `cargo fmt` does nothing rather than something surprising.
+disable_all_formatting = true
