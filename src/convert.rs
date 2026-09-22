@@ -14,7 +14,7 @@ pub fn is_supported(path: &Path) -> bool {
     matches!(crate::sniff::sniff_path(path), Some(k) if k != crate::sniff::Kind::Unknown)
 }
 
-/// A decoded image ready to render: the spectral data, carrying its own tiered [`vsf::spectral_image::ColourProfile`] in `img.profile` (`None` ⇒ render raw-camera). The display matrix is derived from the profile at render time — nothing display-space is stored.
+/// A decoded image ready to render: the spectral data, carrying its own tiered [`vsf::spectral_image::ColourProfile`] in `img.profile` (`None` ⇒ the samples ARE VSF RGB: untagged data is VSF RGB by specification, so absence is a complete statement, not a gap, and it renders thru the identity with Illuminant E as its white). The display matrix is derived from the profile at render time — nothing display-space is stored.
 pub struct Decoded {
     pub img: SpectralImage,
     /// The SOURCE file's sample depth, which is not `img.bit_depth()`. Every display-referred ingest expands its samples into linear u16 and packs the plane at 16, so the stored depth describes opsin's buffer, not the file — an 8-bit WebP would otherwise report itself as 16-bit in the HUD (Nick 2026-09-22: "it says 16 bit planar, and it's 8 bit three channel"). The plane's depth still drives the histogram, which reads actual stored counts; this is for the reading shown to the operator.
@@ -25,6 +25,9 @@ pub struct Decoded {
 const fn t3(m: [f32; 9]) -> [f32; 9] {
     [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
 }
+
+/// The identity camera→VSF-RGB matrix: what renders samples that already are VSF RGB, and the matrix of an `Assumed` entry for a camera nobody characterized.
+const IDENTITY3: [f32; 9] = [1., 0., 0., 0., 1., 0., 0., 0., 1.];
 
 /// CIE XYZ → linear VSF RGB (row-major), from vsf's authoritative constant. The stored characterization target: spectral 703/523/462nm primaries, Illuminant E white.
 const XYZ_TO_VSF_RGB: [f32; 9] = t3(vsf::colour::XYZ2VSF_RGB);
@@ -74,6 +77,16 @@ fn illuminant_xyz(code: u16) -> [f32; 3] {
     }
 }
 
+/// A single Absolute entry: `matrix` takes camera → linear VSF RGB, `grade` says how it was come by, `illuminant` is the scene white the display scalar is derived from.
+fn absolute_entry(matrix: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16) -> ProfileEntry {
+    ProfileEntry { matrix, source: source.to_string(), class: IdtClass::Absolute, grade, illuminant, transfer: Transfer::Linear }
+}
+
+/// A profile of one entry, targeting VSF RGB, with no DNG matrices, patches or calibration riding along.
+fn single_entry_profile(entry: ProfileEntry) -> ColourProfile {
+    ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry], dng_colormatrix: [None, None], patches: None, cal: None }
+}
+
 /// **Absolute IDT** characterization from a DNG colour matrix (`XYZ → camera`): camera → XYZ → linear **VSF RGB**, straight inversion, NO chromatic adaptation and NO scaling — the scene illuminant's cast is preserved as captured, per the VERICHROME taxonomy (chromatic adaptation / "white balance" is a Creative IDT). The matrix is stored unscaled; the illuminant code rides alongside so display can re-derive an exposure scalar. `None` if the matrix is singular. `source` names which DNG matrix this came from.
 fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<ProfileEntry> {
     let cam_to_xyz = inv3(&cm)?;
@@ -88,7 +101,7 @@ fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<Profile
     })
 }
 
-/// The display matrix for a characterized image: `VSF_RGB2REC2020 × entries[0]`, then normalized so the elected entry's illuminant lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. `None` when uncharacterized, the target isn't VSF RGB, or the result is singular ⇒ render raw-camera.
+/// The display matrix for an image: `VSF_RGB2REC2020 × (camera→VSF RGB)`, then normalized so the scene white lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. NO profile is not an error and not "uncharacterized": untagged samples ARE VSF RGB by specification, so the camera matrix is the identity and the white is Illuminant E — which XYZ→VSF RGB maps to exactly (1, 1, 1), VSF RGB being E-normalized, so for the VSF-RGB target the normalization is provably a no-op. `None` only when the target isn't VSF RGB or the result is singular ⇒ raw passthrough.
 /// The linear space a render lands in. `Rec2020` is the viewer's display space; `VsfRgb` keeps the buffer in VSF RGB for a host that converts at its own display step (photon, 2026-09-11: "vsf rgb as much as possible").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -97,39 +110,27 @@ pub enum Target {
 }
 
 fn display_matrix(img: &SpectralImage, target: Target) -> Option<[f32; 9]> {
-    let profile = img.profile.as_ref()?;
+    let Some(profile) = img.profile.as_ref() else {
+        return display_from(&IDENTITY3, [1., 1., 1.], target);
+    };
     if profile.target != "vsf_rgb" {
         return None;
     }
     let entry = profile.entries.first()?;
-    if target == Target::VsfRgb {
-        // Same exposure scalar, taken in VSF RGB: the illuminant's landing is (XYZ→VSF RGB)·wp.
-        let mut disp = entry.matrix;
-        let wp = illuminant_xyz(entry.illuminant);
-        let m = &XYZ_TO_VSF_RGB;
-        let lit = [
-            m[0] * wp[0] + m[1] * wp[1] + m[2] * wp[2],
-            m[3] * wp[0] + m[4] * wp[1] + m[5] * wp[2],
-            m[6] * wp[0] + m[7] * wp[1] + m[8] * wp[2],
-        ];
-        let peak = lit[0].max(lit[1]).max(lit[2]);
-        if peak <= 0. || !peak.is_finite() {
-            return None;
-        }
-        for v in &mut disp {
-            *v /= peak;
-        }
-        return Some(disp);
-    }
-    let mut disp = matmul3(&VSF_RGB_TO_REC2020, &entry.matrix);
+    display_from(&entry.matrix, illuminant_xyz(entry.illuminant), target)
+}
 
-    // Exposure scalar: the illuminant's own landing in display space. cam_wp = CM·wp, and disp·cam_wp reduces to (XYZ→Rec2020)·wp — independent of the camera matrix — so we compute it straight from the illuminant whitepoint.
-    let xyz_to_rec2020 = matmul3(&VSF_RGB_TO_REC2020, &XYZ_TO_VSF_RGB);
-    let wp = illuminant_xyz(entry.illuminant);
+/// The display matrix for a camera→VSF-RGB `matrix` whose scene white is `wp` (XYZ), landing in `target`. The exposure scalar is the white's own landing in the target space — cam_wp = CM·wp, and disp·cam_wp reduces to (XYZ→target)·wp, independent of the camera matrix — so it comes straight from the whitepoint. One function for both the characterized and the identity case, so they cannot drift apart.
+fn display_from(matrix: &[f32; 9], wp: [f32; 3], target: Target) -> Option<[f32; 9]> {
+    let (mut disp, xyz_to_target) = match target {
+        Target::VsfRgb => (*matrix, XYZ_TO_VSF_RGB),
+        Target::Rec2020 => (matmul3(&VSF_RGB_TO_REC2020, matrix), matmul3(&VSF_RGB_TO_REC2020, &XYZ_TO_VSF_RGB)),
+    };
+    let m = &xyz_to_target;
     let lit = [
-        xyz_to_rec2020[0] * wp[0] + xyz_to_rec2020[1] * wp[1] + xyz_to_rec2020[2] * wp[2],
-        xyz_to_rec2020[3] * wp[0] + xyz_to_rec2020[4] * wp[1] + xyz_to_rec2020[5] * wp[2],
-        xyz_to_rec2020[6] * wp[0] + xyz_to_rec2020[7] * wp[1] + xyz_to_rec2020[8] * wp[2],
+        m[0] * wp[0] + m[1] * wp[1] + m[2] * wp[2],
+        m[3] * wp[0] + m[4] * wp[1] + m[5] * wp[2],
+        m[6] * wp[0] + m[7] * wp[1] + m[8] * wp[2],
     ];
     let peak = lit[0].max(lit[1]).max(lit[2]);
     if peak <= 0. || !peak.is_finite() {
@@ -166,14 +167,21 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     }
 }
 
-/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade profile entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL and JPEG paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
-/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] under an identity `Native` entry: the caller's samples ARE VSF RGB, so the entry characterizes nothing and claims nothing. Not `Assumed` — that grade is for a legacy format's convention being taken at its word (an untagged JPEG read as sRGB); here there is no convention being trusted and no guess being made.
+/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] with NO profile. That is the correct representation, not a shortcut: untagged samples are VSF RGB by specification, so absence is the complete statement and an identity entry would only restate it under a grade that has no honest value for it (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). With no entry to carry `source`, the label goes where the headerless guesser already puts its verdict — `model`, the HUD's first line.
 pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str) -> Decoded {
     // The caller handed us linear u16 — that IS the source depth as far as opsin can see.
-    display_referred(w, h, planar, [1., 0., 0., 0., 1., 0., 0., 0., 1.], source, ProfileGrade::Native, 0, 16)
+    let mut dec = planar_rgb(w, h, planar, None, 16);
+    dec.img.model = source.to_string();
+    dec
 }
 
+/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL, JPEG, WebP and display-referred TIFF paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
 fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16, src_bits: u8) -> Decoded {
+    planar_rgb(w, h, planar, Some(single_entry_profile(absolute_entry(cam_to_vsf, source, grade, illuminant))), src_bits)
+}
+
+/// The planar linear-u16 RGB image every non-raw ingest lands in, under `profile` — `None` for samples that are VSF RGB already.
+fn planar_rgb(w: usize, h: usize, planar: Vec<u16>, profile: Option<ColourProfile>, src_bits: u8) -> Decoded {
     let img = SpectralImage {
         width: w,
         height: h,
@@ -185,20 +193,7 @@ fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], 
         make: String::new(),
         model: String::new(),
         provenance: Provenance::default(),
-        profile: Some(ColourProfile {
-            target: "vsf_rgb".to_string(),
-            entries: vec![ProfileEntry {
-                matrix: cam_to_vsf,
-                source: source.to_string(),
-                class: IdtClass::Absolute,
-                grade,
-                illuminant,
-                transfer: Transfer::Linear,
-            }],
-            dng_colormatrix: [None, None],
-            patches: None,
-            cal: None,
-        }),
+        profile,
         view: None,
     };
     Decoded { img, src_bits }
@@ -486,9 +481,9 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         } else {
             [e1, e2].into_iter().flatten().collect()
         };
-        if entries.is_empty() {
-            None
-        } else {
+        {
+            // A RAW with no ColorMatrix is camera-native counts nobody has characterized — which is NOT "no profile": absence means the samples already are VSF RGB, and sensor counts are not that. The honest entry is the identity at `Assumed`: the camera's native space is taken as ≈VSF RGB and the grade says that is a guess, which is exactly what `Assumed` exists to mark. Illuminant 0 (unknown) normalizes as daylight.
+            let entries = if entries.is_empty() { vec![absolute_entry(IDENTITY3, "no_colormatrix", ProfileGrade::Assumed, 0)] } else { entries };
             Some(ColourProfile {
                 target: "vsf_rgb".to_string(),
                 entries,
@@ -702,7 +697,7 @@ pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
 /// [`to_linear`] with the landing space chosen: the same integer pipeline, only the matrix differs.
 pub fn to_linear_in(dec: &Decoded, target: Target) -> Result<(usize, usize, Vec<i32>), String> {
     let img = &dec.img;
-    // Display matrix derived fresh from the stored VSF-RGB profile: VSF_RGB2REC2020 × elected entry, illuminant-normalized. None ⇒ raw-camera bin.
+    // Display matrix derived fresh from the stored VSF-RGB profile: VSF_RGB2REC2020 × elected entry (the identity when there is no profile — the samples are VSF RGB), white-normalized. None ⇒ raw passthrough, only for a foreign target or a singular result.
     let cmx = display_matrix(img, target);
     let counts = img.samples.unpack_u16();
 
@@ -847,7 +842,7 @@ mod tests {
 
     #[test]
     fn to_linear_honours_view_orientation() {
-        // 2×1 planar RGB, uncharacterized (identity render), tagged rotate-90-CCW (code 8): display comes back 1×2 with the right pixel on top. The stored plane is untouched — only the render output moves.
+        // 2×1 planar RGB with no profile — VSF RGB by specification — tagged rotate-90-CCW (code 8): display comes back 1×2 with the right pixel on top. Rendered in VSF RGB so the camera matrix is the identity and the white (Illuminant E) normalizes to exactly 1: the values pass through bit-exact and only the orientation moves them. The stored plane is untouched.
         let img = SpectralImage {
             width: 2,
             height: 1,
@@ -865,7 +860,7 @@ mod tests {
                 ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
             }),
         };
-        let (w, h, lin) = to_linear(&Decoded { img, src_bits: 16 }).unwrap();
+        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16 }, Target::VsfRgb).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
     }

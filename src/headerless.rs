@@ -3,11 +3,11 @@
 //! 1. **Sample format and channel count.** A few thousand positions are sampled; for each candidate layout (u8, u16 LE, u16 BE, f32 LE, f32 BE × one to four interleaved channels) the mean |sample − the same channel one pixel on|, normalised by the interquartile range, scores how image-like the bytes are under that reading. Real images vary slowly along a row in every channel; the true stride scores lowest. A float reading with a non-finite sample is discarded outright.
 //! 2. **Width.** Every width within an aspect band of 8:1 either way of square is scored by the mean |luminance − the pixel one row up| at the sampled positions, times the aspect ratio as a penalty, so a headerless dump with a real width finds it (rows cohere sharply) and bytes with no image in them settle near square. Dolphin only tried exact divisors and panicked on a prime pixel count; here a trailing partial row is simply dropped.
 //! 3. **Bayer.** A two-channel winner is also tried as a CFA mosaic (row pairs compared two rows apart); when that reads better the height halves and the 2×2 tiles demosaic to RGB, the channel order picked by which pair of tile positions correlates best.
-//! 4. **Levels.** Black is the 256th-darkest value, white the brightest; the plane stores 16-bit between them. The profile is an identity `Native` entry: untagged samples ARE VSF RGB by specification, not by assumption (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). What this module guesses is the LAYOUT — sample format, channel count, width, Bayer order; the colourspace is not among the guesses, so `Assumed`, which means a legacy convention taken at its word, would misdescribe it.
+//! 4. **Levels.** Black is the 256th-darkest value, white the brightest; the plane stores 16-bit between them. There is NO profile: untagged samples are VSF RGB by specification (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"), and absence is the complete statement of that. What this module guesses is the LAYOUT — sample format, channel count, width, Bayer order; the colourspace is not among the guesses, so an entry graded `Assumed`, a legacy convention taken at its word, would misdescribe it, and there is no honest grade for an identity.
 //! The verdict rides in `make`/`model` ("headerless" / "16-bit LE, 2 ch, CFA RGGB"), which the viewer's frame-info HUD already prints. Sampling is deterministic (splitmix64 seeded by the length), so the same file guesses the same way every time.
 
 use rayon::prelude::*;
-use vsf::spectral_image::{ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer};
+use vsf::spectral_image::{PlaneLayout, Provenance, SpectralChannel, SpectralImage};
 use vsf::BitPackedTensor;
 
 use crate::convert::{rgb_channel_names, Decoded};
@@ -288,20 +288,7 @@ pub fn guess(bytes: &[u8]) -> Result<Decoded, String> {
         make: "headerless".to_string(),
         model: note,
         provenance: Provenance::default(),
-        profile: Some(ColourProfile {
-            target: "vsf_rgb".to_string(),
-            entries: vec![ProfileEntry {
-                matrix: [1., 0., 0., 0., 1., 0., 0., 0., 1.],
-                source: "headerless_vsf_rgb".to_string(),
-                class: IdtClass::Absolute,
-                grade: ProfileGrade::Native,
-                illuminant: 0,
-                transfer: Transfer::Linear,
-            }],
-            dng_colormatrix: [None, None],
-            patches: None,
-            cal: None,
-        }),
+        profile: None,
         view: None,
     };
     Ok(Decoded { img, src_bits: (fmt.bytes() * 8) as u8 })

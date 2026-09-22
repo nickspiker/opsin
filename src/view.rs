@@ -462,7 +462,8 @@ fn frame_lines(dec: &crate::convert::Decoded, meta: Option<&crate::tiff::FrameMe
                 }
             }
         }
-        None => v.push(if matches!(&img.layout, vsf::spectral_image::PlaneLayout::Mosaic { .. }) { "IDT none — uncalibrated (identity ColorMatrix), rendering raw camera".to_string() } else { "IDT none".to_string() }),
+        // No profile is a statement, not a gap: the samples are VSF RGB by specification. A mosaic with no profile is the one shape that cannot literally be that (a CFA plane is sensor counts), so it says so.
+        None => v.push(if matches!(&img.layout, vsf::spectral_image::PlaneLayout::Mosaic { .. }) { "IDT none — a mosaic with no characterization: sensor counts rendered as VSF RGB".to_string() } else { "IDT none — VSF RGB (untagged samples are VSF RGB by specification)".to_string() }),
     }
     v
 }
