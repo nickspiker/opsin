@@ -788,6 +788,11 @@ impl View {
         self.ev
     }
 
+    /// Total display gain in stops: the operator's slider PLUS the file's declared opening gain. The screen gets the baseline half thru the characterization matrix (`display_matrix` folds in `2^baseline`, so it is already inside `lin`) and the slider half at the encode boundary — so anything that has to agree with the screen and works from RAW COUNTS, like the histogram, has to add both. Having one definition is the point: when the baseline landed in the matrix and the histogram kept using the slider alone, the two silently diverged by exactly the baseline.
+    fn total_ev(&self) -> f32 {
+        self.ev + self.baseline_ev
+    }
+
     /// Every hit id the view's widgets answer to — the host's cursor cue and press routing.
     pub fn hit_ids(&self) -> Vec<HitId> {
         #[allow(unused_mut)]
@@ -1371,6 +1376,7 @@ impl View {
         self.set_matrix(m, ctx);
         let shared = crate::live::Shared::new(m);
         shared.clip.store(self.clip_show, std::sync::atomic::Ordering::Relaxed);
+        // Slider only, deliberately: live frames come from the camera, not from the open file, so the file's baseline has nothing to say about them.
         shared.ev_gain.store(2f32.powf(self.ev).to_bits(), std::sync::atomic::Ordering::Relaxed);
         shared.hdr.store(self.hdr, std::sync::atomic::Ordering::Relaxed);
         match crate::live::start(shared.clone(), move |m| {
@@ -2102,7 +2108,7 @@ impl View {
                 } else {
                     vec![[0u32; 3]; 1 << 16]
                 };
-                let dens = self.raw.spread(&codes, self.hist_xlog, bins, 2f32.powf(self.ev));
+                let dens = self.raw.spread(&codes, self.hist_xlog, bins, self.total_ev().exp2());
                 // Stop hairlines at oversampled-bin precision: every whole stop from saturation down to the sensor's bit floor — equally spaced in log, halving positions in linear.
                 let stop_bins: Vec<usize> = if self.raw.counts.is_empty() {
                     Vec::new()
@@ -2249,7 +2255,7 @@ impl View {
             let pad = bandf / 2.;
             let mut lines = self.frame_lines.clone();
             // With a baseline in play the slider's 0 is not "no gain" — it is "as the file says", so the HUD spells out both and their sum rather than leaving the difference invisible.
-            let ev_part = if self.baseline_ev.abs() > 1e-4 { format!("EV {:+.2}  baseline {:+.2}  total {:+.2}", self.ev, self.baseline_ev, self.ev + self.baseline_ev) } else { format!("EV {:+.2}", self.ev) };
+            let ev_part = if self.baseline_ev.abs() > 1e-4 { format!("EV {:+.2}  baseline {:+.2}  total {:+.2}", self.ev, self.baseline_ev, self.total_ev()) } else { format!("EV {:+.2}", self.ev) };
             lines.push(format!("{ev_part}  zoom {}x  clip {}  hdr {}", trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }, if self.hdr { "on (3x−x³)/2" } else { "off" }));
             if let Some((x0, y0, x1, y1)) = self.crop {
                 lines.push(format!("crop {x0},{y0}  {}×{}  (click: nearest corner to cursor)", x1 - x0, y1 - y0));
@@ -2356,7 +2362,7 @@ impl View {
         // Calibration overlay — the solved target grid warped back onto the frame, drawn BEFORE the image so it composes on top. It lives in RAW mosaic coordinates: every display pixel walks the same orientation bridge as the histogram to its sensor position, then ×tile into raw space, so the overlay tracks pan, zoom, rotation and EV with the image and can never drift from it.
         #[cfg(feature = "calibrate")]
         if let (Some(ov), true) = (&self.cal_overlay, self.img_w > 0) {
-            let gain = 2f32.powf(self.ev);
+            let gain = self.total_ev().exp2();
             let (tw, th) = (self.raw.tile_w.max(1), self.raw.tile_h.max(1));
             let x0 = (img_ox.max(0.) as usize).max(area_x0);
             let y0 = (img_oy.max(0.) as usize).max(area_y0);
