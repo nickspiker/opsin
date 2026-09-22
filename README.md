@@ -43,6 +43,13 @@ Embedded ICC on JPEG/WebP/JXL: a matrix/TRC profile is a declared characterizati
 
 Formats in: `vsf` native, DNG and the common camera RAWs through [iris](https://github.com/nickspiker/iris), RGB TIFF (8/16-bit, strip, uncompressed — display-referred, so it takes the JPEG rule: embedded ICC honoured, else assumed sRGB), and the display-referred trio JXL + JPEG + WebP (lumis exports and web files) — JXL's tagged colour encoding, or the assumed-sRGB convention of JPEG and WebP, becomes an `assumed`-grade profile entry, transfer un-done to linear at ingest. A WebP with alpha composites over black; an animated one opens on its first frame. Every file is recognised by its first bytes, never its name — an extensionless DNG or a `.jpg` that is really a WebP opens as what it is. A file no decoder claims (a text file, a program, a headerless sensor dump) still opens: the headerless guesser reads its statistics for sample format, channel count, width and Bayer order, levels it black-to-white and shows the bytes as VSF RGB, with its verdict in the frame-info HUD.
 
+## Install
+
+`cargo build --release` gives you the binary, and on Linux that is the whole story — the `.desktop` `%f` hands a double-clicked file straight to `argv`.
+
+macOS needs a bundle. Finder delivers an opened document as an Apple Event and only ever to an application bundle, so a bare binary on `$PATH` can be your shell's `opsin` but can never be the thing Finder opens a raw file with. `sh packaging/macos/install.sh` builds opsin, wraps it in `Opsin.app` with the orb as its icon, ad-hoc signs it (unsigned Mach-O bundles are refused at launch), installs the CLI to `~/.local/bin`, and claims every content type opsin decodes — VSF and the raw family and the display-referred trio — as the default handler. Re-run it to upgrade in place. The bundle is local and not notarized: it runs on the machine that built it, not on one you copy it to.
+
+
 ## Landing
 
 - Minimal edits, recorded as `view_transform` metadata: rotation, starring, culling, and the light creative ops (the vocabulary is reserved in the spec: `curve`, `contrast`, `skew_matrix`, `dr_curve`).

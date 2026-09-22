@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>opsin</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.nickspiker.opsin</string>
+	<key>CFBundleName</key>
+	<string>Opsin</string>
+	<key>CFBundleDisplayName</key>
+	<string>Opsin</string>
+	<key>CFBundleIconFile</key>
+	<string>opsin</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.1</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Nick Spiker</string>
+
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.nickspiker.vsf</string>
+			<key>UTTypeDescription</key>
+			<string>VSF Spectral Image</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+				<string>public.image</string>
+			</array>
+			<key>UTTypeIconFile</key>
+			<string>opsin</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>vsf</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>VSF Spectral Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>opsin</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.nickspiker.vsf</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Camera Raw Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>opsin</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.camera-raw-image</string>
+				<string>com.adobe.raw-image</string>
+				<string>com.canon.cr2-raw-image</string>
+				<string>com.canon.cr3-raw-image</string>
+				<string>com.canon.crw-raw-image</string>
+				<string>com.nikon.raw-image</string>
+				<string>com.nikon.nrw-raw-image</string>
+				<string>com.sony.raw-image</string>
+				<string>com.sony.arw-raw-image</string>
+				<string>com.sony.sr2-raw-image</string>
+				<string>com.pentax.raw-image</string>
+				<string>com.samsung.raw-image</string>
+				<string>com.olympus.raw-image</string>
+				<string>com.olympus.or-raw-image</string>
+				<string>com.panasonic.raw-image</string>
+				<string>com.panasonic.rw2-raw-image</string>
+				<string>com.fuji.raw-image</string>
+				<string>com.leica.raw-image</string>
+				<string>com.leica.rwl-raw-image</string>
+				<string>com.hasselblad.3fr-raw-image</string>
+				<string>com.hasselblad.fff-raw-image</string>
+				<string>com.epson.raw-image</string>
+				<string>com.konicaminolta.raw-image</string>
+				<string>com.phaseone.raw-image</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>opsin</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.jpeg</string>
+				<string>public.tiff</string>
+				<string>public.jpeg-xl</string>
+				<string>org.webmproject.webp</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
