@@ -48,13 +48,18 @@ const EV_MAX: f32 = (12) as f32;
 /// Slider position (0..1) of 0 EV.
 const EV_ZERO: f32 = -EV_MIN / (EV_MAX - EV_MIN);
 
-/// Slider 0..1 → stops.
-fn ev_of_slider(v: f32) -> f32 {
-    EV_MIN + v * (EV_MAX - EV_MIN)
+/// Slider position of "as the file says" (operator EV 0). The baseline MOVES it: a file that declares +4 opens four stops up, so its zero sits four stops along the track, and the travel below it is what reaches below the capture.
+fn ev_zero_of(baseline: f32) -> f32 {
+    slider_of_ev(0., baseline)
 }
-/// Stops → slider 0..1 (clamped to the range).
-fn slider_of_ev(ev: f32) -> f32 {
-    (ev.clamp(EV_MIN, EV_MAX) - EV_MIN) / (EV_MAX - EV_MIN)
+
+/// Slider 0..1 → stops.
+fn ev_of_slider(v: f32, baseline: f32) -> f32 {
+    (EV_MIN - baseline) + v * (EV_MAX - EV_MIN)
+}
+/// Stops of operator exposure → slider 0..1. `baseline` is the file's declared opening gain, and the range brackets the TOTAL that reaches the screen — `EV_MIN..EV_MAX` of `ev + baseline`, not of `ev` alone. Without that, a file declaring +4 could only be pulled back to its own capture: the slider bottomed out at −4, which lands at total 0, where sensor saturation maps exactly to display white, so a blown sky stayed white however far you pulled and the preserved above-white data was unreachable (Nick 2026-09-22: "when I put a -4 in Opsin I still get white ... I KNOW there's data there").
+fn slider_of_ev(ev: f32, baseline: f32) -> f32 {
+    ((ev + baseline).clamp(EV_MIN, EV_MAX) - EV_MIN) / (EV_MAX - EV_MIN)
 }
 
 /// The rectangle the view owns on the host's surface, in pixels. The image area is its left part, the tool panel its right part (split by the draggable divider); in plain mode the image takes all of it.
@@ -1018,7 +1023,7 @@ impl View {
 
     /// Apply the slider's 0..1 value as stops and re-encode the display pixels. The panel thumbnail tracks (cheap), the histogram tracks too (the same gain remaps its bins — see the render arm), and the chart alone stays put (chromaticity ratios shrug at a scalar).
     fn apply_ev(&mut self, value01: f32, ctx: &mut Context) {
-        let ev = ev_of_slider(value01);
+        let ev = ev_of_slider(value01, self.baseline_ev);
         if (ev - self.ev).abs() < 1e-4 || self.lin.is_empty() {
             return;
         }
@@ -1034,8 +1039,8 @@ impl View {
     /// Nudge the exposure by `delta` stops (the host's keys or gestures), or reset to 0 with `delta = None`.
     pub fn nudge_ev(&mut self, delta: Option<f32>, ctx: &mut Context) {
         let v = match delta {
-            Some(d) => slider_of_ev(self.ev + d),
-            None => EV_ZERO,
+            Some(d) => slider_of_ev(self.ev + d, self.baseline_ev),
+            None => ev_zero_of(self.baseline_ev),
         };
         self.ev_slider.set_value(v);
         self.apply_ev(v, ctx);
@@ -1072,9 +1077,11 @@ impl View {
         self.baseline_ev = loaded.baseline_ev;
         // A file that RECORDS an exposure wins: that op is this operator's own grade of this frame, so opening it should show it graded. A file that records none leaves the slider alone, which is what keeps arrowing through a folder of ungraded frames at one exposure.
         if let Some(ev) = loaded.stored_ev {
-            self.ev = ev.clamp(EV_MIN, EV_MAX);
-            self.ev_slider.set_value(slider_of_ev(self.ev));
+            self.ev = ev;
         }
+        // The baseline moves where a given EV sits on the track, so the handle is re-placed whether or not the EV itself changed — and the EV is held to what this file can reach.
+        self.ev = self.ev.clamp(EV_MIN - self.baseline_ev, EV_MAX - self.baseline_ev);
+        self.ev_slider.set_value(slider_of_ev(self.ev, self.baseline_ev));
         if self.clip_show || self.hdr || self.ev.abs() > 1e-4 {
             // Carry the exposure and the clip indicator into the new frame (loaded.pixels were encoded plain at EV 0) — both are the operator's settings, not the frame's.
             self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
@@ -1857,8 +1864,9 @@ impl View {
             if self.btn_mat_reset.take_click() {
                 // Reset is the whole starting point: the saved matrix AND exposure back to 0 (its gain rides the stream too).
                 self.set_matrix(crate::live::load_matrix().unwrap_or(crate::live::default_matrix()), ctx);
-                self.ev_slider.set_value(EV_ZERO);
-                self.apply_ev(EV_ZERO, ctx);
+                let zero = ev_zero_of(self.baseline_ev);
+                self.ev_slider.set_value(zero);
+                self.apply_ev(zero, ctx);
                 self.live_status = Some("live: matrix and exposure reset".into());
             }
             if self.btn_mat_save.take_click() {
@@ -2593,6 +2601,38 @@ mod tests {
         assert_eq!((fw, fh), (2, 1));
         // Each output pixel is the mean of a 2×2 block; the carried remainder keeps the row's channel sums exact.
         assert_eq!(folded.len(), 6);
+    }
+
+    #[test]
+    fn the_slider_brackets_the_total_not_the_operators_dial() {
+        // With no baseline, nothing moves: the track is EV_MIN..EV_MAX of operator stops and 0 sits at EV_ZERO.
+        assert!((ev_of_slider(0., 0.) - EV_MIN).abs() < 1e-5);
+        assert!((ev_of_slider(1., 0.) - EV_MAX).abs() < 1e-5);
+        assert!((ev_zero_of(0.) - EV_ZERO).abs() < 1e-5);
+
+        // A file declaring +4 still reaches EV_MIN..EV_MAX of TOTAL — which is the whole point.
+        let b = 4.;
+        let total = |v: f32| ev_of_slider(v, b) + b;
+        assert!((total(0.) - EV_MIN).abs() < 1e-5, "full left reaches four stops BELOW the capture, not merely back to it");
+        assert!((total(1.) - EV_MAX).abs() < 1e-5);
+
+        // The regression this fixes: the old mapping bottomed out at operator -4, i.e. total 0, where sensor
+        // saturation lands exactly on display white — so a blown sky stayed white however far you pulled.
+        assert!(ev_of_slider(0., b) < -4., "full left must go below -4 operator stops when the file declares +4");
+
+        // "As the file says" stays reachable, and its detent slides along the track with the baseline.
+        assert!((ev_of_slider(ev_zero_of(b), b)).abs() < 1e-5, "the detent is still operator EV 0");
+        assert!(ev_zero_of(b) > ev_zero_of(0.), "a positive baseline pushes the zero detent up the track");
+
+        // Round trip, both directions, baseline or not.
+        for &bl in &[0., 4., -2.5] {
+            for &ev in &[-3., 0., 2., 7.] {
+                let v = slider_of_ev(ev, bl);
+                if v > 0. && v < 1. {
+                    assert!((ev_of_slider(v, bl) - ev).abs() < 1e-4, "round trip at baseline {bl} ev {ev}");
+                }
+            }
+        }
     }
 
     #[test]
