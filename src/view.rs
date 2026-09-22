@@ -105,6 +105,10 @@ pub struct Loaded {
     frame_lines: Vec<String>,
     /// Channel names for the cursor readout.
     channel_names: Vec<String>,
+    /// The file's declared opening gain (stops), already applied to `lin` by the render — carried only so the HUD can show what it contributed.
+    baseline_ev: f32,
+    /// The operator's exposure recorded IN THIS FILE, if it records one. `Some` overrides the carried slider position on install; `None` leaves it, which is what keeps arrowing through a folder of ungraded frames at one exposure.
+    stored_ev: Option<f32>,
 }
 
 /// The raw sensor plane retained for the view-live histogram: unpacked counts, CFA channel routing, black/white levels, and the orientation bridge from display coords back to sensor tiles. Everything the per-frame binning needs, nothing borrowed from the decode.
@@ -471,6 +475,8 @@ fn frame_lines(dec: &crate::convert::Decoded, meta: Option<&crate::tiff::FrameMe
 impl Loaded {
     /// Assemble a view-ready image from a decode: the linear render (EXIF orientation applied by `to_linear`), display pixels at EV 0, the raw sensor view, the HUD lines. `max_edge` folds the display copy to that long edge (a phone keeps 2048; twelve bytes a pixel), the raw counts stay at full resolution for the histogram; `keep_decode = false` drops the decode once its facts are captured.
     pub fn from_decoded(dec: crate::convert::Decoded, meta: Option<crate::tiff::FrameMeta>, file_name: &str, file_size: u64, max_edge: Option<usize>, keep_decode: bool) -> Result<Loaded, String> {
+        // `baseline_ev` is already on the decode — `load_any` read it from the headers, so every render path has it, not just this one. A VSF has nowhere to carry it yet, so a DNG→VSF convert still drops it.
+        let stored_ev = crate::convert::stored_exposure_ev(&dec.img);
         let (w, h, lin) = crate::convert::to_linear(&dec)?;
         let mut raw = RawView::from_image(&dec.img, w, h);
         let (w, h, lin) = match max_edge {
@@ -479,16 +485,17 @@ impl Loaded {
         };
         raw.fold_w = w;
         raw.fold_h = h;
+        let baseline_ev = dec.baseline_ev;
         let pixels = encode_pixels(&lin, 0., false, false);
         let title = format!("opsin — {file_name} ({}×{}, {} ch, {}-bit)", dec.img.width, dec.img.height, dec.img.channel_count(), dec.src_bits);
         let frame_lines = frame_lines(&dec, meta.as_ref(), file_name, file_size);
         let channel_names = dec.img.channels.iter().map(|c| c.name.clone()).collect();
-        Ok(Loaded { pixels, lin, w, h, raw, dec: keep_decode.then_some(dec), title, file_name: file_name.to_string(), frame_lines, channel_names })
+        Ok(Loaded { pixels, lin, w, h, raw, dec: keep_decode.then_some(dec), title, file_name: file_name.to_string(), frame_lines, channel_names, baseline_ev, stored_ev })
     }
 
     /// The empty drop-target state — no image, the panel's locus/Planck chart renders from the observer alone.
     pub fn empty() -> Self {
-        Loaded { pixels: Vec::new(), lin: Vec::new(), w: 0, h: 0, raw: RawView::empty(), dec: None, file_name: String::new(), title: "opsin — drop an image".to_string(), frame_lines: Vec::new(), channel_names: Vec::new() }
+        Loaded { pixels: Vec::new(), lin: Vec::new(), w: 0, h: 0, raw: RawView::empty(), dec: None, file_name: String::new(), title: "opsin — drop an image".to_string(), frame_lines: Vec::new(), channel_names: Vec::new(), baseline_ev: 0., stored_ev: None }
     }
 
     pub fn dims(&self) -> (usize, usize) {
@@ -552,6 +559,8 @@ pub struct View {
     btn_clip: fluor::widgets::Button,
     /// Exposure in stops (gain = 2^ev in linear), [EV_MIN]..=[EV_MAX].
     ev: f32,
+    /// The open file's declared opening gain (stops), already in the render — shown in the HUD so the slider's 0 is readable as "as the file says" rather than as "no gain".
+    baseline_ev: f32,
     /// The panel's exposure slider (fluor widget, value 0..1 ↔ EV_MIN..EV_MAX; 0 EV sits at [EV_ZERO]).
     ev_slider: fluor::widgets::Slider,
     /// 1:1 / Fit — fluor pill Buttons, same widget family as the slider and chrome. Geometry is set every frame from panel_rects; hit silhouettes stamp into the host's hit map at render, so dispatch rides the host's Container walk.
@@ -672,6 +681,7 @@ impl View {
             btn_yscale,
             btn_clip,
             ev: 0.,
+            baseline_ev: 0.,
             ev_slider,
             btn_one,
             btn_fit,
@@ -1054,6 +1064,12 @@ impl View {
             self.cal_readout = None;
         }
         self.file_name = loaded.file_name;
+        self.baseline_ev = loaded.baseline_ev;
+        // A file that RECORDS an exposure wins: that op is this operator's own grade of this frame, so opening it should show it graded. A file that records none leaves the slider alone, which is what keeps arrowing through a folder of ungraded frames at one exposure.
+        if let Some(ev) = loaded.stored_ev {
+            self.ev = ev.clamp(EV_MIN, EV_MAX);
+            self.ev_slider.set_value(slider_of_ev(self.ev));
+        }
         if self.clip_show || self.hdr || self.ev.abs() > 1e-4 {
             // Carry the exposure and the clip indicator into the new frame (loaded.pixels were encoded plain at EV 0) — both are the operator's settings, not the frame's.
             self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
@@ -2232,7 +2248,9 @@ impl View {
             let line_h = font * 1.3;
             let pad = bandf / 2.;
             let mut lines = self.frame_lines.clone();
-            lines.push(format!("EV {:+.2}  zoom {}x  clip {}  hdr {}", self.ev, trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }, if self.hdr { "on (3x−x³)/2" } else { "off" }));
+            // With a baseline in play the slider's 0 is not "no gain" — it is "as the file says", so the HUD spells out both and their sum rather than leaving the difference invisible.
+            let ev_part = if self.baseline_ev.abs() > 1e-4 { format!("EV {:+.2}  baseline {:+.2}  total {:+.2}", self.ev, self.baseline_ev, self.ev + self.baseline_ev) } else { format!("EV {:+.2}", self.ev) };
+            lines.push(format!("{ev_part}  zoom {}x  clip {}  hdr {}", trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }, if self.hdr { "on (3x−x³)/2" } else { "off" }));
             if let Some((x0, y0, x1, y1)) = self.crop {
                 lines.push(format!("crop {x0},{y0}  {}×{}  (click: nearest corner to cursor)", x1 - x0, y1 - y0));
             }

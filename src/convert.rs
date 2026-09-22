@@ -17,6 +17,8 @@ pub fn is_supported(path: &Path) -> bool {
 /// A decoded image ready to render: the spectral data, carrying its own tiered [`vsf::spectral_image::ColourProfile`] in `img.profile` (`None` ⇒ the samples ARE VSF RGB: untagged data is VSF RGB by specification, so absence is a complete statement, not a gap, and it renders thru the identity with Illuminant E as its white). The display matrix is derived from the profile at render time — nothing display-space is stored.
 pub struct Decoded {
     pub img: SpectralImage,
+    /// The writer's declared opening gain, in stops — DNG `BaselineExposure` (tag 50730), which lumis writes with its on-screen display gain so a converter opens the frame at the brightness it was graded at. NOT the operator's exposure: this is the file's own statement about how it should be rendered, a hue-free scalar and so a Technical IDT by the VERICHROME taxonomy. It is applied with the rest of the characterization in `display_matrix` and DERIVED FRESH every render, never folded into the slider — if the slider absorbed it, an export would record `baseline + operator` and the next open would apply the baseline again on top, doubling it every round trip.
+    pub baseline_ev: f32,
     /// The SOURCE file's sample depth, which is not `img.bit_depth()`. Every display-referred ingest expands its samples into linear u16 and packs the plane at 16, so the stored depth describes opsin's buffer, not the file — an 8-bit WebP would otherwise report itself as 16-bit in the HUD (Nick 2026-09-22: "it says 16 bit planar, and it's 8 bit three channel"). The plane's depth still drives the histogram, which reads actual stored counts; this is for the reading shown to the operator.
     pub src_bits: u8,
 }
@@ -101,7 +103,7 @@ fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<Profile
     })
 }
 
-/// The display matrix for an image: `VSF_RGB2REC2020 × (camera→VSF RGB)`, then normalized so the scene white lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. NO profile is not an error and not "uncharacterized": untagged samples ARE VSF RGB by specification, so the camera matrix is the identity and the white is Illuminant E — which XYZ→VSF RGB maps to exactly (1, 1, 1), VSF RGB being E-normalized, so for the VSF-RGB target the normalization is provably a no-op. `None` only when the target isn't VSF RGB or the result is singular ⇒ raw passthrough.
+/// The display matrix for an image: `VSF_RGB2REC2020 × (camera→VSF RGB)`, then normalized so the scene white lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. NO profile is not an error and not "uncharacterized": untagged samples ARE VSF RGB by specification, so the camera matrix is the identity and the white is Illuminant E — which XYZ→VSF RGB maps to exactly (1, 1, 1), VSF RGB being E-normalized, so for the VSF-RGB target the normalization is provably a no-op. `None` only when the target isn't VSF RGB or the result is singular ⇒ raw passthrough. `baseline_ev` is the file's declared opening gain (see [`Decoded::baseline_ev`]), folded in here as `2^ev` beside the white normalization — the same place, for the same reason: it is the file's statement, derived fresh, never stored.
 /// The linear space a render lands in. `Rec2020` is the viewer's display space; `VsfRgb` keeps the buffer in VSF RGB for a host that converts at its own display step (photon, 2026-09-11: "vsf rgb as much as possible").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -109,19 +111,20 @@ pub enum Target {
     VsfRgb,
 }
 
-fn display_matrix(img: &SpectralImage, target: Target) -> Option<[f32; 9]> {
+fn display_matrix(img: &SpectralImage, target: Target, baseline_ev: f32) -> Option<[f32; 9]> {
+    let gain = baseline_ev.exp2();
     let Some(profile) = img.profile.as_ref() else {
-        return display_from(&IDENTITY3, [1., 1., 1.], target);
+        return display_from(&IDENTITY3, [1., 1., 1.], target, gain);
     };
     if profile.target != "vsf_rgb" {
         return None;
     }
     let entry = profile.entries.first()?;
-    display_from(&entry.matrix, illuminant_xyz(entry.illuminant), target)
+    display_from(&entry.matrix, illuminant_xyz(entry.illuminant), target, gain)
 }
 
 /// The display matrix for a camera→VSF-RGB `matrix` whose scene white is `wp` (XYZ), landing in `target`. The exposure scalar is the white's own landing in the target space — cam_wp = CM·wp, and disp·cam_wp reduces to (XYZ→target)·wp, independent of the camera matrix — so it comes straight from the whitepoint. One function for both the characterized and the identity case, so they cannot drift apart.
-fn display_from(matrix: &[f32; 9], wp: [f32; 3], target: Target) -> Option<[f32; 9]> {
+fn display_from(matrix: &[f32; 9], wp: [f32; 3], target: Target, gain: f32) -> Option<[f32; 9]> {
     let (mut disp, xyz_to_target) = match target {
         Target::VsfRgb => (*matrix, XYZ_TO_VSF_RGB),
         Target::Rec2020 => (matmul3(&VSF_RGB_TO_REC2020, matrix), matmul3(&VSF_RGB_TO_REC2020, &XYZ_TO_VSF_RGB)),
@@ -137,7 +140,7 @@ fn display_from(matrix: &[f32; 9], wp: [f32; 3], target: Target) -> Option<[f32;
         return None;
     }
     for v in &mut disp {
-        *v /= peak;
+        *v *= gain / peak;
     }
     Some(disp)
 }
@@ -148,7 +151,7 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let kind = crate::sniff::sniff(&bytes);
     let known = match kind {
-        Kind::Vsf => spectral_image::read(&bytes).map(|img| Decoded { src_bits: img.bit_depth(), img }).map_err(|e| e.to_string()),
+        Kind::Vsf => spectral_image::read(&bytes).map(|img| Decoded { src_bits: img.bit_depth(), img, baseline_ev: 0. }).map_err(|e| e.to_string()),
         Kind::Jxl => ingest_jxl(&bytes),
         Kind::Jpeg => ingest_jpeg(&bytes),
         Kind::WebP => ingest_webp(&bytes),
@@ -196,7 +199,7 @@ fn planar_rgb(w: usize, h: usize, planar: Vec<u16>, profile: Option<ColourProfil
         profile,
         view: None,
     };
-    Decoded { img, src_bits }
+    Decoded { img, src_bits, baseline_ev: 0. }
 }
 
 /// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` grade, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` grade, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the grade.
@@ -386,6 +389,11 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     Ok(display_referred(w, h, planar, cam_to_vsf, &source, grade, illuminant, src_bits))
 }
 
+/// DNG `BaselineExposure` (tag 50730) in stops, or 0 when the file has none, isn't a TIFF, or divides by zero. See [`Decoded::baseline_ev`].
+fn baseline_ev_of(input: &Path) -> f32 {
+    crate::tiff::FrameMeta::read_path(input).ok().and_then(|m| m.baseline_exposure).map_or(0., |(n, d)| if d == 0 { 0. } else { n as f32 / d as f32 })
+}
+
 /// Camera RAW / DNG → [`Decoded`], in memory (no file written). Decodes via limbus, packs the sensor plane as a `BitPackedTensor` at native bit depth, records the CFA as a channel-index tile, and derives the camera→Rec.2020 cmx from the DNG ColorMatrix1 when present (3-channel sources only).
 pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     let (info, pixels) = limbus::read_dng(input).ok_or_else(|| format!("{}: unable to decode", input.display()))?;
@@ -430,6 +438,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
             *b = lut[2][(pixels[i * 3 + 2] as usize).min(white as usize)];
         });
         let mut dec = display_referred(info.width, info.height, planar, m, &source, grade, illuminant, bit_depth as u8);
+        dec.baseline_ev = baseline_ev_of(input);
         dec.img.make = info.make.trim_end_matches('\0').trim().to_string();
         dec.img.model = info.model.trim_end_matches('\0').trim().to_string();
         dec.img.view = (2..=8).contains(&info.orientation).then(|| ViewTransform {
@@ -524,7 +533,8 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         view,
     };
 
-    Ok(Decoded { img, src_bits: bit_depth as u8 })
+    // The baseline lives only in the TIFF headers — limbus does not surface it — and it is a fact about the FILE, so it is read here where `Decoded` is built rather than in the viewer, which would leave `--check`, `--convert` and photon rendering without it.
+    Ok(Decoded { img, src_bits: bit_depth as u8, baseline_ev: baseline_ev_of(input) })
 }
 
 /// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input clamp is load-bearing: past the rail the cubic FOLDS BACK, so overs must pin to the rail first (the encode boundary's clamp already does). Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
@@ -661,6 +671,16 @@ pub fn rotate_code(code: u16, cw: bool) -> u16 {
     M.iter().position(|c| *c == p).map(|i| i as u16 + 1).unwrap_or(1)
 }
 
+/// The operator's recorded exposure from the view log, in stops — the `exposure` op opsin writes when converting to VSF. `None` when the file records none, which is every source but a VSF opsin has graded. This is the OPERATOR's setting, so it lands on the slider, unlike the file's `baseline_ev`, which is characterization and goes into the render.
+pub fn stored_exposure_ev(img: &SpectralImage) -> Option<f32> {
+    img.view
+        .as_ref()
+        .and_then(|v| v.ops.iter().find(|op| op.name == "exposure"))
+        .and_then(|op| op.params.first())
+        .copied()
+        .filter(|ev| ev.is_finite())
+}
+
 /// The EXIF orientation code from the view log: the `orientation` op's first param when present and a real transform (2..=8), else 1 (display as stored).
 pub fn orientation_code(img: &SpectralImage) -> u16 {
     img.view
@@ -698,7 +718,7 @@ pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
 pub fn to_linear_in(dec: &Decoded, target: Target) -> Result<(usize, usize, Vec<i32>), String> {
     let img = &dec.img;
     // Display matrix derived fresh from the stored VSF-RGB profile: VSF_RGB2REC2020 × elected entry (the identity when there is no profile — the samples are VSF RGB), white-normalized. None ⇒ raw passthrough, only for a foreign target or a singular result.
-    let cmx = display_matrix(img, target);
+    let cmx = display_matrix(img, target, dec.baseline_ev);
     let counts = img.samples.unpack_u16();
 
     let (out_w, out_h, rgb) = match &img.layout {
@@ -860,9 +880,71 @@ mod tests {
                 ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
             }),
         };
-        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16 }, Target::VsfRgb).unwrap();
+        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16, baseline_ev: 0. }, Target::VsfRgb).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
+    }
+
+    /// A profile-less 2×1 planar RGB at the given baseline, rendered in VSF RGB. No profile ⇒ identity matrix and Illuminant E, which normalizes to exactly 1, so at baseline 0 the stored counts pass through bit-exact and any change is the baseline alone.
+    fn render_at_baseline(baseline_ev: f32) -> Vec<i32> {
+        let img = SpectralImage {
+            width: 2,
+            height: 1,
+            channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+            layout: PlaneLayout::Planar,
+            samples: BitPackedTensor::pack(16, vec![3, 1, 2], &[10u16, 20, 30, 40, 50, 60]),
+            black: vec![0.; 3],
+            white: vec![65535.; 3],
+            make: String::new(),
+            model: String::new(),
+            provenance: Provenance::default(),
+            profile: None,
+            view: None,
+        };
+        to_linear_in(&Decoded { img, src_bits: 16, baseline_ev }, Target::VsfRgb).unwrap().2
+    }
+
+    #[test]
+    fn baseline_exposure_gains_the_render() {
+        // The file's declared opening gain is a power of two in stops, applied with the characterization.
+        let plain = render_at_baseline(0.);
+        assert_eq!(plain, vec![10, 30, 50, 20, 40, 60], "baseline 0 passes the counts thru untouched");
+        assert_eq!(render_at_baseline(1.), plain.iter().map(|v| v * 2).collect::<Vec<_>>(), "+1 EV doubles");
+        assert_eq!(render_at_baseline(-1.), plain.iter().map(|v| v / 2).collect::<Vec<_>>(), "-1 EV halves");
+        // And it is a scalar: it cannot move a ratio, so it cannot shift hue. That is what makes it Technical.
+        let up = render_at_baseline(2.);
+        assert_eq!(up[0] * plain[1], plain[0] * up[1], "channel ratios survive the gain");
+    }
+
+    #[test]
+    fn stored_exposure_op_lands_on_the_slider_not_the_render() {
+        let mut img = SpectralImage {
+            width: 1,
+            height: 1,
+            channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+            layout: PlaneLayout::Planar,
+            samples: BitPackedTensor::pack(16, vec![3, 1, 1], &[10u16, 20, 30]),
+            black: vec![0.; 3],
+            white: vec![65535.; 3],
+            make: String::new(),
+            model: String::new(),
+            provenance: Provenance::default(),
+            profile: None,
+            view: None,
+        };
+        // A file that records nothing leaves the slider where the operator left it.
+        assert_eq!(stored_exposure_ev(&img), None);
+        let op = |name: &str, v: f32| ViewTransform { space: "vsf_rgb_linear".to_string(), ops: vec![ViewOp { name: name.to_string(), class: IdtClass::Technical, params: vec![v] }] };
+        img.view = Some(op("exposure", 1.5));
+        assert_eq!(stored_exposure_ev(&img), Some(1.5));
+        // It is the OPERATOR's setting, so it must not also gain the render — that double-count is the whole reason baseline and slider stay separate.
+        let plain = to_linear_in(&Decoded { img: img.clone(), src_bits: 16, baseline_ev: 0. }, Target::VsfRgb).unwrap().2;
+        assert_eq!(plain, vec![10, 20, 30], "a recorded exposure does not touch the render");
+        // An orientation-only log records no exposure; a non-finite param is not one either.
+        img.view = Some(op("orientation", 8.));
+        assert_eq!(stored_exposure_ev(&img), None);
+        img.view = Some(op("exposure", f32::NAN));
+        assert_eq!(stored_exposure_ev(&img), None);
     }
 
     #[test]
