@@ -39,6 +39,11 @@ calibrate = ["dep:chameleon"]
 # Live: a V4L2 MJPEG camera as the frame source — opsin is the viewfinder, a 3×3 (+gain) matrix corrects it, and the corrected stream goes out thru ffmpeg to a v4l2loopback device (/dev/video10) for whatever app wants a calibrated webcam. Open source on its own; with `calibrate` too, K scans a held-up target and solves the matrix.
 live = ["dep:v4l"]
 
+# macOS document opens: Finder delivers a double-clicked file as an Apple Event, never in argv, and only the application delegate catches the one that arrives during launch — so opsin adds a method to winit's delegate class through the ObjC runtime (see src/mac_open.rs). Same version fluor already pulls on this target, so nothing new enters the graph.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL"] }
+
 [lib]
 name = "opsin"
 path = "src/lib.rs"

@@ -303,6 +303,14 @@ impl FluorApp for OpsinApp {
     /// The host's wake-sender arrives once before init: become the single instance now — bind the socket and ship the sender to the listener thread, which forwards each handed-over path to `on_user_event`. A clone goes to the view for its own background work (the target scan).
     fn set_event_proxy(&mut self, proxy: std::sync::Arc<dyn fluor::host::WakeSender<Self::UserEvent>>) {
         self.view.set_wake(proxy.clone());
+        // macOS never spawns the second process the socket exists to catch — Launch Services routes a Finder open into THIS process. Same destination, so the same Msg; only the transport differs. This is the one moment the delegate method can be added: after winit built the EventLoop, before it runs.
+        #[cfg(target_os = "macos")]
+        {
+            let proxy = proxy.clone();
+            crate::mac_open::install(move |path| {
+                let _ = proxy.send(Msg::Open(Some(path)));
+            });
+        }
         if let Some(sock) = crate::instance::listen(move |path| {
             let _ = proxy.send(Msg::Open(path));
         }) {
