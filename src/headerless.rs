@@ -3,7 +3,7 @@
 //! 1. **Sample format and channel count.** A few thousand positions are sampled; for each candidate layout (u8, u16 LE, u16 BE, f32 LE, f32 BE × one to four interleaved channels) the mean |sample − the same channel one pixel on|, normalised by the interquartile range, scores how image-like the bytes are under that reading. Real images vary slowly along a row in every channel; the true stride scores lowest. A float reading with a non-finite sample is discarded outright.
 //! 2. **Width.** Every width within an aspect band of 8:1 either way of square is scored by the mean |luminance − the pixel one row up| at the sampled positions, times the aspect ratio as a penalty, so a headerless dump with a real width finds it (rows cohere sharply) and bytes with no image in them settle near square. Dolphin only tried exact divisors and panicked on a prime pixel count; here a trailing partial row is simply dropped.
 //! 3. **Bayer.** A two-channel winner is also tried as a CFA mosaic (row pairs compared two rows apart); when that reads better the height halves and the 2×2 tiles demosaic to RGB, the channel order picked by which pair of tile positions correlates best.
-//! 4. **Levels.** Black is the 256th-darkest value, white the brightest; the plane stores 16-bit between them. The profile is an identity `Assumed` entry: the bytes are taken as VSF RGB because nothing says otherwise, and `Assumed` says so.
+//! 4. **Levels.** Black is the 256th-darkest value, white the brightest; the plane stores 16-bit between them. The profile is an identity `Native` entry: untagged samples ARE VSF RGB by specification, not by assumption (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). What this module guesses is the LAYOUT — sample format, channel count, width, Bayer order; the colourspace is not among the guesses, so `Assumed`, which means a legacy convention taken at its word, would misdescribe it.
 //! The verdict rides in `make`/`model` ("headerless" / "16-bit LE, 2 ch, CFA RGGB"), which the viewer's frame-info HUD already prints. Sampling is deterministic (splitmix64 seeded by the length), so the same file guesses the same way every time.
 
 use rayon::prelude::*;
@@ -292,9 +292,9 @@ pub fn guess(bytes: &[u8]) -> Result<Decoded, String> {
             target: "vsf_rgb".to_string(),
             entries: vec![ProfileEntry {
                 matrix: [1., 0., 0., 0., 1., 0., 0., 0., 1.],
-                source: "headerless_assumed_vsf_rgb".to_string(),
+                source: "headerless_vsf_rgb".to_string(),
                 class: IdtClass::Absolute,
-                grade: ProfileGrade::Assumed,
+                grade: ProfileGrade::Native,
                 illuminant: 0,
                 transfer: Transfer::Linear,
             }],

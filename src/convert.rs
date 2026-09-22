@@ -167,10 +167,10 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
 }
 
 /// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade profile entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL and JPEG paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
-/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] under an identity `Assumed` entry, so the view treats it like any other display-referred ingest.
+/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] under an identity `Native` entry: the caller's samples ARE VSF RGB, so the entry characterizes nothing and claims nothing. Not `Assumed` — that grade is for a legacy format's convention being taken at its word (an untagged JPEG read as sRGB); here there is no convention being trusted and no guess being made.
 pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str) -> Decoded {
     // The caller handed us linear u16 — that IS the source depth as far as opsin can see.
-    display_referred(w, h, planar, [1., 0., 0., 0., 1., 0., 0., 0., 1.], source, ProfileGrade::Assumed, 0, 16)
+    display_referred(w, h, planar, [1., 0., 0., 0., 1., 0., 0., 0., 1.], source, ProfileGrade::Native, 0, 16)
 }
 
 fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16, src_bits: u8) -> Decoded {
