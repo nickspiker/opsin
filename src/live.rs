@@ -388,7 +388,16 @@ impl Recorder {
             // Two audio tracks, titled: 0 = the mic, 1 = the system audio (the call's far end, and anything else the machine played).
             .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-metadata:s:a:0", "handler_name=mic", "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "handler_name=system", "-metadata:s:a:1", "title=system", "-c:v", "libx264"])
             .args(REC_ENCODE)
-            .args(["-timecode", &timecode, "-metadata", "encoder=opsin live", "-movflags", "+faststart", "-y"])
+            // Fragmented MOV, not `+faststart`. A plain MOV writes its index (moov) only when the
+            // recording stops, and faststart then rewrites the whole file to move it to the front —
+            // so a killed or crashed ffmpeg (disk full, power, SIGKILL) leaves gigabytes of media with
+            // no map, and the raw PCM tracks cannot be re-indexed afterwards. With empty_moov the
+            // header is written first and the media follows in self-describing fragments, so the file
+            // stays playable up to the last completed fragment whatever happens to the process.
+            // -g 30 + frag_duration bound each fragment to ~2 s at 15 fps, so that is the most a
+            // hard kill can lose. default_base_moof keeps the fragment offsets player-friendly.
+            .args(["-timecode", &timecode, "-metadata", "encoder=opsin live", "-g", "30",
+                   "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "2000000", "-y"])
             .arg(path)
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());

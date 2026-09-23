@@ -1421,7 +1421,15 @@ impl View {
             *rec = None;
             self.btn_rec.set_fill(Some(INFO_ON_FILL));
         } else {
-            let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Videos").join("opsin");
+            // Recordings go to the big disk, never $HOME. Live capture is 4K h264 at ~50 Mbit/s plus two
+            // PCM tracks — roughly 25 GB an hour — and the home partition is 237 GB shared with
+            // everything else. It filled mid-call on 2026-09-23; ffmpeg was killed before it could
+            // write the index, and a 30 GB unrepeatable conversation became unplayable.
+            // OPSIN_RECORD_DIR overrides; the default is the Harbor volume.
+            let dir = std::env::var_os("OPSIN_RECORD_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/mnt/Harbor/Videos/opsin"));
+            let _ = std::fs::create_dir_all(&dir);
             *rec = Some(dir.join(format!("live-{}.mov", crate::live::local_stamp())));
             self.btn_rec.set_fill(Some(CLIP_ON_FILL));
         }
