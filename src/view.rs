@@ -102,7 +102,7 @@ pub struct Loaded {
     w: usize,
     h: usize,
     raw: RawView,
-    /// The decode, retained where the host can afford it (rotation writes its orientation op here for the VSF convert; the calibrate scan grades its entry). `None` = folded/phone load: rotation and the clip toggle work from `lin` alone.
+    /// The decode, retained where the host can afford it (rotation writes its orientation op here for the VSF convert; the calibrate scan sets its entry's tier). `None` = folded/phone load: rotation and the clip toggle work from `lin` alone.
     dec: Option<crate::convert::Decoded>,
     title: String,
     file_name: String,
@@ -414,7 +414,7 @@ fn trim_f(v: f64, prec: usize) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
 }
 
-/// The HUD's static frame lines: file → camera/sensor → exposure → levels → IDT (grade, class, illuminant, the nine numbers). Everything here is a reading, not an interpretation.
+/// The HUD's static frame lines: file → camera/sensor → exposure → levels → IDT (tier, class, illuminant, the nine numbers). Everything here is a reading, not an interpretation.
 fn frame_lines(dec: &crate::convert::Decoded, meta: Option<&crate::tiff::FrameMeta>, file_name: &str, file_size: u64) -> Vec<String> {
     let img = &dec.img;
     let mut v = Vec::new();
@@ -464,7 +464,7 @@ fn frame_lines(dec: &crate::convert::Decoded, meta: Option<&crate::tiff::FrameMe
                 _ => "?",
             };
             let name = meta.and_then(|m| m.profile_name.clone()).map(|n| format!("  \"{n}\"")).unwrap_or_default();
-            v.push(format!("IDT {}  {}  {}  {ill}{name}", e.source, e.grade.as_str(), e.class.as_str()));
+            v.push(format!("IDT {}  {}  {}  {ill}{name}", e.source, e.tier.as_str(), e.class.as_str()));
             if let Some((m, _)) = p.dng_colormatrix[0] {
                 for r in 0..3 {
                     v.push(format!("   {:>9.5} {:>9.5} {:>9.5}", m[r * 3], m[r * 3 + 1], m[r * 3 + 2]));
@@ -1075,7 +1075,7 @@ impl View {
         }
         self.file_name = loaded.file_name;
         self.baseline_ev = loaded.baseline_ev;
-        // A file that RECORDS an exposure wins: that op is this operator's own grade of this frame, so opening it should show it graded. A file that records none leaves the slider alone, which is what keeps arrowing through a folder of ungraded frames at one exposure.
+        // A file that RECORDS an exposure wins: that op is this operator's own tier of this frame, so opening it should show it graded. A file that records none leaves the slider alone, which is what keeps arrowing through a folder of ungraded frames at one exposure.
         if let Some(ev) = loaded.stored_ev {
             self.ev = ev;
         }
@@ -1319,7 +1319,7 @@ impl View {
             .ok();
     }
 
-    /// The scan came back: paste the nine numbers into the DNG in place (same machinery as Ctrl+V — the fingerprint is the file's own, so it matches by construction), reload so the frame renders through them, grade the entry `unit`/`relative` (this IS a measurement of this sensor), and keep the overlay + readout. A rejected scan leaves the file untouched and says why.
+    /// The scan came back: paste the nine numbers into the DNG in place (same machinery as Ctrl+V — the fingerprint is the file's own, so it matches by construction), reload so the frame renders through them, tier the entry `unit`/`relative` (this IS a measurement of this sensor), and keep the overlay + readout. A rejected scan leaves the file untouched and says why.
     #[cfg(feature = "calibrate")]
     fn finish_scan(&mut self, path: PathBuf, result: Result<crate::calibrate::ScanOutcome, String>, ctx: &mut Context) {
         self.cal_busy = false;
@@ -1357,7 +1357,7 @@ impl View {
             }
             if let Some(dec) = self.dec.as_mut() {
                 if let Some(e) = dec.img.profile.as_mut().and_then(|p| p.entries.first_mut()) {
-                    e.grade = vsf::spectral_image::ProfileGrade::Unit;
+                    e.tier = vsf::spectral_image::ProfileTier::Unit;
                     e.class = vsf::spectral_image::IdtClass::Relative;
                     e.source = "chameleon_scan".to_string();
                 }

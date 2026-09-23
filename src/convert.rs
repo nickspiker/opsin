@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 use std::path::Path;
-use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileGrade, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
+use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileTier, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
 use vsf::{BitPackedTensor, Tensor};
 
 /// Is `path` a file the viewer lists for arrow navigation? Decided by its first bytes ([`crate::sniff`]), never its name: a file whose bytes carry a signature we decode. A file with no signature still OPENS (the headerless guesser takes it) — it just isn't swept up when arrowing thru a folder of images.
@@ -79,9 +79,9 @@ fn illuminant_xyz(code: u16) -> [f32; 3] {
     }
 }
 
-/// A single Absolute entry: `matrix` takes camera → linear VSF RGB, `grade` says how it was come by, `illuminant` is the scene white the display scalar is derived from.
-fn absolute_entry(matrix: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16) -> ProfileEntry {
-    ProfileEntry { matrix, source: source.to_string(), class: IdtClass::Absolute, grade, illuminant, transfer: Transfer::Linear }
+/// A single Absolute entry: `matrix` takes camera → linear VSF RGB, `tier` says how it was come by, `illuminant` is the scene white the display scalar is derived from.
+fn absolute_entry(matrix: [f32; 9], source: &str, tier: ProfileTier, illuminant: u16) -> ProfileEntry {
+    ProfileEntry { matrix, source: source.to_string(), class: IdtClass::Absolute, tier, illuminant, transfer: Transfer::Linear }
 }
 
 /// A profile of one entry, targeting VSF RGB, with no DNG matrices, patches or calibration riding along.
@@ -97,7 +97,7 @@ fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<Profile
         matrix,
         source: source.to_string(),
         class: IdtClass::Absolute,
-        grade: ProfileGrade::Model,
+        tier: ProfileTier::Model,
         illuminant,
         transfer: Transfer::Linear,
     })
@@ -170,7 +170,7 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     }
 }
 
-/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] with NO profile. That is the correct representation, not a shortcut: untagged samples are VSF RGB by specification, so absence is the complete statement and an identity entry would only restate it under a grade that has no honest value for it (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). With no entry to carry `source`, the label goes where the headerless guesser already puts its verdict — `model`, the HUD's first line.
+/// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] with NO profile. That is the correct representation, not a shortcut: untagged samples are VSF RGB by specification, so absence is the complete statement and an identity entry would only restate it under a tier that has no honest value for it (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). With no entry to carry `source`, the label goes where the headerless guesser already puts its verdict — `model`, the HUD's first line.
 pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str) -> Decoded {
     // The caller handed us linear u16 — that IS the source depth as far as opsin can see.
     let mut dec = planar_rgb(w, h, planar, None, 16);
@@ -178,9 +178,9 @@ pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str)
     dec
 }
 
-/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-grade entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL, JPEG, WebP and display-referred TIFF paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
-fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, grade: ProfileGrade, illuminant: u16, src_bits: u8) -> Decoded {
-    planar_rgb(w, h, planar, Some(single_entry_profile(absolute_entry(cam_to_vsf, source, grade, illuminant))), src_bits)
+/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-tier entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL, JPEG, WebP and display-referred TIFF paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
+fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, tier: ProfileTier, illuminant: u16, src_bits: u8) -> Decoded {
+    planar_rgb(w, h, planar, Some(single_entry_profile(absolute_entry(cam_to_vsf, source, tier, illuminant))), src_bits)
 }
 
 /// The planar linear-u16 RGB image every non-raw ingest lands in, under `profile` — `None` for samples that are VSF RGB already.
@@ -202,16 +202,16 @@ fn planar_rgb(w: usize, h: usize, planar: Vec<u16>, profile: Option<ColourProfil
     Decoded { img, src_bits, baseline_ev: 0. }
 }
 
-/// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` grade, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` grade, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the grade.
-fn display_referred_8bit(px: &[u8], stride: usize, n: usize, icc: Option<&[u8]>, convention: &str) -> (Vec<u16>, [f32; 9], String, ProfileGrade, u16) {
+/// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` tier, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` tier, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the tier.
+fn display_referred_8bit(px: &[u8], stride: usize, n: usize, icc: Option<&[u8]>, convention: &str) -> (Vec<u16>, [f32; 9], String, ProfileTier, u16) {
     match icc.and_then(crate::icc::parse) {
         Some(p) => {
             let cam_to_vsf = matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz);
-            (icc8_to_linear_planar(px, stride, n, &p.trc), cam_to_vsf, format!("icc:{}", p.description), ProfileGrade::Model, illuminant_code_of(p.white))
+            (icc8_to_linear_planar(px, stride, n, &p.trc), cam_to_vsf, format!("icc:{}", p.description), ProfileTier::Model, illuminant_code_of(p.white))
         }
         None => {
             let source = if icc.is_some() { format!("{convention} (embedded ICC not matrix/TRC — declined)") } else { convention.to_string() };
-            (srgb8_to_linear_planar(px, stride, n), t3(vsf::colour::SRGB2VSF_RGB), source, ProfileGrade::Assumed, 21)
+            (srgb8_to_linear_planar(px, stride, n), t3(vsf::colour::SRGB2VSF_RGB), source, ProfileTier::Assumed, 21)
         }
     }
 }
@@ -269,8 +269,8 @@ fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
         return Err(format!("decoded {} bytes for {w}×{h}×3", rgb.len()));
     }
     let icc = dec.icc_profile();
-    let (planar, m, source, grade, ill) = display_referred_8bit(&rgb, 3, n, icc.as_deref(), "jpeg_assumed_srgb");
-    Ok(display_referred(w, h, planar, m, &source, grade, ill, 8))
+    let (planar, m, source, tier, ill) = display_referred_8bit(&rgb, 3, n, icc.as_deref(), "jpeg_assumed_srgb");
+    Ok(display_referred(w, h, planar, m, &source, tier, ill, 8))
 }
 
 /// Interleaved sRGB8 (`stride` bytes a pixel: 3 for RGB, 4 for RGBA) → LINEAR planar u16 RGB, `n` pixels. sRGB EOTF un-done via a 256-entry LUT built once per process. With a fourth byte the pixel is composited over black (the linear value scaled by alpha) — opsin has no alpha plane, and a transparent region carrying leftover colour would otherwise render as garbage; over black is what a viewer with no backdrop honestly shows.
@@ -317,11 +317,11 @@ fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
         return Err(format!("decoded {} bytes for {w}×{h}×{stride}", px.len()));
     }
     let icc = dec.icc_profile().ok().flatten();
-    let (planar, m, source, grade, ill) = display_referred_8bit(&px, stride, n, icc.as_deref(), "webp_assumed_srgb");
-    Ok(display_referred(w, h, planar, m, &source, grade, ill, 8))
+    let (planar, m, source, tier, ill) = display_referred_8bit(&px, stride, n, icc.as_deref(), "webp_assumed_srgb");
+    Ok(display_referred(w, h, planar, m, &source, tier, ill, 8))
 }
 
-/// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` grade, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. An embedded matrix/TRC ICC is honoured (its curves and colorants, `Model` grade); other ICC kinds and HDR (PQ/HLG) enum streams are declined rather than guessed at.
+/// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` tier, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. An embedded matrix/TRC ICC is honoured (its curves and colorants, `Model` tier); other ICC kinds and HDR (PQ/HLG) enum streams are declined rather than guessed at.
 fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     use jxl_oxide::color::{ColourEncoding, Primaries, TransferFunction};
     let image = jxl_oxide::JxlImage::builder().read(bytes).map_err(|e| e.to_string())?;
@@ -332,7 +332,7 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
         Pow(f32),
         Icc([crate::icc::Trc; 3]),
     }
-    let (cam_to_vsf, eotf, source, grade, illuminant): ([f32; 9], Eotf, String, ProfileGrade, u16) = match &image.image_header().metadata.colour_encoding {
+    let (cam_to_vsf, eotf, source, tier, illuminant): ([f32; 9], Eotf, String, ProfileTier, u16) = match &image.image_header().metadata.colour_encoding {
         ColourEncoding::Enum(enc) => {
             // Display space → linear VSF RGB, from the tagged primaries (white D65 for both). This is the profile entry's matrix — the stored plane is linear in the TAGGED primaries; VSF RGB is reached at read time like every other source.
             let m: [f32; 9] = match enc.primaries {
@@ -346,11 +346,11 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
                 TransferFunction::Gamma { g, inverted } if g > 0 => Eotf::Pow(if inverted { 1e7 / g as f32 } else { g as f32 / 1e7 }),
                 other => return Err(format!("unsupported JXL transfer function {other:?}")),
             };
-            (m, eotf, "jxl_colour_encoding".to_string(), ProfileGrade::Assumed, 21)
+            (m, eotf, "jxl_colour_encoding".to_string(), ProfileTier::Assumed, 21)
         }
         ColourEncoding::IccProfile(_) => {
             let p = image.original_icc().and_then(crate::icc::parse).ok_or("ICC-profiled JXL: embedded profile is not matrix/TRC — declined")?;
-            (matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz), Eotf::Icc(p.trc.clone()), format!("icc:{}", p.description), ProfileGrade::Model, illuminant_code_of(p.white))
+            (matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz), Eotf::Icc(p.trc.clone()), format!("icc:{}", p.description), ProfileTier::Model, illuminant_code_of(p.white))
         }
     };
 
@@ -386,7 +386,7 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
 
     // JXL declares its sample depth in the image header; it is not always 8.
     let src_bits = image.image_header().metadata.bit_depth.bits_per_sample().clamp(1, 32) as u8;
-    Ok(display_referred(w, h, planar, cam_to_vsf, &source, grade, illuminant, src_bits))
+    Ok(display_referred(w, h, planar, cam_to_vsf, &source, tier, illuminant, src_bits))
 }
 
 /// DNG `BaselineExposure` (tag 50730) in stops, or 0 when the file has none, isn't a TIFF, or divides by zero. See [`Decoded::baseline_ev`].
@@ -409,9 +409,9 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         let meta = crate::tiff::FrameMeta::read_path(input).ok();
         let icc = meta.as_ref().and_then(|m| m.icc.as_deref());
         let white = ((1u32 << bit_depth) - 1) as f32;
-        let (m, source, grade, illuminant, trc) = match icc.and_then(crate::icc::parse) {
-            Some(p) => (matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz), format!("icc:{}", p.description), ProfileGrade::Model, illuminant_code_of(p.white), Some(p.trc)),
-            None => (t3(vsf::colour::SRGB2VSF_RGB), if icc.is_some() { "tiff_assumed_srgb (embedded ICC not matrix/TRC — declined)".to_string() } else { "tiff_assumed_srgb".to_string() }, ProfileGrade::Assumed, 21, None),
+        let (m, source, tier, illuminant, trc) = match icc.and_then(crate::icc::parse) {
+            Some(p) => (matmul3(&XYZ_TO_VSF_RGB, &p.rgb_to_xyz), format!("icc:{}", p.description), ProfileTier::Model, illuminant_code_of(p.white), Some(p.trc)),
+            None => (t3(vsf::colour::SRGB2VSF_RGB), if icc.is_some() { "tiff_assumed_srgb (embedded ICC not matrix/TRC — declined)".to_string() } else { "tiff_assumed_srgb".to_string() }, ProfileTier::Assumed, 21, None),
         };
         // Per-channel LUT over the native code range (256 or 65536 entries): the ICC curve, or sRGB's.
         let lut: Vec<Vec<u16>> = (0..3)
@@ -437,7 +437,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
             *g = lut[1][(pixels[i * 3 + 1] as usize).min(white as usize)];
             *b = lut[2][(pixels[i * 3 + 2] as usize).min(white as usize)];
         });
-        let mut dec = display_referred(info.width, info.height, planar, m, &source, grade, illuminant, bit_depth as u8);
+        let mut dec = display_referred(info.width, info.height, planar, m, &source, tier, illuminant, bit_depth as u8);
         dec.baseline_ev = baseline_ev_of(input);
         dec.img.make = info.make.trim_end_matches('\0').trim().to_string();
         dec.img.model = info.model.trim_end_matches('\0').trim().to_string();
@@ -466,23 +466,23 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     };
     let k = channels.len();
 
-    // Tiered colour_profile only for 3-channel sources with a DNG colour matrix — Absolute-IDT `model`-grade entries (see derive_profile). BOTH matrices become entries, daylight-characterized one FIRST (better fit for typical scenes; ordering is a reader policy, not a destroyed decision — the loser is still carried). The verbatim DNG tags ride alongside so the derivation is auditable and re-derivable. Multispectral (k≠3) awaits the spectral resolve.
+    // Tiered colour_profile only for 3-channel sources with a DNG colour matrix — Absolute-IDT `model`-tier entries (see derive_profile). BOTH matrices become entries, daylight-characterized one FIRST (better fit for typical scenes; ordering is a reader policy, not a destroyed decision — the loser is still carried). The verbatim DNG tags ride alongside so the derivation is auditable and re-derivable. Multispectral (k≠3) awaits the spectral resolve.
     // An IDENTITY ColorMatrix1 with no ColorMatrix2 is lumis's explicit "uncalibrated" sentinel (chameleon hasn't scanned this camera yet) — not a characterization. Treating it as one would push raw camera counts through XYZ→VSF-RGB as if they were XYZ: the green, desaturated render. No profile ⇒ honest raw-camera rendering, and the HUD says so.
     let identity = |m: &[f32; 9]| m.iter().zip(&[1f32, 0., 0., 0., 1., 0., 0., 0., 1.]).all(|(a, b)| (a - b).abs() < 1e-6);
     let uncalibrated = info.colourmatrix1.as_ref().is_some_and(identity) && info.colourmatrix2.is_none();
-    // A "Verichrome scene-relative IDT" profile name means the matrix came from a chameleon target scan of THIS camera: `unit` grade, `relative` (DSR) class — elected first over any factory matrix. Header read only; a non-TIFF or missing tag just leaves the factory grading.
+    // A "Verichrome scene-relative IDT" profile name means the matrix came from a chameleon target scan of THIS camera: `unit` tier, `relative` (DSR) class — elected first over any factory matrix. Header read only; a non-TIFF or missing tag just leaves the factory grading.
     let verichrome = crate::tiff::FrameMeta::read_path(input).ok().and_then(|m| m.profile_name).is_some_and(|n| n.to_ascii_lowercase().contains("verichrome"));
     let profile = if k == 3 && !uncalibrated {
         let daylight = |code: u16| matches!(code, 0 | 1 | 9 | 10 | 20 | 21 | 22 | 23);
-        let grade = |mut e: ProfileEntry| {
+        let tier = |mut e: ProfileEntry| {
             if verichrome {
-                e.grade = ProfileGrade::Unit;
+                e.tier = ProfileTier::Unit;
                 e.class = IdtClass::Relative;
             }
             e
         };
-        let e1 = info.colourmatrix1.and_then(|m| derive_profile(m, info.calibrationilluminant1, "dng_colormatrix1")).map(grade);
-        let e2 = info.colourmatrix2.and_then(|m| derive_profile(m, info.calibrationilluminant2, "dng_colormatrix2")).map(grade);
+        let e1 = info.colourmatrix1.and_then(|m| derive_profile(m, info.calibrationilluminant1, "dng_colormatrix1")).map(tier);
+        let e2 = info.colourmatrix2.and_then(|m| derive_profile(m, info.calibrationilluminant2, "dng_colormatrix2")).map(tier);
         // Order best-first: put the daylight-family entry ahead of the other.
         let cm2_first = daylight(info.calibrationilluminant2) && !daylight(info.calibrationilluminant1);
         let entries: Vec<ProfileEntry> = if cm2_first {
@@ -491,8 +491,8 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
             [e1, e2].into_iter().flatten().collect()
         };
         {
-            // A RAW with no ColorMatrix is camera-native counts nobody has characterized — which is NOT "no profile": absence means the samples already are VSF RGB, and sensor counts are not that. The honest entry is the identity at `Assumed`: the camera's native space is taken as ≈VSF RGB and the grade says that is a guess, which is exactly what `Assumed` exists to mark. Illuminant 0 (unknown) normalizes as daylight.
-            let entries = if entries.is_empty() { vec![absolute_entry(IDENTITY3, "no_colormatrix", ProfileGrade::Assumed, 0)] } else { entries };
+            // A RAW with no ColorMatrix is camera-native counts nobody has characterized — which is NOT "no profile": absence means the samples already are VSF RGB, and sensor counts are not that. The honest entry is the identity at `Assumed`: the camera's native space is taken as ≈VSF RGB and the tier says that is a guess, which is exactly what `Assumed` exists to mark. Illuminant 0 (unknown) normalizes as daylight.
+            let entries = if entries.is_empty() { vec![absolute_entry(IDENTITY3, "no_colormatrix", ProfileTier::Assumed, 0)] } else { entries };
             Some(ColourProfile {
                 target: "vsf_rgb".to_string(),
                 entries,
