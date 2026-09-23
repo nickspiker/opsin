@@ -611,6 +611,9 @@ pub struct View {
     btn_mat_reset: fluor::widgets::Button,
     #[cfg(feature = "live")]
     btn_mat_save: fluor::widgets::Button,
+    /// Record pill — blue idle, red while recording; `Space` and the pill share `toggle_record`.
+    #[cfg(feature = "live")]
+    btn_rec: fluor::widgets::Button,
     /// Crop rect in DISPLAY pixels (after orientation), `[x0, x1) × [y0, y1)`; `Some` = crop mode on. Toggling on seeds the full frame and fits; a click or drag on the image moves the NEAREST corner to the cursor (no handles, no modes); toggling off clears and fits. Armed = the JPEG exports the rect and `V` records a `crop` view op. A view op: it culls, the plane never changes.
     crop: Option<(usize, usize, usize, usize)>,
     /// The corner being dragged (0 = x0y0, 1 = x1y0, 2 = x0y1, 3 = x1y1) while the button is down in crop mode.
@@ -651,6 +654,10 @@ impl View {
         let btn_mat_reset = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Reset");
         #[cfg(feature = "live")]
         let btn_mat_save = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Save");
+        #[cfg(feature = "live")]
+        let mut btn_rec = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Rec");
+        #[cfg(feature = "live")]
+        btn_rec.set_fill(Some(INFO_ON_FILL));
         #[cfg(feature = "live")]
         let mat_sliders: Vec<fluor::widgets::Slider> = (0..12).map(|i| fluor::widgets::Slider::new(hit_counter, 0., 0., 1., 1., mat_slider_pos(i, crate::live::IDENTITY[i / 4][i % 4]))).collect();
         let btn_rot_ccw = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "CCW");
@@ -720,6 +727,8 @@ impl View {
             btn_mat_reset,
             #[cfg(feature = "live")]
             btn_mat_save,
+            #[cfg(feature = "live")]
+            btn_rec,
             crop: None,
             crop_drag: None,
             btn_crop,
@@ -806,7 +815,7 @@ impl View {
         ids.push(self.btn_cal.hit_id());
         #[cfg(feature = "live")]
         {
-            ids.extend([self.btn_live.hit_id(), self.btn_mat_reset.hit_id(), self.btn_mat_save.hit_id()]);
+            ids.extend([self.btn_live.hit_id(), self.btn_mat_reset.hit_id(), self.btn_mat_save.hit_id(), self.btn_rec.hit_id()]);
             ids.extend(self.mat_sliders.iter().map(|s| s.hit_id()));
         }
         ids
@@ -1374,6 +1383,7 @@ impl View {
         if let Some(shared) = self.live.take() {
             shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             self.btn_live.set_fill(None);
+            self.btn_rec.set_fill(Some(INFO_ON_FILL));
             self.live_status = Some("live: stopped".into());
             ctx.window.request_redraw();
             return;
@@ -1402,11 +1412,35 @@ impl View {
         ctx.window.request_redraw();
     }
 
+    /// Record start/stop — `Space` and the Rec pill. The pill is blue idle, red while a recording is requested (the capture thread owns the encoder; the pill reflects the request, the HUD's REC clock the frames actually written).
+    #[cfg(feature = "live")]
+    fn toggle_record(&mut self, ctx: &mut Context) {
+        let Some(shared) = &self.live else { return };
+        let mut rec = shared.record.lock().unwrap();
+        if rec.is_some() {
+            *rec = None;
+            self.btn_rec.set_fill(Some(INFO_ON_FILL));
+        } else {
+            let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Videos").join("opsin");
+            *rec = Some(dir.join(format!("live-{}.mov", crate::live::local_stamp())));
+            self.btn_rec.set_fill(Some(CLIP_ON_FILL));
+        }
+        drop(rec);
+        ctx.window.request_redraw();
+    }
+
     /// A message from the capture thread: a viewfinder frame becomes the current image (same install as a file, minus the decode); a scan result updates the sliders and the readout.
     #[cfg(feature = "live")]
     fn on_live(&mut self, m: crate::live::LiveMsg, ctx: &mut Context) {
         match m {
-            crate::live::LiveMsg::Status(s) => self.live_status = Some(s),
+            crate::live::LiveMsg::Status(s) => {
+                self.live_status = Some(s);
+                // The thread can end a recording on its own (encoder closed): keep the pill honest.
+                if let Some(shared) = &self.live {
+                    let recording = shared.record.lock().unwrap().is_some();
+                    self.btn_rec.set_fill(Some(if recording { CLIP_ON_FILL } else { INFO_ON_FILL }));
+                }
+            }
             crate::live::LiveMsg::Level => {}
             crate::live::LiveMsg::Frame(f) => {
                 if let Some(shared) = &self.live {
@@ -1745,16 +1779,7 @@ impl View {
                     // Space: record the live stream (HEVC MOV + aligned mic + TOD timecode) — start / stop.
                     #[cfg(feature = "live")]
                     Key::Named(NamedKey::Space) if self.live.is_some() => {
-                        if let Some(shared) = &self.live {
-                            let mut rec = shared.record.lock().unwrap();
-                            if rec.is_some() {
-                                *rec = None;
-                            } else {
-                                let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Videos").join("opsin");
-                                *rec = Some(dir.join(format!("live-{}.mov", crate::live::local_stamp())));
-                            }
-                        }
-                        ctx.window.request_redraw();
+                        self.toggle_record(ctx);
                         EventResponse::Handled
                     }
                     // , and . nudge the operator's A/V constant by 10 ms while live (the camera's own delay + the downstream we can't see); Save persists it with the matrix.
@@ -1819,7 +1844,7 @@ impl View {
         #[cfg(feature = "calibrate")]
         pills.push(&mut self.btn_cal);
         #[cfg(feature = "live")]
-        pills.extend([&mut self.btn_live, &mut self.btn_mat_reset, &mut self.btn_mat_save]);
+        pills.extend([&mut self.btn_live, &mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec]);
         pills
     }
 
@@ -1868,6 +1893,9 @@ impl View {
                 self.ev_slider.set_value(zero);
                 self.apply_ev(zero, ctx);
                 self.live_status = Some("live: matrix and exposure reset".into());
+            }
+            if self.btn_rec.take_click() {
+                self.toggle_record(ctx);
             }
             if self.btn_mat_save.take_click() {
                 let m = self.matrix();
@@ -2020,15 +2048,15 @@ impl View {
                         }
                     }
                     let ry = (my + band * 3 + pad_of(viewport)) as f32 + band as f32 / 2.;
-                    for (i, b) in [&mut self.btn_mat_reset, &mut self.btn_mat_save].into_iter().enumerate() {
-                        b.set_rect(mx as f32 + mw as f32 * (0.25 + 0.5 * i as f32), ry, mw as f32 / 3., band as f32);
+                    for (i, b) in [&mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec].into_iter().enumerate() {
+                        b.set_rect(mx as f32 + mw as f32 * ((i as f32 + 0.5) / 3.), ry, mw as f32 * 0.3, band as f32);
                         b.set_font_size(band as f32 / 2.);
                         let id = b.hit_id();
                         b.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
                     }
                     // Mic meter — a real bar, fixed place and width: the full section width under Reset/Save. −60…0 dBFS left to right, green to −12, yellow to −3, red above; a dark trough behind it, a hairline at each 12 dB. Label at the left end, dB at the right.
                     if let Some(shared) = &self.live {
-                        let peak = f32::from_bits(shared.mic_peak.load(std::sync::atomic::Ordering::Relaxed));
+                        let peak = f32::from_bits(shared.mic.peak.load(std::sync::atomic::Ordering::Relaxed));
                         let db = if peak > 0. { (20. * peak.log10()).max(-60.) } else { -60. };
                         let label_w = band * 2;
                         let (tx, ty, tw, th) = (mx + label_w, my + band * 4 + pad_of(viewport) * 2, mw.saturating_sub(label_w + band * 3), (band * 3 / 5).max(3));
@@ -2287,7 +2315,7 @@ impl View {
                     lines.push(format!("A/V: opsin {pipe:.0} ms + camera/downstream {extra} ms (, . adjust) = mic delayed {:.0} ms", pipe + extra as f32));
                     if let Some(p) = shared.record.lock().unwrap().as_ref() {
                         let frames = shared.rec_frames.load(std::sync::atomic::Ordering::Relaxed);
-                        let secs = frames / 15;
+                        let secs = frames / crate::live::REC_FPS;
                         lines.push(format!("● REC {:02}:{:02}:{:02}  → {}   (Space stops)", secs / 3600, secs / 60 % 60, secs % 60, p.display()));
                     }
                 }
@@ -2451,6 +2479,7 @@ impl Container for View {
             f(&mut self.btn_live);
             f(&mut self.btn_mat_reset);
             f(&mut self.btn_mat_save);
+            f(&mut self.btn_rec);
             for s in &mut self.mat_sliders {
                 f(s);
             }

@@ -47,19 +47,16 @@ pub struct Shared {
     /// Recording: the UI sets a path to start and clears it to stop; the thread owns the encoder. `rec_frames` counts frames written (the HUD's clock).
     pub record: Mutex<Option<PathBuf>>,
     pub rec_frames: AtomicU32,
-    /// Mic level meter: peak of the last 20 ms block, 0..1 as f32 bits; 0 while nothing is being read.
-    pub mic_peak: AtomicU32,
-    /// The last two seconds of the mic (s16 mono 48 kHz) with the wall time (ms since the epoch) of its newest sample — the recorder's audio source, so a recording can start from the sample that matches its first frame.
-    pub mic_ring: Mutex<(std::collections::VecDeque<i16>, f64)>,
-    /// A recording asks the mic thread for audio: (FIFO path, wall ms of the first sample wanted). `None` ends the feed (EOF to the encoder).
-    pub audio_feed: Mutex<Option<(PathBuf, f64)>>,
+    /// The two audio taps: the microphone (mono — what the aligned mic delays, and the meter) and the system audio (stereo, the default sink's monitor: what you hear on the call). Each is its own pw-record thread, ring and recording feed; a recording takes both as separate tracks.
+    pub mic: AudioTap,
+    pub sys: AudioTap,
     /// Frames the solved overlay stays composited for (counts down).
     pub overlay_frames: AtomicU32,
 }
 
 impl Shared {
     pub fn new(matrix: Sliders) -> Arc<Shared> {
-        Arc::new(Shared { matrix: Mutex::new(matrix), stop: AtomicBool::new(false), frame_pending: AtomicBool::new(false), viewfinder: AtomicBool::new(true), clip: AtomicBool::new(false), ev_gain: AtomicU32::new(1f32.to_bits()), hdr: AtomicBool::new(false), scan_requested: AtomicBool::new(false), overlay_frames: AtomicU32::new(0), pipe_ms10: AtomicU32::new(0), extra_ms: AtomicU32::new(load_extra_ms()), record: Mutex::new(None), rec_frames: AtomicU32::new(0), mic_peak: AtomicU32::new(0), mic_ring: Mutex::new((std::collections::VecDeque::new(), 0.)), audio_feed: Mutex::new(None) })
+        Arc::new(Shared { matrix: Mutex::new(matrix), stop: AtomicBool::new(false), frame_pending: AtomicBool::new(false), viewfinder: AtomicBool::new(true), clip: AtomicBool::new(false), ev_gain: AtomicU32::new(1f32.to_bits()), hdr: AtomicBool::new(false), scan_requested: AtomicBool::new(false), overlay_frames: AtomicU32::new(0), pipe_ms10: AtomicU32::new(0), extra_ms: AtomicU32::new(load_extra_ms()), record: Mutex::new(None), rec_frames: AtomicU32::new(0), mic: AudioTap::new(1), sys: AudioTap::new(2) })
     }
     /// Total audio delay to apply, in ms: measured pipe + operator's constant.
     pub fn av_delay_ms(&self) -> f32 {
@@ -74,6 +71,20 @@ impl Shared {
             }
         }
         m
+    }
+}
+
+/// One captured audio source: 48 kHz s16, `channels` interleaved. `peak` is the last 20 ms block's peak (0..1 as f32 bits; 0 while nothing is read); `ring` the last two seconds with the wall time (ms since the epoch) of its newest sample — a recording starts from the sample that matches its first frame; `feed` is a recording's request: (FIFO path, wall ms of the first sample wanted), `None` ends it (EOF to the encoder).
+pub struct AudioTap {
+    pub channels: usize,
+    pub peak: AtomicU32,
+    pub ring: Mutex<(std::collections::VecDeque<i16>, f64)>,
+    pub feed: Mutex<Option<(PathBuf, f64)>>,
+}
+
+impl AudioTap {
+    fn new(channels: usize) -> AudioTap {
+        AudioTap { channels, peak: AtomicU32::new(0), ring: Mutex::new((std::collections::VecDeque::new(), 0.)), feed: Mutex::new(None) }
     }
 }
 
@@ -210,6 +221,21 @@ fn rgb_to_yuv420(rgb: &[u8], yuv: &mut [u8]) {
     });
 }
 
+/// Every child opsin spawns dies with it: `PR_SET_PDEATHSIG` in the child before exec, so a window close (fluor exits the process from inside its loop — no thread ever reaches its cleanup) or a crash can't leave a pipewire host — and its "opsin aligned mic" — running orphaned (four of them in the picker, 2026-09-20). ffmpeg and pw-record already died with their pipes; this covers the one that had no pipe. libc-free.
+fn die_with_parent(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    unsafe extern "C" {
+        fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            prctl(1, 15, 0, 0, 0); // PR_SET_PDEATHSIG, SIGTERM
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// Wall clock in milliseconds since the epoch — the clock the recorder aligns audio and video on.
 fn wall_ms() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1e3).unwrap_or(0.)
@@ -265,7 +291,7 @@ context.modules = [
             delay_ms / 1000.
         );
         std::fs::write(&conf, text).ok()?;
-        let child = std::process::Command::new("pipewire").arg("-c").arg(&conf).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()?;
+        let child = die_with_parent(std::process::Command::new("pipewire").arg("-c").arg(&conf).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())).spawn().ok()?;
         let mut mic = AlignedMic { child, node_id: None, last_set_ms: delay_ms };
         // The node appears a moment after launch; find it by name (pw-dump is JSON — a line scan for our node.name then the nearest preceding "id" is enough here).
         for _ in 0..20 {
@@ -309,6 +335,9 @@ impl Drop for AlignedMic {
     }
 }
 
+/// The recording's frame rate: the camera's native 15, CFR. (30 with doubled frames was tried for Resolve's benefit and costs nothing to encode — Nick 2026-09-20: Resolve is irritating either way, keep it honest at 15.)
+pub const REC_FPS: u32 = 15;
+
 /// The recorder's encode settings (after the two inputs and the codec): H.264 8-bit, x264 ultrafast — measured on real 4K frames from this camera: ultrafast 27 fps, superfast 20, ProRes LT 22, DNxHR 11, x265 ~5; only ultrafast has real headroom over 15 while the stream runs beside it (the synthetic pattern it was first timed on compresses trivially). No -tune zerolatency: it turns off frame threading, which at 4K is the speed. BT.2020-tagged like the stream, PCM audio. QuickTime and Resolve Studio both decode it.
 const REC_ENCODE: &[&str] = &[
     "-preset", "ultrafast", "-crf", "17", "-pix_fmt", "yuv420p",
@@ -316,7 +345,7 @@ const REC_ENCODE: &[&str] = &[
     "-c:a", "pcm_s16le", "-ar", "48000",
 ];
 
-/// A recording in progress: ffmpeg encoding the corrected frames (H.264 8-bit 4:2:0 at the camera's native 15 fps, see REC_ENCODE) with the aligned mic as PCM and a time-of-day timecode track from the clock at start, into a MOV, BT.2020-tagged like the stream.
+/// A recording in progress: ffmpeg encoding the corrected frames (H.264 8-bit 4:2:0 at REC_FPS, see REC_ENCODE) with the aligned mic as PCM and a time-of-day timecode track from the clock at start, into a MOV, BT.2020-tagged like the stream.
 pub struct Recorder {
     child: std::process::Child,
     /// Frames go to a writer thread thru a bounded channel, so the encoder's back-pressure can never stall the capture loop (and the loopback with it). A full queue drops the frame — with wall-clock stamps that's a duplicated frame in the file, not drift.
@@ -327,39 +356,43 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(path: &std::path::Path, audio_fifo: &std::path::Path) -> Result<Recorder, String> {
+    pub fn start(path: &std::path::Path, mic_fifo: &std::path::Path, sys_fifo: &std::path::Path) -> Result<Recorder, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         // Time-of-day timecode at the camera's rate: HH:MM:SS:FF, frames from the sub-second part.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?;
-        let (h, m, sec, ff) = local_hms(now.as_secs(), (now.subsec_millis() as u32 * 15 / 1000).min(14));
+        let (h, m, sec, ff) = local_hms(now.as_secs(), (now.subsec_millis() as u32 * REC_FPS / 1000).min(REC_FPS - 1));
         let timecode = format!("{h:02}:{m:02}:{sec:02}:{ff:02}");
         let size = format!("{WIDTH}x{HEIGHT}");
         // A fresh FIFO for the audio: opsin's mic thread writes s16 mono into it from the sample that matches the first frame. Both inputs are plain count-based streams that start at 0 together — opsin owns the clock (CFR-conformed video, contiguous audio), ffmpeg does no timestamp arithmetic at all.
-        let _ = std::fs::remove_file(audio_fifo);
-        let status = std::process::Command::new("mkfifo").arg(audio_fifo).status().map_err(|e| format!("mkfifo: {e}"))?;
-        if !status.success() {
-            return Err("mkfifo failed".to_string());
+        for fifo in [mic_fifo, sys_fifo] {
+            let _ = std::fs::remove_file(fifo);
+            let status = std::process::Command::new("mkfifo").arg(fifo).status().map_err(|e| format!("mkfifo: {e}"))?;
+            if !status.success() {
+                return Err("mkfifo failed".to_string());
+            }
         }
-        let mut child = std::process::Command::new("ffmpeg")
-            .args([
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args([
                 "-loglevel", "error",
                 // Raw inputs need no probing: without this ffmpeg's find_stream_info sat on the audio FIFO waiting for its default 5 s of data, reading no video meanwhile — four seconds of dropped frames at the start of every recording.
                 "-probesize", "32", "-analyzeduration", "0",
-                "-thread_queue_size", "64", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", "15", "-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "bt709", "-i", "pipe:0",
+                "-thread_queue_size", "64", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", &REC_FPS.to_string(), "-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "bt709", "-i", "pipe:0",
                 "-probesize", "32", "-analyzeduration", "0",
                 "-thread_queue_size", "1024", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i",
             ])
-            .arg(audio_fifo)
-            .args(["-map", "0:v", "-map", "1:a", "-c:v", "libx264"])
+            .arg(mic_fifo)
+            .args(["-probesize", "32", "-analyzeduration", "0", "-thread_queue_size", "1024", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i"])
+            .arg(sys_fifo)
+            // Two audio tracks, titled: 0 = the mic, 1 = the system audio (the call's far end, and anything else the machine played).
+            .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-metadata:s:a:0", "handler_name=mic", "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "handler_name=system", "-metadata:s:a:1", "title=system", "-c:v", "libx264"])
             .args(REC_ENCODE)
             .args(["-timecode", &timecode, "-metadata", "encoder=opsin live", "-movflags", "+faststart", "-y"])
             .arg(path)
             .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("ffmpeg: {e}"))?;
+            .stderr(std::process::Stdio::inherit());
+        let mut child = die_with_parent(&mut cmd).spawn().map_err(|e| format!("ffmpeg: {e}"))?;
         let mut stdin = child.stdin.take().ok_or("ffmpeg: no stdin")?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
         let writer = std::thread::Builder::new()
@@ -463,25 +496,27 @@ pub fn local_stamp() -> String {
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", tm.year + 1900, tm.mon + 1, tm.mday, tm.hour, tm.min, tm.sec)
 }
 
-/// The mic thread: `pw-record` streams the DEFAULT source (the raw mic — what the aligned mic delays) as s16 mono 48 kHz in 20 ms blocks. Each block updates the meter peak and the 2 s ring; while a recording has asked for audio, blocks also go to its FIFO — starting with the ring's backlog from the wall time it named, so the audio lines up with the first frame. Ends with the stream.
-fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) + Send + Sync>) -> Option<std::thread::JoinHandle<()>> {
-    let mut child = std::process::Command::new("pw-record")
-        .args(["--target", source, "--format", "s16", "--rate", "48000", "--channels", "1", "-"])
+/// An audio tap thread: `pw-record` streams a source as s16 48 kHz (`tap.channels` interleaved) in 20 ms blocks. Each block updates the tap's peak and its 2 s ring; while a recording has asked for audio, blocks also go to its FIFO — starting with the ring's backlog from the wall time it named, so the audio lines up with the first frame — through an unbounded queue drained by its own thread, so a stalled FIFO (ffmpeg throttles audio to the video timeline) never stalls the capture: a stall here overflows pw-record's pipe and drops real samples, and dropped samples are a shorter audio timeline than the video's. `extra_args` picks the source: the default input, or the default sink's monitor. Ends with the stream.
+fn start_audio_tap(shared: Arc<Shared>, which: fn(&Shared) -> &AudioTap, extra_args: &[&str], name: &'static str, send: Arc<dyn Fn(LiveMsg) + Send + Sync>) -> Option<std::thread::JoinHandle<()>> {
+    let channels = which(&shared).channels;
+    let mut cmd = std::process::Command::new("pw-record");
+    cmd.args(extra_args)
+        // 10 ms latency, not pw-record's 100 ms default: the recorder places audio by treating the ring's newest sample as "now", so the capture latency is an audio-EARLY bias in the file — and the meter's lag.
+        .args(["--latency", "10ms", "--format", "s16", "--rate", "48000", "--channels", &channels.to_string(), "-"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    let mut child = die_with_parent(&mut cmd).spawn().ok()?;
     let mut out = child.stdout.take()?;
     std::thread::Builder::new()
-        .name("opsin-mic-meter".into())
+        .name(name.into())
         .spawn(move || {
             use std::io::Read;
             const RATE: usize = 48000;
-            const BLOCK: usize = RATE / 50; // 20 ms
-            let mut buf = vec![0u8; BLOCK * 2];
+            let block = RATE / 50 * channels; // 20 ms of samples
+            let mut buf = vec![0u8; block * 2];
             let mut ticks = 0u32;
-            // The recording's audio feeder: an unbounded queue drained by its own thread, so a stalled FIFO (ffmpeg throttles audio to the video timeline) never stalls THIS thread — a stall here overflows pw-record's pipe and drops real samples, and dropped samples are a shorter audio timeline than the video's.
             let mut feed: Option<(PathBuf, std::sync::mpsc::Sender<Vec<u8>>, std::thread::JoinHandle<()>)> = None;
+            let tap = which(&shared);
             while !shared.stop.load(Ordering::Relaxed) {
                 if out.read_exact(&mut buf).is_err() {
                     break;
@@ -489,29 +524,29 @@ fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) 
                 let now_ms = wall_ms();
                 let samples: Vec<i16> = buf.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
                 let peak = samples.iter().map(|v| (*v as i32).unsigned_abs()).max().unwrap_or(0) as f32 / 32768.;
-                shared.mic_peak.store(peak.to_bits(), Ordering::Relaxed);
+                tap.peak.store(peak.to_bits(), Ordering::Relaxed);
                 {
-                    let mut ring = shared.mic_ring.lock().unwrap();
+                    let mut ring = tap.ring.lock().unwrap();
                     ring.0.extend(samples.iter().copied());
-                    while ring.0.len() > RATE * 2 {
+                    while ring.0.len() > RATE * 2 * channels {
                         ring.0.pop_front();
                     }
                     ring.1 = now_ms;
                 }
-                // Recording audio: open the FIFO when asked (ffmpeg has to be at the other end — retry until it is), send the backlog from the requested moment, then every block as it comes; EOF when the request is cleared.
-                let want = shared.audio_feed.lock().unwrap().clone();
+                let want = tap.feed.lock().unwrap().clone();
                 match (&want, &mut feed) {
                     (Some((path, from_ms)), None) => {
-                        // Backlog from the moment the first frame was captured (the ring's newest sample is "now"), then every block as it comes.
+                        // Backlog from the moment the first frame was captured (the ring's newest sample is "now"), whole frames of channels, then every block as it comes.
                         let backlog: Vec<u8> = {
-                            let ring = shared.mic_ring.lock().unwrap();
-                            let n = (((ring.1 - from_ms) / 1000. * RATE as f64).round().max(0.) as usize).min(ring.0.len());
+                            let ring = tap.ring.lock().unwrap();
+                            let frames = (((ring.1 - from_ms) / 1000. * RATE as f64).round().max(0.) as usize).min(ring.0.len() / channels);
+                            let n = frames * channels;
                             ring.0.iter().skip(ring.0.len() - n).flat_map(|v| v.to_le_bytes()).collect()
                         };
                         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
                         let fifo = path.clone();
                         let handle = std::thread::Builder::new()
-                            .name("opsin-rec-audio".into())
+                            .name(format!("{name}-feed"))
                             .spawn(move || {
                                 // Blocking open: pairs with ffmpeg's read side. Then drain until the sender is dropped; closing the file is the encoder's EOF.
                                 let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
@@ -541,8 +576,8 @@ fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) 
                     }
                     (None, None) => {}
                 }
-                // Frames drive repaints while the viewfinder runs; otherwise tick the UI at 5 Hz so the meter keeps moving.
-                if !shared.viewfinder.load(Ordering::Relaxed) {
+                // Frames drive repaints while the viewfinder runs; otherwise tick the UI at 5 Hz so the meters keep moving (the mic tap does the ticking).
+                if channels == 1 && !shared.viewfinder.load(Ordering::Relaxed) {
                     ticks += 1;
                     if ticks % 10 == 0 {
                         send(LiveMsg::Level);
@@ -555,7 +590,7 @@ fn start_mic_meter(shared: Arc<Shared>, source: &str, send: Arc<dyn Fn(LiveMsg) 
             }
             let _ = child.kill();
             let _ = child.wait();
-            shared.mic_peak.store(0, Ordering::Relaxed);
+            tap.peak.store(0, Ordering::Relaxed);
         })
         .ok()
 }
@@ -612,12 +647,11 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
     // ffmpeg → loopback, exactly chameleon's invocation. Absent loopback ⇒ viewfinder only.
     let mut ffmpeg = if std::path::Path::new(LOOPBACK).exists() {
         let size = format!("{WIDTH}x{HEIGHT}");
-        std::process::Command::new("ffmpeg")
-            .args(["-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", "15", "-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-i", "pipe:0", "-f", "v4l2", "-pix_fmt", "yuv420p", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-color_range", "tv", "-vsync", "0", LOOPBACK])
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", "15", "-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-i", "pipe:0", "-f", "v4l2", "-pix_fmt", "yuv420p", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "gamma22", "-color_range", "tv", "-vsync", "0", LOOPBACK])
             .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .ok()
+            .stderr(std::process::Stdio::inherit());
+        die_with_parent(&mut cmd).spawn().ok()
     } else {
         None
     };
@@ -654,13 +688,15 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                 Some(_) => format!("live: {path} → {LOOPBACK}; aligned mic started but not found in the graph"),
                 None => format!("live: {path} → {LOOPBACK}; no PipeWire — no aligned mic"),
             }));
-            // The mic thread reads the RAW default source: the meter shows the same level the aligned mic carries (it is that signal, delayed), and a recording wants the undelayed samples to place by wall time itself.
-            let _meter = start_mic_meter(shared.clone(), "@DEFAULT_SOURCE@", send.clone());
+            // Two taps: the RAW default input (the meter shows the level the aligned mic carries — it is that signal, delayed — and a recording wants the undelayed samples to place by wall time itself), and the default sink's monitor (the system audio).
+            let _mic_tap = start_audio_tap(shared.clone(), |s| &s.mic, &["--target", "@DEFAULT_SOURCE@"], "opsin-mic", send.clone());
+            let _sys_tap = start_audio_tap(shared.clone(), |s| &s.sys, &["-P", "{ stream.capture.sink = true }"], "opsin-sys", send.clone());
             let mut recorder: Option<Recorder> = None;
             // Recording clock: the wall time the next output frame is due; frames are duplicated or dropped to hold exactly 15 fps, so the file's frame index IS time.
             let mut rec_next_due = 0f64;
-            const FRAME_MS: f64 = 1000. / 15.;
-            let fifo = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("opsin-rec-audio.fifo");
+            const FRAME_MS: f64 = 1000. / REC_FPS as f64;
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            let (mic_fifo, sys_fifo) = (runtime.join("opsin-rec-mic.fifo"), runtime.join("opsin-rec-sys.fifo"));
             // The per-frame pass on its own pool, sized to leave the encoders room (see REC_ENCODE).
             let pool = rayon::ThreadPoolBuilder::new().num_threads(12).thread_name(|i| format!("opsin-live-{i}")).build().expect("live pool");
             // yuv420p planes for both ffmpegs (limited range, BT.2020 non-constant luminance): half the bytes of rgb24, and no swscale on the far side — ffmpeg's rgb→yuv conversion is single-threaded and at 4K it was the bottleneck of both the loopback and the recorder.
@@ -675,7 +711,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                             if let Some(r) = recorder.take() {
                                 r.finish();
                             }
-                            match Recorder::start(&p, &fifo) {
+                            match Recorder::start(&p, &mic_fifo, &sys_fifo) {
                                 Ok(r) => {
                                     shared.rec_frames.store(0, Ordering::Relaxed);
                                     // The first frame is due now; its audio starts at the moment that frame was captured: now − opsin's pipe − the camera's own latency (the operator's constant less the downstream part, which doesn't apply to a file).
@@ -683,7 +719,9 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                                     rec_next_due = now;
                                     let cam_ms = shared.extra_ms.load(Ordering::Relaxed).saturating_sub(DOWNSTREAM_MS) as f64;
                                     let pipe_ms = shared.pipe_ms10.load(Ordering::Relaxed) as f64 / 10.;
-                                    *shared.audio_feed.lock().unwrap() = Some((fifo.clone(), now - pipe_ms - cam_ms));
+                                    let from = now - pipe_ms - cam_ms;
+                                    *shared.mic.feed.lock().unwrap() = Some((mic_fifo.clone(), from));
+                                    *shared.sys.feed.lock().unwrap() = Some((sys_fifo.clone(), from));
                                     send(LiveMsg::Status(format!("live: recording → {}", p.display())));
                                     recorder = Some(r);
                                 }
@@ -697,7 +735,8 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                             if let Some(r) = recorder.take() {
                                 let p = r.path.clone();
                                 let dropped = r.dropped.load(Ordering::Relaxed);
-                                *shared.audio_feed.lock().unwrap() = None;
+                                *shared.mic.feed.lock().unwrap() = None;
+                                *shared.sys.feed.lock().unwrap() = None;
                                 r.finish();
                                 send(LiveMsg::Status(if dropped > 0 { format!("live: recording saved → {} ({dropped} frames dropped: encoder fell behind — duplicated in the file, timing intact)", p.display()) } else { format!("live: recording saved → {}", p.display()) }));
                             }
@@ -870,7 +909,8 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                     }
                     if !ok {
                         let p = r.path.clone();
-                        *shared.audio_feed.lock().unwrap() = None;
+                        *shared.mic.feed.lock().unwrap() = None;
+                        *shared.sys.feed.lock().unwrap() = None;
                         recorder.take().unwrap().finish();
                         *shared.record.lock().unwrap() = None;
                         send(LiveMsg::Status(format!("live: recording ended (encoder closed) → {}", p.display())));
@@ -896,7 +936,8 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
             }
             drop(stdin);
             if let Some(r) = recorder.take() {
-                *shared.audio_feed.lock().unwrap() = None;
+                *shared.mic.feed.lock().unwrap() = None;
+                *shared.sys.feed.lock().unwrap() = None;
                 r.finish();
             }
             drop(mic);
