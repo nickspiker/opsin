@@ -131,6 +131,8 @@ struct RawView {
     /// Per-display-channel black/white in raw counts (scalar levels broadcast).
     black: [f32; 3],
     white: [f32; 3],
+    /// What the render does to each camera channel on its way to the screen — [`crate::convert::display_channel_gains`]. The histogram's per-channel gain, so a bin sits where that light actually lands; the operator's slider multiplies on top.
+    gains: [f32; 3],
     /// Sensor bit depth — the stops span of the log view.
     bits: usize,
     /// EXIF orientation code the display applied; [`crate::convert::orientation_src`] inverts it per pixel.
@@ -149,7 +151,7 @@ struct RawView {
 
 impl RawView {
     fn empty() -> Self {
-        Self { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [1.; 3], bits: 1, orient: 1, pre_w: 0, pre_h: 0, or_w: 0, or_h: 0, fold_w: 0, fold_h: 0, census: [1.; 3] }
+        Self { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [1.; 3], bits: 1, orient: 1, pre_w: 0, pre_h: 0, or_w: 0, or_h: 0, fold_w: 0, fold_h: 0, census: [1.; 3], gains: [1.; 3] }
     }
 
     fn from_image(img: &vsf::spectral_image::SpectralImage, or_w: usize, or_h: usize) -> Self {
@@ -186,6 +188,7 @@ impl RawView {
                     fold_w: or_w,
                     fold_h: or_h,
                     census,
+                    gains: [1.; 3],
                 }
             }
             vsf::spectral_image::PlaneLayout::Planar => Self {
@@ -206,6 +209,7 @@ impl RawView {
                 fold_w: or_w,
                 fold_h: or_h,
                 census: [1.; 3],
+                gains: [1.; 3],
             },
         }
     }
@@ -262,11 +266,13 @@ impl RawView {
     /// Equal-energy spread: each ADC code deposits its census-weighted count uniformly over the bin interval its quantization step `[v, v+1)` covers through the active axis — exact density on both axes, comb-free, deterministic (lumis's `bin_span` idea taken to its conclusion: the interval IS the span, deposited rather than divided, so no duty-cycle/log-order weirdness survives). Below-black collapses into bin 0 and at/above-white into the last bin — the clip spikes.
     ///
     /// `gain` is the live EV multiplier (2^ev), applied to the black-subtracted counts before the axis map, so the histogram tracks the exposure slider exactly as the display does: in linear-x every peak moves 2× per stop, in log-x the whole distribution translates one stop per stop — a labelled remap of the same raw counts, still no curve. Data pushed past display white by the gain collapses into the last bin: the clip spike grows as you rack exposure, agreeing with the image's encode-boundary indicator.
-    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, gain: f32) -> Vec<[f32; 3]> {
+    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, ev_gain: f32) -> Vec<[f32; 3]> {
         let mut dens = vec![[0f32; 3]; bins];
         for ch in 0..3 {
             let black = self.black[ch];
             let range = (self.white[ch] - black).max(1.);
+            // The render's own gain for THIS camera channel, times the operator's slider.
+            let gain = self.gains[ch] * ev_gain;
             let frac = |x: f32| -> f32 {
                 if x_log {
                     if x <= 0. { 0. } else { (1. + (x / range).log2() / self.bits as f32).clamp(0., 1.) }
@@ -484,6 +490,7 @@ impl Loaded {
         let stored_ev = crate::convert::stored_exposure_ev(&dec.img);
         let (w, h, lin) = crate::convert::to_linear(&dec)?;
         let mut raw = RawView::from_image(&dec.img, w, h);
+        raw.gains = crate::convert::display_channel_gains(&dec, crate::convert::Target::Rec2020);
         let (w, h, lin) = match max_edge {
             Some(e) => fold_linear(lin, w, h, e),
             None => (w, h, lin),
@@ -1467,7 +1474,7 @@ impl View {
                     planar[n + i] = f.codes[i * 3 + 1];
                     planar[2 * n + i] = f.codes[i * 3 + 2];
                 }
-                self.raw = RawView { counts: planar, sensor_w: f.w, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: n, black: [0.; 3], white: [255.; 3], bits: 8, orient: 1, pre_w: f.w, pre_h: f.h, or_w: f.w, or_h: f.h, fold_w: f.w, fold_h: f.h, census: [1.; 3] };
+                self.raw = RawView { counts: planar, sensor_w: f.w, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: n, black: [0.; 3], white: [255.; 3], bits: 8, orient: 1, pre_w: f.w, pre_h: f.h, or_w: f.w, or_h: f.h, fold_w: f.w, fold_h: f.h, census: [1.; 3], gains: [1.; 3] };
                 if first {
                     self.tools = PanelTools::new(&self.pixels, f.w, f.h);
                     self.dec = None;
@@ -2152,7 +2159,7 @@ impl View {
                 } else {
                     vec![[0u32; 3]; 1 << 16]
                 };
-                let dens = self.raw.spread(&codes, self.hist_xlog, bins, self.total_ev().exp2());
+                let dens = self.raw.spread(&codes, self.hist_xlog, bins, self.ev.exp2());
                 // Stop hairlines at oversampled-bin precision: every whole stop from saturation down to the sensor's bit floor — equally spaced in log, halving positions in linear.
                 let stop_bins: Vec<usize> = if self.raw.counts.is_empty() {
                     Vec::new()
@@ -2674,7 +2681,7 @@ mod tests {
 
     #[test]
     fn spread_gain_shifts_bins_and_grows_clip_spike() {
-        let raw = RawView { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [65535.; 3], bits: 16, orient: 1, pre_w: 0, pre_h: 0, or_w: 0, or_h: 0, fold_w: 0, fold_h: 0, census: [1.; 3] };
+        let raw = RawView { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [65535.; 3], bits: 16, orient: 1, pre_w: 0, pre_h: 0, or_w: 0, or_h: 0, fold_w: 0, fold_h: 0, census: [1.; 3], gains: [1.; 3] };
         let bins = 64;
         let mut codes = vec![[0u32; 3]; 1 << 16];
         codes[16000][0] = 100; // quarter-scale population
@@ -2694,7 +2701,7 @@ mod tests {
     fn folded_raw_bridge_scales_a_display_pixel_to_the_sensor() {
         // A planar 8×4 sensor shown folded to 4×2: display (3, 1) → full (6, 2).
         let counts: Vec<u16> = (0..(8 * 4 * 3) as u16).collect();
-        let raw = RawView { counts, sensor_w: 8, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 32, black: [0.; 3], white: [255.; 3], bits: 8, orient: 1, pre_w: 8, pre_h: 4, or_w: 8, or_h: 4, fold_w: 4, fold_h: 2, census: [1.; 3] };
+        let raw = RawView { counts, sensor_w: 8, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 32, black: [0.; 3], white: [255.; 3], bits: 8, orient: 1, pre_w: 8, pre_h: 4, or_w: 8, or_h: 4, fold_w: 4, fold_h: 2, census: [1.; 3], gains: [1.; 3] };
         assert_eq!(raw.sensor_of(3, 1), (6, 2));
         let s = raw.samples_at(3, 1);
         assert_eq!(s[0], (0, (2 * 8 + 6) as u16));

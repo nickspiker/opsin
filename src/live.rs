@@ -386,7 +386,22 @@ impl Recorder {
             .args(["-probesize", "32", "-analyzeduration", "0", "-thread_queue_size", "1024", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i"])
             .arg(sys_fifo)
             // Two audio tracks, titled: 0 = the mic, 1 = the system audio (the call's far end, and anything else the machine played).
-            .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-metadata:s:a:0", "handler_name=mic", "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "handler_name=system", "-metadata:s:a:1", "title=system", "-c:v", "libx264"])
+                        // Audio track 1 is the CALL as you'd want to hear it: them left, me right. Nearly every
+            // player — QuickTime, a browser, a casual drag into anything — plays only the first audio
+            // track, so with the bare mic there you hear yourself and not them; that is exactly why a
+            // recording had to be hand-downmixed after the fact (the .downmix-L-mic-R-system.flac of
+            // 2026-09-23). The system side is a call's far end, mono in all but name, so folding its
+            // two channels loses nothing. The separate mic and system tracks ride along after it, so
+            // surgical work (de-noise one side, ride one level) still has them untouched.
+            .args([
+                "-filter_complex",
+                "[2:a]pan=mono|c0=0.5*c0+0.5*c1[them];[them][1:a]join=inputs=2:channel_layout=stereo[call]",
+                "-map", "0:v", "-map", "[call]", "-map", "1:a", "-map", "2:a",
+                "-metadata:s:a:0", "handler_name=call (L them, R me)", "-metadata:s:a:0", "title=call (L them, R me)",
+                "-metadata:s:a:1", "handler_name=mic", "-metadata:s:a:1", "title=mic",
+                "-metadata:s:a:2", "handler_name=system", "-metadata:s:a:2", "title=system",
+                "-c:v", "libx264",
+            ])
             .args(REC_ENCODE)
             // Fragmented MOV, not `+faststart`. A plain MOV writes its index (moov) only when the
             // recording stops, and faststart then rewrites the whole file to move it to the front —

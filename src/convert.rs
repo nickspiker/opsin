@@ -111,6 +111,14 @@ pub enum Target {
     VsfRgb,
 }
 
+/// The gain the render actually applies to each CAMERA channel, for a reader that works in raw counts — the display matrix's row sums. A neutral capture (equal normalized counts in every channel) lands at `gains[ch]` of display white in channel `ch`, so this is the scalar that takes a raw count to the screen: the file's `baseline_ev` AND the colour transform's own per-channel weight, which for a Bayer camera is most of it (green is the sensitive channel, so its row sums well below red's and blue's). A flat `2^baseline` instead puts the three channels wherever the matrix happens to disagree — on a lumis frame declaring +3.925 that is +0.27 / −1.17 / +0.56 stops, a 1.75-stop spread between channels (Nick 2026-10-02: "histogram is nowhere near accurate when working with dng's that have an exposure bias set"). Falls back to a flat `2^baseline` when there is no usable matrix, which is what the render does too.
+pub fn display_channel_gains(dec: &Decoded, target: Target) -> [f32; 3] {
+    match display_matrix(&dec.img, target, dec.baseline_ev) {
+        Some(m) => [m[0] + m[1] + m[2], m[3] + m[4] + m[5], m[6] + m[7] + m[8]],
+        None => [dec.baseline_ev.exp2(); 3],
+    }
+}
+
 fn display_matrix(img: &SpectralImage, target: Target, baseline_ev: f32) -> Option<[f32; 9]> {
     let gain = baseline_ev.exp2();
     let Some(profile) = img.profile.as_ref() else {
@@ -886,6 +894,62 @@ mod tests {
     }
 
     /// A profile-less 2×1 planar RGB at the given baseline, rendered in VSF RGB. No profile ⇒ identity matrix and Illuminant E, which normalizes to exactly 1, so at baseline 0 the stored counts pass through bit-exact and any change is the baseline alone.
+    /// A neutral capture — every channel at the same fraction of its range — renders to exactly
+    /// `frac × display_channel_gains`, which is the contract the histogram leans on to place a raw
+    /// count where its light actually lands. Uses a real camera matrix and a nonzero baseline, so the
+    /// row sums are nothing like `2^baseline` (the lumis frame of 2026-10-02: 18.3 / 6.8 / 22.4
+    /// against a flat 15.2) and a scalar gain would show the three channels up to 1.75 stops apart.
+    #[test]
+    fn neutral_capture_lands_at_the_channel_gains() {
+        let dng_cm1 = [1.23615396, -0.3672920167, -0.07938161492, -0.3309353888, 1.556956172, 0.127306819, -0.1197145134, 0.4332881272, 0.5436184406];
+        let entry = derive_profile(dng_cm1, 21, "test").unwrap();
+        let (black, white) = (3023f32, 48320f32);
+        for frac in [0.25f32, 0.5, 0.75] {
+            let v = (black + frac * (white - black)).round() as u16;
+            let img = SpectralImage {
+                width: 2,
+                height: 2,
+                channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+                layout: PlaneLayout::Mosaic { cfa: Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1]) },
+                samples: BitPackedTensor::pack(16, vec![2, 2], &[v; 4]),
+                black: vec![black; 3],
+                white: vec![white; 3],
+                make: String::new(),
+                model: String::new(),
+                provenance: Provenance::default(),
+                profile: Some(ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry.clone()], dng_colormatrix: [None, None], patches: None, cal: None }),
+                view: None,
+            };
+            let dec = Decoded { img, src_bits: 16, baseline_ev: 3.925 };
+            let gains = display_channel_gains(&dec, Target::Rec2020);
+            let lin = to_linear(&dec).unwrap().2;
+            for ch in 0..3 {
+                let rendered = lin[ch] as f32 / 65535.;
+                let predicted = frac * gains[ch];
+                assert!((rendered - predicted).abs() < 2e-3, "frac {frac} ch {ch}: rendered {rendered} vs histogram's {predicted}");
+            }
+        }
+        // And the whole point: those gains are NOT a flat 2^baseline.
+        let dec = Decoded {
+            img: SpectralImage {
+                width: 2, height: 2,
+                channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+                layout: PlaneLayout::Mosaic { cfa: Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1]) },
+                samples: BitPackedTensor::pack(16, vec![2, 2], &[0u16; 4]),
+                black: vec![black; 3], white: vec![white; 3],
+                make: String::new(), model: String::new(), provenance: Provenance::default(),
+                profile: Some(ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry], dng_colormatrix: [None, None], patches: None, cal: None }),
+                view: None,
+            },
+            src_bits: 16,
+            baseline_ev: 3.925,
+        };
+        let gains = display_channel_gains(&dec, Target::Rec2020);
+        let flat = 3.925f32.exp2();
+        assert!((gains[1] / flat).log2() < -1., "green should sit over a stop below a flat 2^baseline, got {:+.2} stops", (gains[1] / flat).log2());
+        assert!((gains[2] / flat).log2() > 0.4, "blue should sit above it, got {:+.2} stops", (gains[2] / flat).log2());
+    }
+
     fn render_at_baseline(baseline_ev: f32) -> Vec<i32> {
         let img = SpectralImage {
             width: 2,
@@ -983,6 +1047,8 @@ mod tests {
         assert_eq!(px(3), &[3, 4, 5]); // B
     }
 }
+
+
 
 
 
