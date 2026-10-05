@@ -19,7 +19,8 @@ pub fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool) -> Vec<u32> {
                 };
                 lut[idx as usize]
             };
-            0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2])
+            // The surface's byte order (fluor's `fmt`: R↔B on Android, identity elsewhere) — see `view::argb`.
+            fluor::theme::fmt(0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2]))
         })
         .collect()
 }

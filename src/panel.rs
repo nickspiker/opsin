@@ -47,14 +47,15 @@ pub struct PanelTools {
     pub thumb_h: usize,
 }
 
-/// visible RGB + α → α+darkness u32 (saturating on all channels).
+/// visible RGB + α → α+darkness u32 (saturating on all channels), in the surface's byte order (fluor's `fmt` — see `view::argb`).
 fn pack(r: f32, g: f32, b: f32, a: f32) -> u32 {
     let d = |v: f32| 255 - (v.clamp(0., 255.) as u32);
-    ((a.clamp(0., 255.) as u32) << 24) | (d(r) << 16) | (d(g) << 8) | d(b)
+    fluor::theme::fmt(((a.clamp(0., 255.) as u32) << 24) | (d(r) << 16) | (d(g) << 8) | d(b))
 }
 
-/// α+darkness u32 → (α, visible RGB bytes as f32).
+/// α+darkness u32 (surface order) → (α, visible RGB bytes as f32). `fmt` is its own inverse, so the same call undoes the pack's swap.
 fn unpack(v: u32) -> (f32, [f32; 3]) {
+    let v = fluor::theme::fmt(v);
     let vis = |shift: u32| (255 - ((v >> shift) & 0xFF)) as f32;
     ((v >> 24) as f32, [vis(16), vis(8), vis(0)])
 }
@@ -227,7 +228,7 @@ pub fn render_hist(dens: &[[f32; 3]], hw: usize, hh: usize, stop_bins: &[usize],
                 }
             }
             let b = |ch: usize| acc[ch] / HIST_OVERSAMPLE as u32;
-            out[row * hw + col] = 0xFF000000 | ((255 - b(0)) << 16) | ((255 - b(1)) << 8) | (255 - b(2));
+            out[row * hw + col] = fluor::theme::fmt(0xFF000000 | ((255 - b(0)) << 16) | ((255 - b(1)) << 8) | (255 - b(2)));
         }
     }
     out

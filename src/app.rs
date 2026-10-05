@@ -13,7 +13,7 @@ use fluor::paint::{self, Clip};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::view::{Area, HAIRLINE, Loaded, Msg, View, load_image};
+use crate::view::{Area, HAIRLINE, Loaded, Msg, View};
 
 /// Base tone (visible RGB) for the top-bar noise texture — the controls-strip grey (`WINDOW_CONTROLS_BG` ≈ 0x1E1E1E visible) so the textured fill and the flat control fill sit at the same value.
 const BAR_TEXTURE_BASE: u32 = 0x00_1E_1E_1E;
@@ -43,6 +43,15 @@ pub struct OpsinApp {
     show_hitmask: bool,
     /// 256 random opaque colours (α+darkness), regenerated on each []h enable so distinct ids always pop.
     debug_hit_colours: Vec<u32>,
+    // --- background loads (2026-10-05, "it just looks like a big UI hang"): every decode runs on its own thread with the view's bar up; the UI thread only installs results.
+    /// The load in flight — a result carrying an older token is a frame the operator has since moved past, and is dropped.
+    load_token: u64,
+    /// The arrow direction of the load in flight (0 = an open/drop): a file that fails to decode is skipped in that direction, as the synchronous walk did.
+    load_step: isize,
+    /// Files skipped during one arrow walk, so a folder of undecodable files ends the walk instead of circling.
+    load_tries: usize,
+    /// The launch path, loaded the moment the wake sender exists (the window shows first, bar up, instead of a blank seconds-long start on a big RAW).
+    pending_open: Option<PathBuf>,
 }
 
 /// Sorted list of supported images in `dir`.
@@ -82,14 +91,16 @@ impl OpsinApp {
         Self::from_loaded(Loaded::empty(), Vec::new(), 0)
     }
 
-    /// Open a file (shown, folder siblings navigable) or a directory (first supported image shown).
+    /// Open a file (shown, folder siblings navigable) or a directory (first supported image shown). The window comes up at once; the decode runs on a thread once the host hands over its wake sender (`set_event_proxy`).
     pub fn open(path: &Path) -> Result<Self, String> {
         let (dir_list, dir_idx) = dir_list_for(path);
         if dir_list.is_empty() {
             return Err(format!("{}: no supported images", path.display()));
         }
-        let loaded = load_image(&dir_list[dir_idx])?;
-        Ok(Self::from_loaded(loaded, dir_list, dir_idx))
+        let first = dir_list[dir_idx].clone();
+        let mut app = Self::from_loaded(Loaded::empty(), dir_list, dir_idx);
+        app.pending_open = Some(first);
+        Ok(app)
     }
 
     fn from_loaded(loaded: Loaded, dir_list: Vec<PathBuf>, dir_idx: usize) -> Self {
@@ -116,7 +127,71 @@ impl OpsinApp {
             chord_rb_release: None,
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
+            load_token: 0,
+            load_step: 0,
+            load_tries: 0,
+            pending_open: None,
         }
+    }
+
+    /// Decode `path` on a thread with the view's bar up; `Msg::Loaded` installs it (or steps on, for an arrow walk). Needs the wake sender — before it exists the path waits in `pending_open`.
+    fn start_load(&mut self, path: PathBuf, step: isize) {
+        let Some(wake) = self.view.wake() else {
+            self.pending_open = Some(path);
+            return;
+        };
+        self.load_token = self.load_token.wrapping_add(1);
+        self.load_step = step;
+        let token = self.load_token;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.view.set_busy(Some(&format!("Loading {name}…")));
+        std::thread::Builder::new()
+            .name("opsin-load".into())
+            .spawn(move || {
+                let w2 = wake.clone();
+                let r = crate::view::load_image_folded_with(&path, None, true, &move |p| {
+                    let _ = w2.send(Msg::LoadProgress(token, p));
+                });
+                let _ = wake.send(Msg::Loaded(token, path, r));
+            })
+            .ok();
+    }
+
+    /// A load came back: install it, or — an arrow walk that hit an undecodable file — step on past it.
+    fn finish_load(&mut self, token: u64, path: PathBuf, r: Result<Loaded, String>, ctx: &mut Context) {
+        if token != self.load_token {
+            return;
+        }
+        self.view.set_busy(None);
+        match r {
+            Ok(loaded) => {
+                match self.dir_list.iter().position(|p| *p == path) {
+                    Some(i) => self.dir_idx = i,
+                    None => {
+                        // A drop / hand-over from another folder: rebuild the list around it so arrow-nav works from there.
+                        let (list, idx) = dir_list_for(&path);
+                        self.dir_list = list;
+                        self.dir_idx = idx;
+                    }
+                }
+                self.install_path(&path, loaded, ctx);
+            }
+            Err(e) => {
+                eprintln!("opsin: {}: {e}", path.display());
+                let n = self.dir_list.len();
+                let here = self.dir_list.iter().position(|p| *p == path);
+                if let (Some(i), true) = (here, self.load_step != 0 && self.load_tries + 1 < n) {
+                    self.load_tries += 1;
+                    let next = ((i as isize + self.load_step).rem_euclid(n as isize)) as usize;
+                    let step = self.load_step;
+                    self.start_load(self.dir_list[next].clone(), step);
+                } else {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.view.say(format!("Could not open {name}"));
+                }
+            }
+        }
+        ctx.window.request_redraw();
     }
 
     /// Top bar height — the chrome strip, or nothing with the controls hidden.
@@ -253,32 +328,17 @@ impl OpsinApp {
         if n <= 1 {
             return;
         }
-        let mut idx = self.dir_idx;
-        for _ in 0..n {
-            idx = ((idx as isize + delta).rem_euclid(n as isize)) as usize;
-            match load_image(&self.dir_list[idx]) {
-                Ok(loaded) => {
-                    self.dir_idx = idx;
-                    let path = self.dir_list[idx].clone();
-                    self.install_path(&path, loaded, ctx);
-                    return;
-                }
-                Err(e) => eprintln!("opsin: {}: {e}", self.dir_list[idx].display()),
-            }
-        }
+        let idx = ((self.dir_idx as isize + delta).rem_euclid(n as isize)) as usize;
+        self.load_tries = 0;
+        self.start_load(self.dir_list[idx].clone(), delta);
+        ctx.window.request_redraw();
     }
 
     /// Open a path dropped onto the window: rebuild the folder list around it so arrow-nav works from there, then show it. Unsupported / undecodable drops are logged and ignored (current image stays).
     fn show_path(&mut self, path: &Path, ctx: &mut Context) {
-        match load_image(path) {
-            Ok(loaded) => {
-                let (list, idx) = dir_list_for(path);
-                self.dir_list = list;
-                self.dir_idx = idx;
-                self.install_path(path, loaded, ctx);
-            }
-            Err(e) => eprintln!("opsin: {}: {e}", path.display()),
-        }
+        self.load_tries = 0;
+        self.start_load(path.to_path_buf(), 0);
+        ctx.window.request_redraw();
     }
 
     /// Plain mode moved the bar and the panel: the chrome's hit stamps are stale either way — mark the layer dirty so a returning chrome re-stamps, and wipe the map now so a hidden close button can't be clicked.
@@ -305,6 +365,10 @@ impl FluorApp for OpsinApp {
     /// The host's wake-sender arrives once before init: become the single instance now — bind the socket and ship the sender to the listener thread, which forwards each handed-over path to `on_user_event`. A clone goes to the view for its own background work (the target scan).
     fn set_event_proxy(&mut self, proxy: std::sync::Arc<dyn fluor::host::WakeSender<Self::UserEvent>>) {
         self.view.set_wake(proxy.clone());
+        // The launch path waited for this moment: the window is up, now the decode runs behind its bar.
+        if let Some(path) = self.pending_open.take() {
+            self.start_load(path, 0);
+        }
         // macOS never spawns the second process the socket exists to catch — Launch Services routes a Finder open into THIS process. Same destination, so the same Msg; only the transport differs. This is the one moment the delegate method can be added: after winit built the EventLoop, before it runs.
         #[cfg(target_os = "macos")]
         {
@@ -325,6 +389,17 @@ impl FluorApp for OpsinApp {
     fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) -> EventResponse {
         #[allow(unreachable_patterns)]
         match event {
+            Msg::Loaded(token, path, r) => {
+                self.finish_load(token, path, r, ctx);
+                EventResponse::Handled
+            }
+            Msg::LoadProgress(token, p) => {
+                if token == self.load_token {
+                    self.view.set_busy_frac(p);
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Handled
+            }
             Msg::Open(path) => {
                 if let Some(path) = path {
                     self.show_path(&path, ctx);

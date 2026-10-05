@@ -20,9 +20,10 @@ use crate::panel::{HIST_OVERSAMPLE, Observer, PanelTools};
 pub const BACKDROP: u32 = 0xFF_F2_F2_F2;
 /// Panel background — a shade above the backdrop so the tool area reads as a surface.
 const PANEL_BG: u32 = 0xFF_E6_E6_E6;
-/// Const-context version of `paint::pack_argb` — same visible-RGB → α+darkness packing.
+/// Const-context version of `paint::pack_argb` — same visible-RGB → α+darkness packing, in the SURFACE's byte order: fluor's `fmt` swaps R↔B on Android's RGBA_8888 buffer and is the identity elsewhere.
+/// Every pixel opsin packs itself (this, [`encode_pixels`], the navigator thumb, the histogram) takes this path; without it the whole viewer rendered red-for-blue inside photon on Android (Nick 2026-10-05, "red blue swap or something").
 pub(crate) const fn argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    ((a as u32) << 24) | (((255 - r) as u32) << 16) | (((255 - g) as u32) << 8) | ((255 - b) as u32)
+    fluor::theme::fmt(((a as u32) << 24) | (((255 - r) as u32) << 16) | (((255 - g) as u32) << 8) | ((255 - b) as u32))
 }
 /// Divider + section hairlines: flat grey, same 1px weight as Photon's button strokes.
 pub(crate) const HAIRLINE: u32 = argb(0x60, 0x60, 0x60, 0xFF);
@@ -83,9 +84,14 @@ pub enum Msg {
     /// From the live capture thread (`live` feature).
     #[cfg(feature = "live")]
     Live(crate::live::LiveMsg),
-    /// A background JPEG export: how far along (0..=1), then where it landed or why it didn't.
+    /// A background JPEG export: how far along (0..=1), then where it landed or why it didn't. The VSF convert shares the progress message (one bar at a time).
     ExportProgress(f32),
     ExportDone(Result<PathBuf, String>),
+    /// A background VSF convert finished: where it landed or why it didn't.
+    ConvertDone(Result<PathBuf, String>),
+    /// A background image load (the host's: arrow step, drop, hand-over): the request it answers — a result for a request the operator has since moved past is dropped — the path, and the decode. How far along rides `LoadProgress`.
+    Loaded(u64, PathBuf, Result<Loaded, String>),
+    LoadProgress(u64, f32),
     /// A background preview upgrade finished: the generation it was started for, and the demosaiced render.
     Preview(u64, Result<(usize, usize, Vec<i32>), String>),
     /// Nothing happened — repaint. A toast raises one of these on a timer so it fades on its own instead of waiting for the next click.
@@ -390,7 +396,7 @@ pub fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool, hdr: bool) -> Vec<u3
                 };
                 lut[idx as usize]
             };
-            0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2])
+            fluor::theme::fmt(0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2]))
         })
         .collect()
 }
@@ -561,11 +567,42 @@ pub fn load_image(path: &Path) -> Result<Loaded, String> {
 
 /// Decode `path` with the display copy folded to `max_edge` and the decode dropped unless `keep_decode` — the phone's load. Header-only reads for the HUD; a non-TIFF source (JXL/JPEG/VSF) simply has no EXIF block here.
 pub fn load_image_folded(path: &Path, max_edge: Option<usize>, keep_decode: bool) -> Result<Loaded, String> {
+    load_image_folded_with(path, max_edge, keep_decode, &|_| {})
+}
+
+/// [`load_image_folded`] reporting how far along it is (0..=1) for a host that draws a bar: the stages are the file read + decode (the long one on a RAW), then the linear render. Coarse — the decoders have no hook of their own — but a bar that moves twice beats a frozen screen.
+pub fn load_image_folded_with(path: &Path, max_edge: Option<usize>, keep_decode: bool, progress: &dyn Fn(f32)) -> Result<Loaded, String> {
+    progress(0.05);
     let dec = crate::convert::load_any(path)?;
+    progress(0.6);
     let meta = crate::tiff::FrameMeta::read_path(path).ok();
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    Loaded::from_decoded(dec, meta, &file_name, file_size, max_edge, keep_decode)
+    let loaded = Loaded::from_decoded(dec, meta, &file_name, file_size, max_edge, keep_decode);
+    progress(1.0);
+    loaded
+}
+
+/// The convert's heavy half, off the UI thread: re-decode the source, record the orientation the view showed and the view ops APPENDED to the translateration log (so the ingest-recorded orientation op rides ahead), write the VSF beside it.
+fn convert_to_vsf(src: &Path, out: &Path, code: u16, ops: Vec<vsf::spectral_image::ViewOp>) -> Result<(), String> {
+    let mut dec = crate::convert::load_any(src)?;
+    let op = vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] };
+    match &mut dec.img.view {
+        Some(v) => match v.ops.iter_mut().find(|o| o.name == "orientation") {
+            Some(o) => o.params = vec![code as f32],
+            None if code != 1 => v.ops.insert(0, op),
+            None => {}
+        },
+        None if code != 1 => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops: vec![op] }),
+        None => {}
+    }
+    if !ops.is_empty() {
+        match &mut dec.img.view {
+            Some(v) => v.ops.extend(ops),
+            None => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops }),
+        }
+    }
+    crate::convert::write_vsf(&dec.img, out)
 }
 
 /// The viewer. See the module doc for the host contract.
@@ -834,6 +871,23 @@ impl View {
 
     pub fn source(&self) -> Option<&Path> {
         self.source.as_deref()
+    }
+
+    /// The host's wake sender, for a load the host runs on its own thread.
+    pub fn wake(&self) -> Option<std::sync::Arc<dyn fluor::host::WakeSender<Msg>>> {
+        self.wake.clone()
+    }
+
+    /// The host's long job: a labelled bar over the image area while `Some`, cleared with `None`. The view's own jobs (export, convert) set it the same way.
+    pub fn set_busy(&mut self, label: Option<&str>) {
+        self.busy = label.map(|l| (l.to_string(), 0.));
+    }
+
+    /// How far the host's job is along (0..=1); nothing when no bar is up.
+    pub fn set_busy_frac(&mut self, frac: f32) {
+        if let Some((_, v)) = self.busy.as_mut() {
+            *v = frac.clamp(0., 1.);
+        }
     }
 
     /// Relabel the export pill (photon says "Save": it hands the original over, no JPEG is written).
@@ -1176,29 +1230,20 @@ impl View {
         ctx.window.request_redraw();
     }
 
-    /// Convert the current image to a VSF-Image beside the source (`<stem>.vsf`). Returns the written path for the caller to surface.
-    fn convert_current_to_vsf(&self) -> Result<PathBuf, String> {
-        let Some(src) = self.source.as_deref() else {
+    /// Convert the current image to a VSF-Image beside the source (`<stem>.vsf`): the view's ops are gathered here, the decode and the write run on a thread with the bar up (a RAW re-decodes from disk — seconds, which used to be a frozen window). `Ok(Some(path))` only on the synchronous fallback (no wake sender); `Ok(None)` = in flight, `ConvertDone` reports.
+    fn convert_current_to_vsf(&mut self) -> Result<Option<PathBuf>, String> {
+        let Some(src) = self.source.clone() else {
             return Err("no source file to convert".to_string());
         };
-        if crate::sniff::sniff_path(src) == Some(crate::sniff::Kind::Vsf) {
+        if crate::sniff::sniff_path(&src) == Some(crate::sniff::Kind::Vsf) {
             return Err("already a VSF image".to_string());
         }
-        let out = src.with_extension("vsf");
-        let mut dec = crate::convert::load_any(src)?;
-        // Record the live view ops — APPENDED to the translateration log, so the ingest-recorded orientation op rides ahead. `exposure` (Technical: a scalar shifts no hue) when EV ≠ 0; `dr_curve` (CREATIVE: a curve is a deliberate look) when HDR is on. Neither is ever baked into the plane; an op-less log is never created.
-        // The display orientation as the view holds it NOW (ingest's EXIF code composed with any 90° turns): replace the ingest-recorded op's param, or insert one at the head so it rides ahead of everything else.
-        let code = self.raw.orient;
-        let op = vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] };
-        match &mut dec.img.view {
-            Some(v) => match v.ops.iter_mut().find(|o| o.name == "orientation") {
-                Some(o) => o.params = vec![code as f32],
-                None if code != 1 => v.ops.insert(0, op),
-                None => {}
-            },
-            None if code != 1 => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops: vec![op] }),
-            None => {}
+        if self.busy.is_some() {
+            return Ok(None);
         }
+        let out = src.with_extension("vsf");
+        // The display orientation as the view holds it NOW (ingest's EXIF code composed with any 90° turns), and the live view ops.
+        let code = self.raw.orient;
         let mut ops = Vec::new();
         // `crop [x, y, w, h]` in display pixels AFTER orientation — ops replay in order, so the rect means what the screen showed. Technical: it culls, it shifts no hue.
         if let Some((x0, y0, x1, y1)) = self.crop {
@@ -1210,14 +1255,22 @@ impl View {
         if self.hdr {
             ops.push(vsf::spectral_image::ViewOp { name: "dr_curve".to_string(), class: vsf::spectral_image::IdtClass::Creative, params: crate::convert::HDR_CURVE_COEFS.to_vec() });
         }
-        if !ops.is_empty() {
-            match &mut dec.img.view {
-                Some(v) => v.ops.extend(ops),
-                None => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops }),
+        match self.wake.clone() {
+            Some(wake) => {
+                self.busy = Some(("Converting…".to_string(), 0.));
+                let out2 = out.clone();
+                std::thread::Builder::new()
+                    .name("opsin-convert".into())
+                    .spawn(move || {
+                        let _ = wake.send(Msg::ExportProgress(0.1));
+                        let r = convert_to_vsf(&src, &out2, code, ops).map(|_| out2);
+                        let _ = wake.send(Msg::ConvertDone(r));
+                    })
+                    .ok();
+                Ok(None)
             }
+            None => convert_to_vsf(&src, &out, code, ops).map(|_| Some(out)),
         }
-        crate::convert::write_vsf(&dec.img, &out)?;
-        Ok(out)
     }
 
     /// Export the current view as an sRGB JPEG beside the source (`<stem>.jpg`) — the live exposure baked in, everything else exactly the rendering on screen. `self.lin` already carries the orientation, so the JPEG lands the way the view shows it. Returns the written path for the caller to surface; `Ok(None)` = no source to write beside, the host was asked instead.
@@ -1472,7 +1525,7 @@ impl View {
     }
 
     /// Raise a confirmation over the image for [`TOAST_SECS`], and schedule the repaint that clears it.
-    fn say(&mut self, text: impl Into<String>) {
+    pub fn say(&mut self, text: impl Into<String>) {
         self.toast = Some((text.into(), std::time::Instant::now()));
         if let Some(wake) = self.wake.clone() {
             std::thread::Builder::new()
@@ -1555,11 +1608,10 @@ impl View {
                 return;
             }
         }
-        // Only reload if this is still the frame on screen (a scan can outlive a navigation).
+        // Only reload if this is still the frame on screen (a scan can outlive a navigation) — thru the host's threaded loader, bar up, as any open.
         if self.source.as_deref() == Some(path.as_path()) {
-            match load_image(&path) {
-                Ok(loaded) => self.install(loaded, ctx),
-                Err(e) => eprintln!("opsin: {}: {e}", path.display()),
+            if let Some(wake) = self.wake.clone() {
+                let _ = wake.send(Msg::Open(Some(path.clone())));
             }
             if let Some(dec) = self.dec.as_mut().map(std::sync::Arc::make_mut) {
                 if let Some(e) = dec.img.profile.as_mut().and_then(|p| p.entries.first_mut()) {
@@ -1730,7 +1782,24 @@ impl View {
     pub fn on_msg(&mut self, msg: Msg, ctx: &mut Context) -> bool {
         let _ = &ctx;
         match msg {
-            Msg::Open(_) => false,
+            // The host's: it owns the folder walk and the window title.
+            Msg::Open(_) | Msg::Loaded(..) | Msg::LoadProgress(..) => false,
+            Msg::ConvertDone(r) => {
+                self.busy = None;
+                match r {
+                    Ok(p) => {
+                        println!("opsin: wrote {}", p.display());
+                        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        self.say(format!("Saved {name}"));
+                    }
+                    Err(e) => {
+                        eprintln!("opsin: convert to VSF failed: {e}");
+                        self.say(format!("Convert failed: {e}"));
+                    }
+                }
+                ctx.window.request_redraw();
+                true
+            }
             #[cfg(feature = "calibrate")]
             Msg::Scan(path, result) => {
                 self.finish_scan(path, result, ctx);
@@ -1981,11 +2050,13 @@ impl View {
                     }
                     Key::Character(c) if c.eq_ignore_ascii_case("v") => {
                         match self.convert_current_to_vsf() {
-                            Ok(out) => {
+                            Ok(Some(out)) => {
                                 println!("opsin: wrote {}", out.display());
                                 let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                                 self.say(format!("Saved {name}"));
                             }
+                            // In flight (or a bar is already up): `ConvertDone` reports.
+                            Ok(None) => {}
                             Err(e) => {
                                 eprintln!("opsin: convert to VSF failed: {e}");
                                 self.say(format!("Convert failed: {e}"));
@@ -2557,8 +2628,8 @@ impl View {
         // Progress bar and confirmation toast — centred over the image area, drawn BEFORE the image
         // like the HUD so the under-compose order puts them on top. The bar is whatever long job is
         // running (a full-resolution export takes ~0.8 s of demosaic on a 12 MP frame); the toast is
-        // the receipt, and fades on its own via the Tick its timer raises.
-        if self.img_w > 0 {
+        // the receipt, and fades on its own via the Tick its timer raises. Drawn with or without an image: the first load's bar has nothing under it yet.
+        if self.img_w > 0 || self.busy.is_some() || self.toast.is_some() {
             let bandf = band as f32;
             let font = bandf * 0.9;
             let (cx, cy) = (((area_x0 + divider_px) / 2) as f32, ((area_y0 + area_y1) / 2) as f32);
