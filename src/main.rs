@@ -15,6 +15,7 @@ mod live;
 #[cfg(feature = "calibrate")]
 mod calibrate;
 mod convert;
+mod debayer;
 mod headerless;
 /// Finder's document opens arrive as an Apple Event, not as argv — see the module note. macOS only; Linux gets its paths from the `.desktop` `%f` and needs nothing here.
 #[cfg(target_os = "macos")]

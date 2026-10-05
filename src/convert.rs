@@ -15,6 +15,7 @@ pub fn is_supported(path: &Path) -> bool {
 }
 
 /// A decoded image ready to render: the spectral data, carrying its own tiered [`vsf::spectral_image::ColourProfile`] in `img.profile` (`None` ⇒ the samples ARE VSF RGB: untagged data is VSF RGB by specification, so absence is a complete statement, not a gap, and it renders thru the identity with Illuminant E as its white). The display matrix is derived from the profile at render time — nothing display-space is stored.
+#[derive(Clone)]
 pub struct Decoded {
     pub img: SpectralImage,
     /// The writer's declared opening gain, in stops — DNG `BaselineExposure` (tag 50730), which lumis writes with its on-screen display gain so a converter opens the frame at the brightness it was graded at. NOT the operator's exposure: this is the file's own statement about how it should be rendered, a hue-free scalar and so a Technical IDT by the VERICHROME taxonomy. It is applied with the rest of the characterization in `display_matrix` and DERIVED FRESH every render, never folded into the slider — if the slider absorbed it, an export would record `baseline + operator` and the next open would apply the baseline again on top, doubling it every round trip.
@@ -723,6 +724,93 @@ pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
 }
 
 /// [`to_linear`] with the landing space chosen: the same integer pipeline, only the matrix differs.
+/// The same render at the sensor's OWN resolution: RCD demosaic instead of the tile bin, so an
+/// exported JPEG is a full-resolution deliverable rather than the quarter-pixel-count view buffer
+/// (a 4080×3072 Bayer frame exported 2040×1536 until 2026-10-05). Bayer only — RCD is a 2×2
+/// algorithm, so a quad-Bayer tile, a planar source or anything else falls back to [`to_linear_in`],
+/// which is also exactly right for them: a planar source has nothing to demosaic. `progress` is
+/// called with 0..=1 as the passes complete, for a host that draws a bar.
+pub fn to_linear_full(dec: &Decoded, target: Target, progress: &dyn Fn(f32)) -> Result<(usize, usize, Vec<i32>), String> {
+    let img = &dec.img;
+    let PlaneLayout::Mosaic { cfa } = &img.layout else { return to_linear_in(dec, target) };
+    if cfa.shape[0] != 2 || cfa.shape[1] != 2 {
+        return to_linear_in(dec, target);
+    }
+    let (w, h) = (img.width, img.height);
+    let counts = img.samples.unpack_u16();
+    progress(0.05);
+
+    // RCD wants each pixel's own CFA channel in place, the other two zero; it fills them in.
+    let tile: Vec<usize> = cfa.data.iter().map(|&c| (c as usize).min(2)).collect();
+    let mut rcd = crate::debayer::RcdData::new(w, h, Box::new(move |row: usize, col: usize| tile[(row % 2) * 2 + col % 2]));
+    for y in 0..h {
+        let row = &mut rcd.data[y];
+        for x in 0..w {
+            row[x][(rcd.fc)(y, x)] = counts[y * w + x];
+        }
+    }
+    progress(0.15);
+    rcd.rcd_demosaic(&crate::debayer::RawImage::new(w, h));
+    progress(0.75);
+
+    // Same colour math as the binned path, one sample per channel per pixel instead of a tile's worth.
+    let cmx = display_matrix(img, target, dec.baseline_ev);
+    let (rows, bias) = build_coefs(img, &cmx, &[1f64; 3])?;
+    let mut rgb = vec![0i32; w * h * 3];
+    rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, out_row)| {
+        let src = &rcd.data[y];
+        for x in 0..w {
+            let cam = [src[x][0] as i64, src[x][1] as i64, src[x][2] as i64];
+            for o in 0..3 {
+                let acc = rows[0].coef[o] * cam[0] + rows[1].coef[o] * cam[1] + rows[2].coef[o] * cam[2] - bias[o];
+                out_row[x * 3 + o] = q_to_lin(acc);
+            }
+        }
+    });
+    // RCD is a 5×5 algorithm: its interior loops run 4..n−4, and its own `border_interpolate`
+    // replicates the ring from row 4 — which is itself still inside the partially-converged zone. On
+    // a flat field the outer pixels come back ~44% high, and on a real 12 MP frame that ring was the
+    // whole of the 0.31% the full render differed from the binned one. So the ring takes the BINNED
+    // render instead: the tile average through the same matrix — real data at half resolution, which
+    // is exactly what the viewer shows there — rather than a fabricated replica of a bad row.
+    const RCD_EDGE: usize = 8;
+    if w > RCD_EDGE * 2 && h > RCD_EDGE * 2 {
+        let mut tile_count = vec![0f64; 3];
+        for &c in &cfa.data {
+            tile_count[(c as usize).min(2)] += 1.;
+        }
+        let (brows, bbias) = build_coefs(img, &cmx, &tile_count)?;
+        let binned_at = |x: usize, y: usize| -> [i32; 3] {
+            let (bx, by) = (x / 2 * 2, y / 2 * 2);
+            let mut acc = [-bbias[0], -bbias[1], -bbias[2]];
+            for ty in 0..2 {
+                for tx in 0..2 {
+                    let ch = (cfa.data[ty * 2 + tx] as usize).min(2);
+                    let c = &brows[ch].coef;
+                    let v = counts[(by + ty) * w + bx + tx] as i64;
+                    for o in 0..3 {
+                        acc[o] += c[o] * v;
+                    }
+                }
+            }
+            [q_to_lin(acc[0]), q_to_lin(acc[1]), q_to_lin(acc[2])]
+        };
+        for y in 0..h {
+            let edge_row = y < RCD_EDGE || y >= h - RCD_EDGE;
+            for x in 0..w {
+                if edge_row || x < RCD_EDGE || x >= w - RCD_EDGE {
+                    let px = binned_at(x, y);
+                    rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&px);
+                }
+            }
+        }
+    }
+    progress(0.95);
+    let out = apply_orientation(w, h, rgb, orientation_code(img));
+    progress(1.);
+    Ok(out)
+}
+
 pub fn to_linear_in(dec: &Decoded, target: Target) -> Result<(usize, usize, Vec<i32>), String> {
     let img = &dec.img;
     // Display matrix derived fresh from the stored VSF-RGB profile: VSF_RGB2REC2020 × elected entry (the identity when there is no profile — the samples are VSF RGB), white-normalized. None ⇒ raw passthrough, only for a foreign target or a singular result.
@@ -950,6 +1038,44 @@ mod tests {
         assert!((gains[2] / flat).log2() > 0.4, "blue should sit above it, got {:+.2} stops", (gains[2] / flat).log2());
     }
 
+    /// The full-resolution path returns the sensor's own dimensions and the same light as the binned
+    /// one — a JPEG is a deliverable, so it must not be a quarter of the pixels (2026-10-05). A
+    /// non-Bayer tile has nothing RCD can do, so it falls back to the binned render rather than refuse.
+    #[test]
+    fn full_resolution_render_matches_the_binned_one() {
+        let dng_cm1 = [1.23615396, -0.3672920167, -0.07938161492, -0.3309353888, 1.556956172, 0.127306819, -0.1197145134, 0.4332881272, 0.5436184406];
+        let entry = derive_profile(dng_cm1, 21, "test").unwrap();
+        let profile = Some(ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry], dng_colormatrix: [None, None], patches: None, cal: None });
+        // A flat field: binning averages a tile, demosaicing interpolates it, and on uniform light
+        // the two must land in the same place. (Real content agrees to ~0.3%; a synthetic ramp does
+        // not, and that difference is the demosaic doing its job at an edge, not an error.)
+        let (w, h) = (64usize, 48usize);
+        let counts: Vec<u16> = vec![24000; w * h];
+        let mk = |cfa: Tensor<u8>| SpectralImage {
+            width: w, height: h,
+            channels: rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect(),
+            layout: PlaneLayout::Mosaic { cfa },
+            samples: BitPackedTensor::pack(16, vec![h, w], &counts),
+            black: vec![3023.; 3], white: vec![48320.; 3],
+            make: String::new(), model: String::new(), provenance: Provenance::default(),
+            profile: profile.clone(), view: None,
+        };
+        let dec = Decoded { img: mk(Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1])), src_bits: 16, baseline_ev: 0. };
+        let (bw, bh, blin) = to_linear(&dec).unwrap();
+        let (fw, fh, flin) = to_linear_full(&dec, Target::Rec2020, &|_| {}).unwrap();
+        assert_eq!((bw, bh), (w / 2, h / 2), "the binned path halves each axis");
+        assert_eq!((fw, fh), (w, h), "the full path keeps the sensor's own dimensions");
+        for ch in 0..3 {
+            let mb: f64 = blin.iter().skip(ch).step_by(3).map(|&v| v as f64).sum::<f64>() / (bw * bh) as f64;
+            let mf: f64 = flin.iter().skip(ch).step_by(3).map(|&v| v as f64).sum::<f64>() / (fw * fh) as f64;
+            assert!((mf / mb - 1.).abs() < 0.01, "ch{ch}: binned mean {mb:.0} vs full {mf:.0}");
+        }
+        // Quad-Bayer: RCD is a 2×2 algorithm, so this falls back to the binned render.
+        let quad = Decoded { img: mk(Tensor::new(vec![4, 4], vec![1u8, 1, 2, 2, 1, 1, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1])), src_bits: 16, baseline_ev: 0. };
+        let (qw, qh, _) = to_linear_full(&quad, Target::Rec2020, &|_| {}).unwrap();
+        assert_eq!((qw, qh), (w / 4, h / 4), "a non-Bayer tile falls back to the bin");
+    }
+
     fn render_at_baseline(baseline_ev: f32) -> Vec<i32> {
         let img = SpectralImage {
             width: 2,
@@ -1047,6 +1173,10 @@ mod tests {
         assert_eq!(px(3), &[3, 4, 5]); // B
     }
 }
+
+
+
+
 
 
 

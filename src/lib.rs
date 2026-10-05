@@ -1,5 +1,6 @@
 //! opsin as a library: the ingest + colour pipeline ([`convert`]), the display encode ([`render`]), and — behind the `view` feature — the whole viewer interface as an embeddable component ([`view::View`], what photon's attachment viewer IS). The window binary lives behind the `viewer` feature.
 pub mod convert;
+pub mod debayer;
 pub mod headerless;
 pub mod sniff;
 pub mod icc;

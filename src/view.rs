@@ -28,6 +28,8 @@ pub(crate) const fn argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
 pub(crate) const HAIRLINE: u32 = argb(0x60, 0x60, 0x60, 0xFF);
 /// Mic meter colours.
 const METER_TROUGH: u32 = argb(0x14, 0x14, 0x14, 0xFF);
+/// How long a confirmation stays up before it fades.
+const TOAST_SECS: f32 = 3.;
 const METER_GREEN: u32 = argb(0x30, 0xC0, 0x50, 0xFF);
 const METER_YELLOW: u32 = argb(0xE0, 0xC0, 0x20, 0xFF);
 const METER_RED: u32 = argb(0xE0, 0x30, 0x30, 0xFF);
@@ -81,6 +83,13 @@ pub enum Msg {
     /// From the live capture thread (`live` feature).
     #[cfg(feature = "live")]
     Live(crate::live::LiveMsg),
+    /// A background JPEG export: how far along (0..=1), then where it landed or why it didn't.
+    ExportProgress(f32),
+    ExportDone(Result<PathBuf, String>),
+    /// A background preview upgrade finished: the generation it was started for, and the demosaiced render.
+    Preview(u64, Result<(usize, usize, Vec<i32>), String>),
+    /// Nothing happened — repaint. A toast raises one of these on a timer so it fades on its own instead of waiting for the next click.
+    Tick,
 }
 
 /// Panel section rects (x0, y0, w, h) — named fields, no position-coded indexing.
@@ -103,7 +112,7 @@ pub struct Loaded {
     h: usize,
     raw: RawView,
     /// The decode, retained where the host can afford it (rotation writes its orientation op here for the VSF convert; the calibrate scan sets its entry's tier). `None` = folded/phone load: rotation and the clip toggle work from `lin` alone.
-    dec: Option<crate::convert::Decoded>,
+    dec: Option<std::sync::Arc<crate::convert::Decoded>>,
     title: String,
     file_name: String,
     /// The HUD's static frame lines (file, camera/sensor, exposure, levels, IDT) — computed once at load, so they outlive `dec`.
@@ -266,6 +275,32 @@ impl RawView {
     /// Equal-energy spread: each ADC code deposits its census-weighted count uniformly over the bin interval its quantization step `[v, v+1)` covers through the active axis — exact density on both axes, comb-free, deterministic (lumis's `bin_span` idea taken to its conclusion: the interval IS the span, deposited rather than divided, so no duty-cycle/log-order weirdness survives). Below-black collapses into bin 0 and at/above-white into the last bin — the clip spikes.
     ///
     /// `gain` is the live EV multiplier (2^ev), applied to the black-subtracted counts before the axis map, so the histogram tracks the exposure slider exactly as the display does: in linear-x every peak moves 2× per stop, in log-x the whole distribution translates one stop per stop — a labelled remap of the same raw counts, still no curve. Data pushed past display white by the gain collapses into the last bin: the clip spike grows as you rack exposure, agreeing with the image's encode-boundary indicator.
+    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, ev_gain: f32) -> Vec<[f32; 3]> {
+        self.domain().spread(codes, x_log, bins, ev_gain)
+    }
+
+    /// What [`Domain::spread`] needs to bin RAW ADC codes: the sensor's own levels and the render's per-channel gain.
+    fn domain(&self) -> Domain {
+        Domain { black: self.black, white: self.white, gains: self.gains, census: self.census, bits: self.bits }
+    }
+}
+
+/// The axis a histogram is binned over: where black and white sit in the incoming values, the gain each channel gets on its way to the screen, the per-channel sample census (a Bayer tile holds two greens), and the stops the log view spans.
+#[derive(Clone, Copy)]
+struct Domain {
+    black: [f32; 3],
+    white: [f32; 3],
+    gains: [f32; 3],
+    census: [f32; 3],
+    bits: usize,
+}
+
+impl Domain {
+    /// Binning the RENDERED display-linear buffer: 0 is display black, 65535 display white, and no gain of its own — `lin` already carries the colour matrix and the file's baseline. `bits` carries over so the log axis still spans the capture's own dynamic range.
+    fn display(bits: usize) -> Domain {
+        Domain { black: [0.; 3], white: [65535.; 3], gains: [1.; 3], census: [1.; 3], bits }
+    }
+
     fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, ev_gain: f32) -> Vec<[f32; 3]> {
         let mut dens = vec![[0f32; 3]; bins];
         for ch in 0..3 {
@@ -502,7 +537,7 @@ impl Loaded {
         let title = format!("opsin — {file_name} ({}×{}, {} ch, {}-bit)", dec.img.width, dec.img.height, dec.img.channel_count(), dec.src_bits);
         let frame_lines = frame_lines(&dec, meta.as_ref(), file_name, file_size);
         let channel_names = dec.img.channels.iter().map(|c| c.name.clone()).collect();
-        Ok(Loaded { pixels, lin, w, h, raw, dec: keep_decode.then_some(dec), title, file_name: file_name.to_string(), frame_lines, channel_names, baseline_ev, stored_ev })
+        Ok(Loaded { pixels, lin, w, h, raw, dec: keep_decode.then(|| std::sync::Arc::new(dec)), title, file_name: file_name.to_string(), frame_lines, channel_names, baseline_ev, stored_ev })
     }
 
     /// The empty drop-target state — no image, the panel's locus/Planck chart renders from the observer alone.
@@ -564,11 +599,14 @@ pub struct View {
     /// Clip indicator on/off — lumis's raw inversion at the encode boundary: blown highlights render dark, crushed shadows render blown, channel-wise.
     clip_show: bool,
     /// The retained decode where the host kept it (see [`Loaded`]).
-    dec: Option<crate::convert::Decoded>,
+    dec: Option<std::sync::Arc<crate::convert::Decoded>>,
     /// The histogram's axis pills + the clip toggle, overlaid top-right of the histogram rect. Labels read the CURRENT mode.
     btn_xscale: fluor::widgets::Button,
     btn_yscale: fluor::widgets::Button,
     btn_clip: fluor::widgets::Button,
+    /// Histogram source: the rendered display light (default — it agrees with the picture) or the sensor's own ADC codes per CFA channel. The pill reads the CURRENT mode, like the axis pills.
+    hist_raw: bool,
+    btn_source: fluor::widgets::Button,
     /// Exposure in stops (gain = 2^ev in linear), [EV_MIN]..=[EV_MAX].
     ev: f32,
     /// The open file's declared opening gain (stops), already in the render — shown in the HUD so the slider's 0 is readable as "as the file says" rather than as "no gain".
@@ -592,6 +630,15 @@ pub struct View {
     source: Option<PathBuf>,
     /// Set by the export pill / `E` when there is no source path to write beside; the host drains it.
     export_requested: bool,
+    /// A background export in flight: the label and how far along, for the bar over the image.
+    busy: Option<(String, f32)>,
+    /// Which frame is on screen. Bumped by every install, so a demosaic that finishes after the
+    /// operator has arrowed on is dropped instead of landing on the wrong picture.
+    frame_gen: u64,
+    /// The preview is the full-resolution demosaic, not the tile bin — what the HUD reports.
+    preview_full: bool,
+    /// A finished action's confirmation, and when it was raised — it fades out on its own.
+    toast: Option<(String, std::time::Instant)>,
     /// Set when plain mode flips; the host drains it to wipe its chrome hit stamps.
     plain_changed: bool,
     /// Target-scan state (`calibrate` feature): the solved overlay in raw coordinates, the one-line readout for the HUD, and whether a scan is in flight (the pill reads "Scanning…").
@@ -674,6 +721,7 @@ impl View {
         let btn_xscale = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "X Lin");
         let btn_yscale = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Y Lin");
         let btn_clip = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Clip");
+        let btn_source = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Out");
 
         let tools = PanelTools::new(&loaded.pixels, loaded.w, loaded.h);
 
@@ -699,6 +747,8 @@ impl View {
             btn_xscale,
             btn_yscale,
             btn_clip,
+            hist_raw: false,
+            btn_source,
             ev: 0.,
             baseline_ev: 0.,
             ev_slider,
@@ -711,6 +761,10 @@ impl View {
             wake: None,
             source: None,
             export_requested: false,
+            busy: None,
+            frame_gen: 0,
+            preview_full: false,
+            toast: None,
             plain_changed: false,
             #[cfg(feature = "calibrate")]
             cal_overlay: None,
@@ -767,6 +821,10 @@ impl View {
     /// The host's wake-sender for the view's background work.
     pub fn set_wake(&mut self, wake: std::sync::Arc<dyn fluor::host::WakeSender<Msg>>) {
         self.wake = Some(wake);
+        // The FIRST image is loaded before the host's event loop exists, so `View::new` had no way to
+        // report a demosaic and skipped it. This is the moment that becomes possible — without this,
+        // the frame opsin was launched on stayed binned forever and only arrowing to another upgraded.
+        self.start_preview_upgrade();
     }
 
     /// Where the shown image lives on disk (the desktop viewer); `None` for an in-memory host.
@@ -817,7 +875,7 @@ impl View {
     /// Every hit id the view's widgets answer to — the host's cursor cue and press routing.
     pub fn hit_ids(&self) -> Vec<HitId> {
         #[allow(unused_mut)]
-        let mut ids = vec![self.ev_slider.hit_id(), self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_info.hit_id(), self.btn_hdr.hit_id(), self.btn_crop.hit_id(), self.btn_rot_ccw.hit_id(), self.btn_rot_cw.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id()];
+        let mut ids = vec![self.ev_slider.hit_id(), self.btn_one.hit_id(), self.btn_fit.hit_id(), self.btn_export.hit_id(), self.btn_info.hit_id(), self.btn_hdr.hit_id(), self.btn_crop.hit_id(), self.btn_rot_ccw.hit_id(), self.btn_rot_cw.hit_id(), self.btn_xscale.hit_id(), self.btn_yscale.hit_id(), self.btn_clip.hit_id(), self.btn_source.hit_id()];
         #[cfg(feature = "calibrate")]
         ids.push(self.btn_cal.hit_id());
         #[cfg(feature = "live")]
@@ -1112,6 +1170,9 @@ impl View {
             self.btn_crop.set_fill(None);
             self.fit();
         }
+        self.frame_gen = self.frame_gen.wrapping_add(1);
+        self.preview_full = false;
+        self.start_preview_upgrade();
         ctx.window.request_redraw();
     }
 
@@ -1164,6 +1225,9 @@ impl View {
         if self.lin.is_empty() {
             return Err("no image loaded".to_string());
         }
+        if self.busy.is_some() {
+            return Ok(None);
+        }
         // Live frames have no source file: they land in ~/Pictures/opsin as live-<unix seconds>.jpg.
         #[cfg(feature = "live")]
         let live_out = self.live.as_ref().map(|_| {
@@ -1181,19 +1245,59 @@ impl View {
                 return Ok(None);
             }
         };
-        match self.crop {
-            Some((x0, y0, x1, y1)) => {
-                // Armed crop: export exactly the rect — row slices of the oriented linear buffer.
-                let (cw, ch) = (x1 - x0, y1 - y0);
-                let mut sub = Vec::with_capacity(cw * ch * 3);
-                for y in y0..y1 {
-                    sub.extend_from_slice(&self.lin[(y * self.img_w + x0) * 3..(y * self.img_w + x1) * 3]);
+        // A JPEG is a DELIVERABLE, so it goes out at the sensor's own resolution: the decode is
+        // re-rendered through RCD rather than reusing the view's binned buffer (a quarter of the
+        // pixels). That costs ~0.8 s on a 12.5 MP frame, far too long to block the window, so it runs
+        // on a thread and reports progress; without a retained decode or a wake sender — a host that
+        // dropped the decode to save memory, a live frame — the view buffer is exactly right and goes
+        // out directly, on the spot.
+        let (ev, hdr, crop) = (self.ev, self.hdr, self.crop);
+        let (view_w, view_h) = (self.img_w.max(1), self.img_h.max(1));
+        let slice = move |lin: &[i32], w: usize, h: usize| -> (Vec<i32>, usize, usize) {
+            match crop {
+                // The crop is in VIEW pixels; the full render is a different resolution, so it scales.
+                Some((x0, y0, x1, y1)) => {
+                    let (sx, sy) = (w as f32 / view_w as f32, h as f32 / view_h as f32);
+                    let (x0, x1) = ((x0 as f32 * sx) as usize, ((x1 as f32 * sx) as usize).min(w));
+                    let (y0, y1) = ((y0 as f32 * sy) as usize, ((y1 as f32 * sy) as usize).min(h));
+                    let (cw, ch) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+                    let mut sub = Vec::with_capacity(cw * ch * 3);
+                    for y in y0..y1 {
+                        sub.extend_from_slice(&lin[(y * w + x0) * 3..(y * w + x1) * 3]);
+                    }
+                    (sub, cw, ch)
                 }
-                crate::convert::export_srgb_jpeg(&sub, cw, ch, self.ev, self.hdr, &out)?;
+                None => (lin.to_vec(), w, h),
             }
-            None => crate::convert::export_srgb_jpeg(&self.lin, self.img_w, self.img_h, self.ev, self.hdr, &out)?,
+        };
+        match (self.dec.clone(), self.wake.clone()) {
+            (Some(dec), Some(wake)) => {
+                self.busy = Some(("Exporting…".to_string(), 0.));
+                let out2 = out.clone();
+                std::thread::Builder::new()
+                    .name("opsin-export".into())
+                    .spawn(move || {
+                        let w2 = wake.clone();
+                        let r = crate::convert::to_linear_full(&dec, crate::convert::Target::Rec2020, &move |p| {
+                            let _ = w2.send(Msg::ExportProgress(p * 0.8));
+                        })
+                        .and_then(|(w, h, lin)| {
+                            let _ = wake.send(Msg::ExportProgress(0.85));
+                            let (sub, cw, ch) = slice(&lin, w, h);
+                            crate::convert::export_srgb_jpeg(&sub, cw, ch, ev, hdr, &out2).map(|_| out2.clone())
+                        });
+                        let _ = wake.send(Msg::ExportDone(r));
+                    })
+                    .ok();
+                Ok(None)
+            }
+            _ => {
+                // No decode to re-render (or no way to report): the view buffer it is.
+                let (sub, cw, ch) = slice(&self.lin, self.img_w, self.img_h);
+                crate::convert::export_srgb_jpeg(&sub, cw, ch, ev, hdr, &out)?;
+                Ok(Some(out))
+            }
         }
-        Ok(Some(out))
     }
 
     fn export(&mut self) {
@@ -1245,7 +1349,7 @@ impl View {
             return;
         }
         let code = crate::convert::rotate_code(self.raw.orient, cw);
-        if let Some(dec) = self.dec.as_mut() {
+        if let Some(dec) = self.dec.as_mut().map(std::sync::Arc::make_mut) {
             let op = vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] };
             match &mut dec.img.view {
                 Some(v) => match v.ops.iter_mut().find(|o| o.name == "orientation") {
@@ -1293,6 +1397,92 @@ impl View {
         self.btn_clip.set_fill(self.clip_show.then_some(CLIP_ON_FILL));
         self.reencode();
         ctx.window.request_redraw();
+    }
+
+    /// Histogram source: rendered light ↔ raw ADC codes. `Out` bins `lin`, the buffer the picture is
+    /// encoded from, so the plot and the screen agree about where the data sits and what clips —
+    /// the only way they can, since the display matrix mixes channels. `Raw` bins the sensor's own
+    /// codes per CFA channel, pre-matrix and pre-debayer: what the capture holds, hot pixels and CFA
+    /// phase included, with each channel scaled by the gain the render gives it so the two modes
+    /// agree on a neutral subject and part company exactly where the colour transform does.
+    fn toggle_hist_source(&mut self, ctx: &mut Context) {
+        self.hist_raw = !self.hist_raw;
+        self.btn_source.set_label(if self.hist_raw { "Raw" } else { "Out" });
+        ctx.window.request_redraw();
+    }
+
+    /// Weave the demosaic in behind the preview: the binned render is on screen in milliseconds, then
+    /// RCD re-renders the same decode at the sensor's own resolution and swaps in when it lands
+    /// (Nick 2026-10-05: "can we weave in the debayer after the initial loads?"). The composition is
+    /// held in relative terms — a centre fraction and a span-relative zoom — so the only thing the
+    /// swap has to re-base is `zoom_rel`, which halves as the buffer doubles, and the crop rect, which
+    /// is in display pixels. Dropped if the operator has moved on (generation), and never started for
+    /// a host that folded the display copy to save memory (a phone), a live frame, a non-Bayer tile,
+    /// or a sensor big enough that the full buffer would be the memory problem the fold was avoiding.
+    fn start_preview_upgrade(&mut self) {
+        #[cfg(feature = "live")]
+        if self.live.is_some() {
+            return;
+        }
+        if self.raw.fold_w != self.raw.or_w || self.raw.fold_h != self.raw.or_h {
+            return;
+        }
+        let (Some(dec), Some(wake)) = (self.dec.clone(), self.wake.clone()) else { return };
+        let full = dec.img.width * dec.img.height;
+        // 12 bytes a pixel for the linear buffer, 4 more for the display copy.
+        if full <= self.img_w * self.img_h || full > 64 << 20 {
+            return;
+        }
+        let frame_gen = self.frame_gen;
+        std::thread::Builder::new()
+            .name("opsin-preview".into())
+            .spawn(move || {
+                let r = crate::convert::to_linear_full(&dec, crate::convert::Target::Rec2020, &|_| {});
+                let _ = wake.send(Msg::Preview(frame_gen, r));
+            })
+            .ok();
+    }
+
+    /// Swap a finished demosaic in under the live composition.
+    fn finish_preview_upgrade(&mut self, frame_gen: u64, r: Result<(usize, usize, Vec<i32>), String>, ctx: &mut Context) {
+        if frame_gen != self.frame_gen || self.img_w == 0 {
+            return;
+        }
+        let Ok((w, h, lin)) = r else { return };
+        if w <= self.img_w {
+            return;
+        }
+        // Hold the picture exactly where it is: the image's on-screen size is `img_w × zoom`, so the
+        // relative zoom scales down by however much the buffer grew.
+        let (sx, sy) = (w as f32 / self.img_w as f32, h as f32 / self.img_h as f32);
+        self.zoom_rel /= sx;
+        self.crop = self.crop.map(|(x0, y0, x1, y1)| {
+            (((x0 as f32 * sx) as usize).min(w), ((y0 as f32 * sy) as usize).min(h), ((x1 as f32 * sx) as usize).min(w), ((y1 as f32 * sy) as usize).min(h))
+        });
+        self.img_w = w;
+        self.img_h = h;
+        self.lin = lin;
+        // The cursor bridge maps a display pixel back to the oriented sensor grid by this ratio.
+        self.raw.fold_w = w;
+        self.raw.fold_h = h;
+        self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+        self.tools.refresh_thumb(&self.pixels, w, h);
+        self.preview_full = true;
+        ctx.window.request_redraw();
+    }
+
+    /// Raise a confirmation over the image for [`TOAST_SECS`], and schedule the repaint that clears it.
+    fn say(&mut self, text: impl Into<String>) {
+        self.toast = Some((text.into(), std::time::Instant::now()));
+        if let Some(wake) = self.wake.clone() {
+            std::thread::Builder::new()
+                .name("opsin-toast".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs_f32(TOAST_SECS + 0.1));
+                    let _ = wake.send(Msg::Tick);
+                })
+                .ok();
+        }
     }
 
     /// Frame-info HUD on/off — the `I` key and the Info pill share this; the pill's fill tracks the state.
@@ -1371,7 +1561,7 @@ impl View {
                 Ok(loaded) => self.install(loaded, ctx),
                 Err(e) => eprintln!("opsin: {}: {e}", path.display()),
             }
-            if let Some(dec) = self.dec.as_mut() {
+            if let Some(dec) = self.dec.as_mut().map(std::sync::Arc::make_mut) {
                 if let Some(e) = dec.img.profile.as_mut().and_then(|p| p.entries.first_mut()) {
                     e.tier = vsf::spectral_image::ProfileTier::Unit;
                     e.class = vsf::spectral_image::IdtClass::Relative;
@@ -1544,6 +1734,37 @@ impl View {
             #[cfg(feature = "calibrate")]
             Msg::Scan(path, result) => {
                 self.finish_scan(path, result, ctx);
+                true
+            }
+            Msg::Preview(frame_gen, r) => {
+                self.finish_preview_upgrade(frame_gen, r, ctx);
+                true
+            }
+            Msg::Tick => {
+                ctx.window.request_redraw();
+                true
+            }
+            Msg::ExportProgress(p) => {
+                if let Some((_, v)) = self.busy.as_mut() {
+                    *v = p;
+                }
+                ctx.window.request_redraw();
+                true
+            }
+            Msg::ExportDone(r) => {
+                self.busy = None;
+                match r {
+                    Ok(p) => {
+                        println!("opsin: wrote {}", p.display());
+                        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        self.say(format!("Saved {name}"));
+                    }
+                    Err(e) => {
+                        eprintln!("opsin: export failed: {e}");
+                        self.say(format!("Export failed: {e}"));
+                    }
+                }
+                ctx.window.request_redraw();
                 true
             }
             #[cfg(feature = "live")]
@@ -1760,8 +1981,15 @@ impl View {
                     }
                     Key::Character(c) if c.eq_ignore_ascii_case("v") => {
                         match self.convert_current_to_vsf() {
-                            Ok(out) => println!("opsin: wrote {}", out.display()),
-                            Err(e) => eprintln!("opsin: convert to VSF failed: {e}"),
+                            Ok(out) => {
+                                println!("opsin: wrote {}", out.display());
+                                let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                self.say(format!("Saved {name}"));
+                            }
+                            Err(e) => {
+                                eprintln!("opsin: convert to VSF failed: {e}");
+                                self.say(format!("Convert failed: {e}"));
+                            }
                         }
                         EventResponse::Handled
                     }
@@ -1855,7 +2083,7 @@ impl View {
     /// Every pill, for hover flips and press polling.
     fn buttons_mut(&mut self) -> Vec<&mut fluor::widgets::Button> {
         #[allow(unused_mut)]
-        let mut pills: Vec<&mut fluor::widgets::Button> = vec![&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_info, &mut self.btn_hdr, &mut self.btn_crop, &mut self.btn_rot_ccw, &mut self.btn_rot_cw, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip];
+        let mut pills: Vec<&mut fluor::widgets::Button> = vec![&mut self.btn_one, &mut self.btn_fit, &mut self.btn_export, &mut self.btn_info, &mut self.btn_hdr, &mut self.btn_crop, &mut self.btn_rot_ccw, &mut self.btn_rot_cw, &mut self.btn_xscale, &mut self.btn_yscale, &mut self.btn_clip, &mut self.btn_source];
         #[cfg(feature = "calibrate")]
         pills.push(&mut self.btn_cal);
         #[cfg(feature = "live")]
@@ -1946,6 +2174,9 @@ impl View {
         }
         if self.btn_clip.take_click() {
             self.toggle_clip(ctx);
+        }
+        if self.btn_source.take_click() {
+            self.toggle_hist_source(ctx);
         }
     }
 
@@ -2105,11 +2336,11 @@ impl View {
             let pill_pad = hh as f32 / (1 << 4) as f32;
             let pill_band = (pill_h + pill_pad * 2.) as usize;
             if hw > 0 && hh > pill_band && !self.raw.counts.is_empty() {
-                // Four pills must fit the row: shrink from the 3:1 pill when the panel is narrow rather than spill over the divider.
-                let pill_w = (pill_h * 3.).min((hw as f32 - pill_pad * 5.) / 4.);
+                // Five pills must fit the row: shrink from the 3:1 pill when the panel is narrow rather than spill over the divider.
+                let pill_w = (pill_h * 3.).min((hw as f32 - pill_pad * 6.) / 5.);
                 let cy_pill = hy as f32 + pill_pad + pill_h / 2.;
                 let mut right = hx as f32 + hw as f32 - pill_pad;
-                for b in [&mut self.btn_clip, &mut self.btn_yscale, &mut self.btn_xscale, &mut self.btn_hdr] {
+                for b in [&mut self.btn_clip, &mut self.btn_source, &mut self.btn_yscale, &mut self.btn_xscale, &mut self.btn_hdr] {
                     b.set_rect(right - pill_w / 2., cy_pill, pill_w, pill_h);
                     b.set_font_size(pill_h * (3. / 4.));
                     let id = b.hit_id();
@@ -2120,12 +2351,28 @@ impl View {
             // The plot body takes the rest of the rect, below the pill band.
             let (hy, hh) = (hy + pill_band.min(hh), hh.saturating_sub(pill_band));
 
-            // Histogram body — RAW counts of WHAT'S IN VIEW, per frame, equal-energy: every visible display pixel bridges back to its sensor tile and tallies its samples into the per-ADC-code table (exact integers, no axis math per sample); the spread then deposits each code over the bin interval its quantization step covers through the active axis. Comb-free by construction; XOR stop hairlines render in panel::render_hist.
+            // Histogram body — the RENDERED light of WHAT'S IN VIEW, per frame, equal-energy: every
+            // visible display pixel tallies its three linear values into the per-level table (exact
+            // integers, no axis math per sample); the spread then deposits each level over the bin
+            // interval its quantization step covers through the active axis. Comb-free by construction;
+            // XOR stop hairlines render in panel::render_hist.
+            //
+            // This bins `lin` — display-linear Rec.2020, the light that actually reaches the eye — and
+            // NOT raw ADC codes, which is a reversal of the original "pre-matrix, pre-debayer" rule and
+            // the only way the plot can agree with the picture. A per-raw-channel histogram cannot: the
+            // display matrix MIXES channels (this camera's green output is −4.30·R + 17.30·G − 6.23·B),
+            // so a per-channel scalar is exact only for a neutral pixel. On a real frame that put green
+            // 62% off and read 0.1% clipped where the screen had 7.9% (Nick 2026-10-05: "histogram is
+            // still not matching the output"). Nothing is curved and nothing is hidden — `lin` is linear
+            // light, the axis stays linear or an explicit log2, and a stop of exposure still moves every
+            // peak exactly 2×. The raw ADC codes per CFA channel remain a cursor reading in the HUD.
             if hw > 0 && hh > 0 {
                 let bins = hw * HIST_OVERSAMPLE;
-                let codes: Vec<[u32; 3]> = if !self.raw.counts.is_empty() && self.img_w > 0 && zoom > 0. {
+                let codes: Vec<[u32; 3]> = if !self.lin.is_empty() && self.img_w > 0 && zoom > 0. {
                     use rayon::prelude::*;
+                    let lin = &self.lin;
                     let raw = &self.raw;
+                    let hist_raw = self.hist_raw && !raw.counts.is_empty();
                     let (img_w, img_h) = (self.img_w, self.img_h);
                     (area_y0..area_y1)
                         .into_par_iter()
@@ -2138,7 +2385,16 @@ impl View {
                                     for sx in area_x0..divider_px {
                                         let fx = (sx as f32 - img_ox) / zoom;
                                         if fx >= 0. && (fx as usize) < img_w {
-                                            raw.collect_codes(fx as usize, fy as usize, &mut c);
+                                            if hist_raw {
+                                                // Pre-matrix, pre-debayer: the display pixel bridges back to its sensor tile and every sample lands under its own CFA channel.
+                                                raw.collect_codes(fx as usize, fy as usize, &mut c);
+                                            } else {
+                                                let i = (fy as usize * img_w + fx as usize) * 3;
+                                                // Out-of-range light is real and kept signed in `lin`; it bins at the ends, where the clip spikes live.
+                                                for ch in 0..3 {
+                                                    c[lin[i + ch].clamp(0, 65535) as usize][ch] += 1;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -2159,7 +2415,8 @@ impl View {
                 } else {
                     vec![[0u32; 3]; 1 << 16]
                 };
-                let dens = self.raw.spread(&codes, self.hist_xlog, bins, self.ev.exp2());
+                let domain = if self.hist_raw && !self.raw.counts.is_empty() { self.raw.domain() } else { Domain::display(self.raw.bits) };
+                let dens = domain.spread(&codes, self.hist_xlog, bins, self.ev.exp2());
                 // Stop hairlines at oversampled-bin precision: every whole stop from saturation down to the sensor's bit floor — equally spaced in log, halving positions in linear.
                 let stop_bins: Vec<usize> = if self.raw.counts.is_empty() {
                     Vec::new()
@@ -2297,6 +2554,36 @@ impl View {
             paint::fill_rect(canvas, (divider_px + 1) as isize, area_y0 as isize, (area_x1.saturating_sub(divider_px + 1)) as isize, (area_y1 - area_y0) as isize, PANEL_BG, clip, None);
         }
 
+        // Progress bar and confirmation toast — centred over the image area, drawn BEFORE the image
+        // like the HUD so the under-compose order puts them on top. The bar is whatever long job is
+        // running (a full-resolution export takes ~0.8 s of demosaic on a 12 MP frame); the toast is
+        // the receipt, and fades on its own via the Tick its timer raises.
+        if self.img_w > 0 {
+            let bandf = band as f32;
+            let font = bandf * 0.9;
+            let (cx, cy) = (((area_x0 + divider_px) / 2) as f32, ((area_y0 + area_y1) / 2) as f32);
+            if let Some((label, p)) = self.busy.clone() {
+                let bw = ((divider_px - area_x0) as f32 * 0.4).max(bandf * 6.);
+                let bh = bandf * 0.5;
+                let (bx, by) = (cx - bw / 2., cy - bh / 2.);
+                // Fill first, trough second: fluor composes front-to-back, so the later rect shows only where the earlier one did not.
+                paint::fill_rect(canvas, bx as isize, by as isize, (bw * p.clamp(0., 1.)) as isize, bh as isize, METER_GREEN, clip, None);
+                paint::fill_rect(canvas, bx as isize, by as isize, bw as isize, bh as isize, METER_TROUGH, clip, None);
+                text.draw_text_center(canvas, &format!("{label}  {:.0}%", p * 100.), cx, by - bandf * 0.6, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
+            }
+            if let Some((msg, raised)) = self.toast.clone() {
+                let age = raised.elapsed().as_secs_f32();
+                if age < TOAST_SECS {
+                    let ty = area_y1 as f32 - bandf * 3.;
+                    let tw = text.measure_text(&msg, &fluor::text::TextStyle::new(font, TEXT_GREY)) + bandf * 2.;
+                    text.draw_text_center(canvas, &msg, cx, ty, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
+                    paint::fill_rect(canvas, (cx - tw / 2.) as isize, (ty - bandf * 0.8) as isize, tw as isize, (bandf * 1.6) as isize, HUD_BG, clip, None);
+                } else {
+                    self.toast = None;
+                }
+            }
+        }
+
         // Frame info HUD — bottom-left of the image area, drawn BEFORE the image so the under-compose order puts it on top: the static frame lines, then the live view state and the cursor readout (raw ADC codes of every sample in the tile under the cursor + the linear display value). A translucent dark backdrop keeps it legible over any content.
         if self.show_info && self.img_w > 0 && !self.plain {
             let bandf = band as f32;
@@ -2307,6 +2594,7 @@ impl View {
             let mut lines = self.frame_lines.clone();
             // With a baseline in play the slider's 0 is not "no gain" — it is "as the file says", so the HUD spells out both and their sum rather than leaving the difference invisible.
             let ev_part = if self.baseline_ev.abs() > 1e-4 { format!("EV {:+.2}  baseline {:+.2}  total {:+.2}", self.ev, self.baseline_ev, self.total_ev()) } else { format!("EV {:+.2}", self.ev) };
+            let ev_part = format!("{ev_part}  {}", if self.preview_full { "RCD" } else { "binned" });
             lines.push(format!("{ev_part}  zoom {}x  clip {}  hdr {}", trim_f(zoom as f64, 3), if self.clip_show { "on" } else { "off" }, if self.hdr { "on (3x−x³)/2" } else { "off" }));
             if let Some((x0, y0, x1, y1)) = self.crop {
                 lines.push(format!("crop {x0},{y0}  {}×{}  (click: nearest corner to cursor)", x1 - x0, y1 - y0));
@@ -2502,6 +2790,7 @@ impl Container for View {
         f(&mut self.btn_xscale);
         f(&mut self.btn_yscale);
         f(&mut self.btn_clip);
+        f(&mut self.btn_source);
         f(&mut self.ev_slider);
     }
 }
@@ -2680,6 +2969,39 @@ mod tests {
     }
 
     #[test]
+    /// The display domain puts a rendered level exactly where the screen has it: a buffer sitting at
+    /// a quarter of display white bins at a quarter of the way along, a stop of exposure doubles that,
+    /// and light past white lands in the clip bin. This is the agreement the raw-count histogram could
+    /// never hold once the colour matrix mixed channels (2026-10-05).
+    #[test]
+    fn display_domain_bins_rendered_light_where_it_renders() {
+        let bins = 64;
+        let peak = |d: &Vec<[f32; 3]>, ch: usize| d.iter().enumerate().max_by(|a, b| a.1[ch].total_cmp(&b.1[ch])).map(|(i, _)| i).unwrap();
+        for frac in [0.25f32, 0.5, 0.75] {
+            let mut codes = vec![[0u32; 3]; 1 << 16];
+            codes[(frac * 65535.) as usize] = [100, 100, 100];
+            let d = Domain::display(16).spread(&codes, false, bins, 1.);
+            for ch in 0..3 {
+                let want = (frac * bins as f32) as usize;
+                assert!(peak(&d, ch).abs_diff(want) <= 1, "frac {frac} ch {ch}: binned at {} want {want}", peak(&d, ch));
+            }
+            // A stop of exposure moves it exactly 2× — the rule that outlives the domain change —
+            // until it runs out of screen, where it clips like the picture does.
+            let d2 = Domain::display(16).spread(&codes, false, bins, 2.);
+            let (a, b) = (peak(&d, 0), peak(&d2, 0));
+            if frac * 2. <= 1. {
+                assert!((b as i32 - 2 * a as i32).abs() <= 1, "a stop must double: {a} → {b}");
+            } else {
+                assert_eq!(b, bins - 1, "past white a stop must clip, not wrap: {a} → {b}");
+            }
+        }
+        // Light past display white collapses into the clip bin.
+        let mut codes = vec![[0u32; 3]; 1 << 16];
+        codes[65535] = [77, 77, 77];
+        let d = Domain::display(16).spread(&codes, false, bins, 1.);
+        assert!(d[bins - 1][0] >= 77. * 0.99, "over-white belongs in the clip bin, got {}", d[bins - 1][0]);
+    }
+
     fn spread_gain_shifts_bins_and_grows_clip_spike() {
         let raw = RawView { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [65535.; 3], bits: 16, orient: 1, pre_w: 0, pre_h: 0, or_w: 0, or_h: 0, fold_w: 0, fold_h: 0, census: [1.; 3], gains: [1.; 3] };
         let bins = 64;
@@ -2706,5 +3028,60 @@ mod tests {
         let s = raw.samples_at(3, 1);
         assert_eq!(s[0], (0, (2 * 8 + 6) as u16));
         assert!(raw.samples_at(4, 0).is_empty(), "past the folded width is off-image");
+    }
+}
+
+#[cfg(test)]
+mod preview_upgrade_tests {
+    use super::*;
+
+    /// A wake sender that just collects what the view hands it.
+    struct Collect(std::sync::Mutex<std::sync::mpsc::Sender<Msg>>);
+    impl fluor::host::WakeSender<Msg> for Collect {
+        fn send(&self, event: Msg) -> Result<(), fluor::host::WakeError> {
+            self.0.lock().unwrap().send(event).map_err(|_| fluor::host::WakeError { event_type: "Msg" })
+        }
+    }
+
+    /// The image opsin was LAUNCHED on must upgrade too. It is loaded before the host's event loop
+    /// exists, so `View::new` has no wake sender and cannot report a demosaic — the upgrade has to be
+    /// kicked again when that sender arrives. Without this the launched frame stayed binned forever
+    /// and only arrowing to another one ever sharpened (2026-10-05).
+    #[test]
+    fn the_launched_frame_upgrades_once_the_wake_sender_arrives() {
+        let (w, h) = (64usize, 48usize);
+        let counts: Vec<u16> = (0..w * h).map(|i| (8000 + (i % 97) * 60) as u16).collect();
+        let img = vsf::spectral_image::SpectralImage {
+            width: w,
+            height: h,
+            channels: ["R", "G", "B"].into_iter().map(|n| vsf::spectral_image::SpectralChannel { name: n.to_string(), curve: None }).collect(),
+            layout: vsf::spectral_image::PlaneLayout::Mosaic { cfa: vsf::Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1]) },
+            samples: vsf::BitPackedTensor::pack(16, vec![h, w], &counts),
+            black: vec![0.; 3],
+            white: vec![65535.; 3],
+            make: String::new(),
+            model: String::new(),
+            provenance: vsf::spectral_image::Provenance::default(),
+            profile: None,
+            view: None,
+        };
+        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0. };
+        let loaded = Loaded::from_decoded(dec, None, "t.dng", 0, None, true).unwrap();
+        assert_eq!((loaded.w, loaded.h), (w / 2, h / 2), "the view starts on the binned render");
+        let mut counter: HitId = 0;
+        let mut view = View::new(loaded, &mut counter);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        view.set_wake(std::sync::Arc::new(Collect(std::sync::Mutex::new(tx))));
+
+        let msg = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the upgrade must report back");
+        match msg {
+            Msg::Preview(frame_gen, Ok((uw, uh, lin))) => {
+                assert_eq!(frame_gen, view.frame_gen);
+                assert_eq!((uw, uh), (w, h), "the upgrade is the sensor's own resolution");
+                assert_eq!(lin.len(), w * h * 3);
+            }
+            other => panic!("expected a preview upgrade, got {}", match other { Msg::Tick => "Tick", _ => "something else" }),
+        }
     }
 }
