@@ -367,19 +367,70 @@ impl Domain {
 /// `clip_show` is lumis's `preview_sub` indicator relocated to opsin's one display clamp — HERE, after the magic-9 and the EV gain, so it marks what is clipping AT DISPLAY under the current exposure and moves live with the slider. Channel-wise, same inversion as lumis: a channel at/over display white renders DARK, a channel below zero renders BLOWN. Indicator-only — `lin` is never touched, so re-encodes and the JPEG export (which takes `lin` directly) stay clean of it by construction.
 ///
 /// `hdr` applies the highlight rolloff [`crate::convert::hdr_rail`] after the clamp and before the transfer — per channel, in linear, exactly where oriel applies its `sin(πx/2)` twin. A second 64Ki LUT bakes curve+sqrt together, so the per-pixel cost is unchanged. The clip indicator is untouched by it: the inversion fires on the pre-curve over/under test, and `f(1) = 1` keeps "at display white" meaning the same thing.
+/// Display-linear 0..65535 → 0..255: the highlight rolloff when `hdr`, then the sqrt transfer. The single definition of the tone the viewer shows — [`encode_pixels`] bakes the channel-inverted form of this into its own LUT, and the calibration overlay indexes it directly, so the overlay can never land on a different tone than the capture beneath it.
+pub fn display_tone(hdr: bool) -> &'static [u8] {
+    static LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    static LUT_HDR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    fn build(hdr: bool) -> Vec<u8> {
+        (0..65536u32)
+            .map(|v| {
+                let x = if hdr { crate::convert::hdr_rail(v as i64) as f32 } else { v as f32 };
+                ((x / 65535.).sqrt() * 255.) as u8
+            })
+            .collect()
+    }
+    if hdr { LUT_HDR.get_or_init(|| build(true)) } else { LUT.get_or_init(|| build(false)) }
+}
+
+/// Display LIGHT, added at the very end of an encode — after the exposure gain, the clip test and the HDR rolloff, still linear, right before the transfer — so it reaches the screen at exactly its own level whatever the exposure: an emissive layer, not a lit surface. Display-linear 0..65535 per channel over the rect (x0, y0, w, h) of a frame `frame_w` wide. The calibration logo is its user: chameleon paints the logo cell true black and hands over the logo's coverage, opsin turns it into white text and an illuminant-E spectrum and adds it here (Nick 2026-10-07: "I want the logo to look emissive so all in terms of display… normalization on text distinct from rainbow and done at the last step").
+pub struct Emissive {
+    pub frame_w: usize,
+    pub x0: usize,
+    pub y0: usize,
+    pub w: usize,
+    pub h: usize,
+    pub rgb: Vec<[u16; 3]>,
+}
+
+impl Emissive {
+    /// The light at frame pixel (x, y); zero outside the rect.
+    #[inline]
+    pub fn at(&self, x: usize, y: usize) -> [u16; 3] {
+        if x < self.x0 || y < self.y0 || x >= self.x0 + self.w || y >= self.y0 + self.h {
+            return [0; 3];
+        }
+        self.rgb[(y - self.y0) * self.w + (x - self.x0)]
+    }
+
+    /// The one place emissive light meets an encode: `t` is the channel already through exposure, clamp and rolloff (display-linear 0..65535), `e` the light. Their sum goes through the bare transfer — the rolloff is behind it, so the light lands at exactly its own value. Shared by the viewer's frame encode and its overlay draw.
+    #[inline]
+    pub fn lit(t: i64, e: u16) -> u8 {
+        display_tone(false)[(t + e as i64).clamp(0, 65535) as usize]
+    }
+}
+
 pub fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool, hdr: bool) -> Vec<u32> {
+    encode_pixels_lit(lin, ev, clip_show, hdr, None)
+}
+
+/// [`encode_pixels`] with an [`Emissive`] layer added at the last step. A lit pixel skips the clip indicator: it is light the display was told to emit, and "at white" is exactly where its text is meant to sit.
+pub fn encode_pixels_lit(lin: &[i32], ev: f32, clip_show: bool, hdr: bool, emissive: Option<&Emissive>) -> Vec<u32> {
     use rayon::prelude::*;
     const GAIN_SHIFT: u32 = 1 << 4;
     static LUT: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
     static LUT_HDR: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    let lut = if hdr {
-        LUT_HDR.get_or_init(|| (0..65536u32).map(|v| 255 - ((crate::convert::hdr_rail(v as i64) as f32 / 65535.).sqrt() * 255.) as u32).collect())
-    } else {
-        LUT.get_or_init(|| (0..65536u32).map(|v| 255 - ((v as f32 / 65535.).sqrt() * 255.) as u32).collect())
-    };
+    let inv = |hdr: bool| display_tone(hdr).iter().map(|&v| 255 - v as u32).collect::<Vec<u32>>();
+    let lut = if hdr { LUT_HDR.get_or_init(|| inv(true)) } else { LUT.get_or_init(|| inv(false)) };
     let gain = (2f64.powf(ev as f64) * (1u64 << GAIN_SHIFT) as f64).round() as i64;
+    let rolled = |g: i64| if hdr { crate::convert::hdr_rail(g) } else { g };
     lin.par_chunks_exact(3)
-        .map(|px| {
+        .enumerate()
+        .map(|(i, px)| {
+            let e = emissive.map_or([0; 3], |em| em.at(i % em.frame_w.max(1), i / em.frame_w.max(1)));
+            if e != [0; 3] {
+                let ch = |v: i32, e: u16| 255 - Emissive::lit(rolled(((v as i64 * gain) >> GAIN_SHIFT).clamp(0, 65535)), e) as u32;
+                return fluor::theme::fmt(0xFF000000 | (ch(px[0], e[0]) << 16) | (ch(px[1], e[1]) << 8) | ch(px[2], e[2]));
+            }
             let ch = |v: i32| {
                 let g = (v as i64 * gain) >> GAIN_SHIFT;
                 let idx = if clip_show {
@@ -681,6 +732,8 @@ pub struct View {
     /// Target-scan state (`calibrate` feature): the solved overlay in raw coordinates, the one-line readout for the HUD, and whether a scan is in flight (the pill reads "Scanning…").
     #[cfg(feature = "calibrate")]
     cal_overlay: Option<crate::calibrate::Overlay>,
+    /// The live frame's emissive layer (the calibration logo while the solved overlay shows), in the frame's own pixel grid; `None` for files and between overlays.
+    emissive: Option<std::sync::Arc<Emissive>>,
     #[cfg(feature = "calibrate")]
     cal_readout: Option<String>,
     #[cfg(feature = "calibrate")]
@@ -805,6 +858,7 @@ impl View {
             plain_changed: false,
             #[cfg(feature = "calibrate")]
             cal_overlay: None,
+            emissive: None,
             #[cfg(feature = "calibrate")]
             cal_readout: None,
             #[cfg(feature = "calibrate")]
@@ -924,6 +978,11 @@ impl View {
     /// Total display gain in stops: the operator's slider PLUS the file's declared opening gain. The screen gets the baseline half thru the characterization matrix (`display_matrix` folds in `2^baseline`, so it is already inside `lin`) and the slider half at the encode boundary — so anything that has to agree with the screen and works from RAW COUNTS, like the histogram, has to add both. Having one definition is the point: when the baseline landed in the matrix and the histogram kept using the slider alone, the two silently diverged by exactly the baseline.
     fn total_ev(&self) -> f32 {
         self.ev + self.baseline_ev
+    }
+
+    /// Re-encode the frame for the screen: exposure, clip indicator, rolloff, and the live frame's emissive layer added last.
+    fn encode(&mut self) {
+        self.pixels = encode_pixels_lit(&self.lin, self.ev, self.clip_show, self.hdr, self.emissive.as_deref());
     }
 
     /// Every hit id the view's widgets answer to — the host's cursor cue and press routing.
@@ -1179,7 +1238,7 @@ impl View {
         if self.lin.is_empty() {
             return;
         }
-        self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+        self.encode();
         self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
     }
 
@@ -1191,6 +1250,7 @@ impl View {
         self.img_h = loaded.h;
         self.tools = PanelTools::new(&loaded.pixels, loaded.w, loaded.h);
         self.lin = loaded.lin;
+        self.emissive = None;
         self.raw = loaded.raw;
         self.dec = loaded.dec;
         self.frame_lines = loaded.frame_lines;
@@ -1212,7 +1272,7 @@ impl View {
         self.ev_slider.set_value(slider_of_ev(self.ev, self.baseline_ev));
         if self.clip_show || self.hdr || self.ev.abs() > 1e-4 {
             // Carry the exposure and the clip indicator into the new frame (loaded.pixels were encoded plain at EV 0) — both are the operator's settings, not the frame's.
-            self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+            self.encode();
             self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
         } else {
             self.pixels = loaded.pixels;
@@ -1419,10 +1479,11 @@ impl View {
         self.img_w = oh;
         self.img_h = ow;
         self.lin = lin;
+        self.emissive = None;
         self.raw.orient = code;
         std::mem::swap(&mut self.raw.or_w, &mut self.raw.or_h);
         std::mem::swap(&mut self.raw.fold_w, &mut self.raw.fold_h);
-        self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+        self.encode();
         self.tools = PanelTools::new(&self.pixels, self.img_w, self.img_h);
         self.fit();
         ctx.window.request_redraw();
@@ -1518,7 +1579,7 @@ impl View {
         // The cursor bridge maps a display pixel back to the oriented sensor grid by this ratio.
         self.raw.fold_w = w;
         self.raw.fold_h = h;
-        self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+        self.encode();
         self.tools.refresh_thumb(&self.pixels, w, h);
         self.preview_full = true;
         ctx.window.request_redraw();
@@ -1707,7 +1768,8 @@ impl View {
                 self.img_w = f.w;
                 self.img_h = f.h;
                 self.lin = f.lin;
-                self.pixels = encode_pixels(&self.lin, self.ev, self.clip_show, self.hdr);
+                self.emissive = f.emissive;
+                self.encode();
                 // The camera's own 8-bit codes for the histogram: planar, white 255.
                 let n = f.w * f.h;
                 let mut planar = vec![0u16; n * 3];
@@ -2771,8 +2833,11 @@ impl View {
 
         // Calibration overlay — the solved target grid warped back onto the frame, drawn BEFORE the image so it composes on top. It lives in RAW mosaic coordinates: every display pixel walks the same orientation bridge as the histogram to its sensor position, then ×tile into raw space, so the overlay tracks pan, zoom, rotation and EV with the image and can never drift from it.
         #[cfg(feature = "calibrate")]
-        if let (Some(ov), true) = (&self.cal_overlay, self.img_w > 0) {
+        if let (Some(ov), Some(dec), true) = (&self.cal_overlay, self.dec.as_ref(), self.img_w > 0) {
             let gain = self.total_ev().exp2();
+            // Raw camera counts → display linear through the capture's OWN transform (re-derived per frame, so after the scan's paste+reload it is the solved IDT the pixels below are rendered with).
+            let m = crate::convert::camera_to_display(dec, crate::convert::Target::Rec2020);
+            let hdr = self.hdr;
             let (tw, th) = (self.raw.tile_w.max(1), self.raw.tile_h.max(1));
             let x0 = (img_ox.max(0.) as usize).max(area_x0);
             let y0 = (img_oy.max(0.) as usize).max(area_y0);
@@ -2798,8 +2863,19 @@ impl View {
                     if a <= 0. {
                         continue;
                     }
-                    let enc = |v: f32| ((v * gain).clamp(0., 1.).sqrt() * 255.) as u8;
-                    let colour = argb(enc(ov.rgba[i]), enc(ov.rgba[i + 1]), enc(ov.rgba[i + 2]), (a * 255.) as u8);
+                    // The capture's own tone — exposure, clamp, rolloff — then the logo's light added last, still linear (zero off the logo).
+                    let e = ov.light[i / 4];
+                    let enc = |v: f32, e: u16| {
+                        let g = ((v * gain).clamp(0., 1.) * 65535.) as i64;
+                        Emissive::lit(if hdr { crate::convert::hdr_rail(g) } else { g }, e)
+                    };
+                    let (r, g, b) = (ov.rgba[i], ov.rgba[i + 1], ov.rgba[i + 2]);
+                    let colour = argb(
+                        enc(m[0] * r + m[1] * g + m[2] * b, e[0]),
+                        enc(m[3] * r + m[4] * g + m[5] * b, e[1]),
+                        enc(m[6] * r + m[7] * g + m[8] * b, e[2]),
+                        (a * 255.) as u8,
+                    );
                     put(canvas.pixels, buf_w, sx, sy, colour);
                 }
             }
@@ -2955,6 +3031,46 @@ mod tests {
         assert_eq!(darkness_r(hdr[0]), darkness_r(plain[0]));
         // Clip indicator still fires on the pre-curve boundary under HDR.
         assert_eq!(darkness_r(encode_pixels(&[70000, 100, 100], 0., true, true)[0]), 255);
+    }
+
+    /// Emissive light lands at exactly its own display value at the last step — after EV, clip and rolloff — whatever the exposure, and leaves every unlit pixel exactly as the plain encode had it. The calibration logo rides this (Nick 2026-10-07: "normalization… done at the last step").
+    #[test]
+    fn emissive_light_lands_at_its_own_value() {
+        // Four pixels: black under white light, black under grey light, a lit pixel over a real base, an unlit one.
+        let lin = vec![0, 0, 0, 0, 0, 0, 10000, 10000, 10000, 30000, 30000, 30000];
+        let em = Emissive { frame_w: 4, x0: 0, y0: 0, w: 3, h: 1, rgb: vec![[65535; 3], [20000; 3], [20000; 3]] };
+        let plain_tone = display_tone(false);
+        for ev in [-4f32, 0., 1., 4.] {
+            for hdr in [false, true] {
+                for clip in [false, true] {
+                    let lit = encode_pixels_lit(&lin, ev, clip, hdr, Some(&em));
+                    let bare = encode_pixels(&lin, ev, clip, hdr);
+                    let r = |px: u32| 255 - darkness_r(px);
+                    assert_eq!(r(lit[0]), 255, "white light not white at ev {ev} hdr {hdr} clip {clip}");
+                    assert_eq!(r(lit[1]), plain_tone[20000] as u32, "grey light moved at ev {ev} hdr {hdr}");
+                    let gain = (2f64.powf(ev as f64) * 16.).round() as i64;
+                    let g = ((10000i64 * gain) >> 4).clamp(0, 65535);
+                    let t = if hdr { crate::convert::hdr_rail(g) } else { g };
+                    assert_eq!(r(lit[2]), plain_tone[(t + 20000).min(65535) as usize] as u32, "light not added after the rolloff");
+                    assert_eq!(lit[3], bare[3], "an unlit pixel changed");
+                }
+            }
+        }
+    }
+
+    /// The calibration overlay and the capture under it go through one tone table: the same linear value lands on the same screen value, rolloff on or off. The overlay once skipped the rolloff and read dark against an HDR frame (Nick 2026-10-07).
+    #[test]
+    fn overlay_tone_is_the_capture_tone() {
+        for hdr in [false, true] {
+            let tone = display_tone(hdr);
+            for v in [0, 1000, 8192, 20000, 32768, 50000, 65535] {
+                let px = encode_pixels(&[v, v, v], 0., false, hdr)[0];
+                assert_eq!(255 - darkness_r(px), tone[v as usize] as u32, "hdr={hdr} v={v}");
+            }
+        }
+        // The rolloff is really in the table: the midtone lifts, white stays white.
+        assert!(display_tone(true)[32768] > display_tone(false)[32768]);
+        assert_eq!(display_tone(true)[65535], display_tone(false)[65535]);
     }
 
     #[test]

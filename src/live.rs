@@ -94,6 +94,8 @@ pub struct Frame {
     pub h: usize,
     pub lin: Vec<i32>,
     pub codes: Vec<u16>,
+    /// Display light for the viewer to add at the last step of its encode (the calibration logo while the solved overlay shows), in this frame's grid.
+    pub emissive: Option<Arc<crate::view::Emissive>>,
 }
 
 /// What a live scan produced (calibrate): the HUD readout and chameleon's report.
@@ -109,6 +111,97 @@ pub enum LiveMsg {
     Level,
     #[cfg(feature = "calibrate")]
     Scan(Result<ScanReport, String>),
+}
+
+/// Byte → linear 0..65535 (gamma 2), the frame's own decode: the composite, the matrix and the viewfinder all work in these units.
+fn frame_lin_lut() -> Vec<u16> {
+    (0..256u32).map(|v| ((v as f32 / 255.).powi(2) * 65535.).round() as u16).collect()
+}
+
+/// The frame as chameleon scans it: the same gamma-2 decode as [`frame_lin_lut`], in 0..1. chameleon hands the overlay back in THESE units (scaled to the scanned white patch), so `× 65535` puts it on the frame's scale.
+#[cfg(feature = "calibrate")]
+fn scan_input(px: &[u8]) -> Vec<f32> {
+    px.iter().map(|&v| (v as f32 / 255.).powi(2)).collect()
+}
+
+/// What chameleon is told about a webcam frame: 8-bit RGB, black 0, white 1 (the scan input is already 0..1).
+#[cfg(feature = "calibrate")]
+fn webcam_raw_info() -> chameleon::RawInfo {
+    chameleon::RawInfo {
+        width: WIDTH, height: HEIGHT, rgb: true, bitdepth: 8, bitdepthold: 8, black: 0., white: 1., make: "Webcam".into(), model: "Live Capture".into(),
+        makeoffset: 0, makelen: 0, modeloffset: 0, modellen: 0, cfa: Vec::new(), cfaw: 0, cfah: 0, blackoffset: 0, blackcount: 0, blacktype: 0, orientation: 9, compression: false,
+        cam2terminal9: [-0.5, 0., 3.5, -0.25, 5., -1.5, 1.5, -0.5, 0.], magic9inv: [0; 72], magicoffset: 0, profileoffset: 0, curveoffset: 0, imagedataoffset: 0, ifdoffset: 0, duck: false, save_scan: false,
+    }
+}
+
+/// The solved overlay as live composites it, in SOURCE (pre-rotation) frame pixels: `rgba` is scene-referred (camera-linear, composited BEFORE the matrix, so it exposes like the target), `light` is the logo's display light beside it (added AFTER everything — [`stream_byte`]). `vf` is that same light in the viewfinder's rotated grid.
+struct LiveOverlay {
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    rgba: Vec<f32>,
+    light: Vec<[u16; 3]>,
+    vf: Arc<crate::view::Emissive>,
+}
+
+/// The stream's encode boundary, the viewer's rules in the viewer's order: EV gain → clip indicator (pre-rail) → clamp → HDR rail → + emissive light → transfer. `light` is display-linear 0..65535 and lands at exactly its own value whatever the exposure; a lit channel skips the clip indicator.
+#[inline]
+fn stream_byte(v: f32, light: u16, ev_gain: f32, clip: bool, hdr: bool, enc_lut: &[u8]) -> u8 {
+    let v = v * ev_gain;
+    if clip && light == 0 {
+        if v >= 65535. {
+            return enc_lut[0];
+        }
+        if v < 0. {
+            return enc_lut[65535];
+        }
+    }
+    let i = v.clamp(0., 65535.) as i64;
+    let t = if hdr { crate::convert::hdr_rail(i) } else { i };
+    enc_lut[(t + light as i64).min(65535) as usize]
+}
+
+/// Display linear 0..65535 → the loopback's byte: BT.2020 with a 2.4 transfer.
+fn stream_lut() -> Vec<u8> {
+    (0..65536u32).map(|v| ((v as f32 / 65535.).powf(1. / 2.4) * 255.).min(255.) as u8).collect()
+}
+
+/// The logo light (source grid, origin x0,y0, w×h) re-gridded for the viewfinder, which shows the frame turned 180°: source (sx, sy) → (WIDTH−1−sx, HEIGHT−1−sy).
+#[cfg(feature = "calibrate")]
+fn viewfinder_light(x0: usize, y0: usize, w: usize, h: usize, light: &[[u16; 3]]) -> crate::view::Emissive {
+    let ox0 = WIDTH.saturating_sub(x0 + w);
+    let oy0 = HEIGHT.saturating_sub(y0 + h);
+    let mut rgb = vec![[0u16; 3]; w * h];
+    for j in 0..h {
+        for i in 0..w {
+            let (ox, oy) = (ox0 + i, oy0 + j);
+            if ox >= WIDTH || oy >= HEIGHT {
+                continue;
+            }
+            let (sx, sy) = (WIDTH - 1 - ox, HEIGHT - 1 - oy);
+            if sx >= x0 && sy >= y0 && sx < x0 + w && sy < y0 + h {
+                rgb[j * w + i] = light[(sy - y0) * w + (sx - x0)];
+            }
+        }
+    }
+    crate::view::Emissive { frame_w: WIDTH, x0: ox0, y0: oy0, w, h, rgb }
+}
+
+/// A scan's overlay, ready to composite: both rasters warped by chameleon's own mesh and binned from its 2× space to frame pixels; the logo coverage turned into display light (white wordmark, illuminant-E rail in the destination space, each normalized on its own).
+#[cfg(feature = "calibrate")]
+fn live_overlay(lo: &chameleon::LiveOverlay, settings: &chameleon::CurrentSettings) -> LiveOverlay {
+    let (x0, y0, w, h, rgba) = lo.warped();
+    // RGB input: the overlay comes back at 2× — bin it to frame scale.
+    let rgba = bin2_rgba(&rgba, w, h);
+    let (_, _, _, _, cov) = lo.warped_logo();
+    let cov = bin2_rgba(&cov, w, h);
+    let rail = chameleon::logo::rail_display(settings);
+    // Normalized over the frame-pixel raster the stream actually shows: text and rail each to their own white.
+    let light: Vec<[u16; 3]> = chameleon::logo::light_layer(&cov, &rail).into_iter().map(crate::calibrate::to_light).collect();
+    let (x0, y0, w, h) = (x0 / 2, y0 / 2, w / 2, h / 2);
+    let vf = Arc::new(viewfinder_light(x0, y0, w, h, &light));
+    LiveOverlay { x0, y0, w, h, rgba, light, vf }
 }
 
 /// 2×2 box-bin an RGBA f32 raster (chameleon's `bin_rectangular` for 4 channels, bins = 2).
@@ -689,23 +782,19 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
         .name("opsin-live".into())
         .spawn(move || {
             // LUTs: camera code → linear u16 (gamma 2), and linear → loopback byte (gamma 1/2.4), as chameleon builds them.
-            let lin_lut: Vec<u16> = (0..256u32).map(|v| ((v as f32 / 255.).powi(2) * 65535.).round() as u16).collect();
-            let enc_lut: Vec<u8> = (0..65536u32).map(|v| ((v as f32 / 65535.).powf(1. / 2.4) * 255.).min(255.) as u8).collect();
+            let lin_lut = frame_lin_lut();
+            let enc_lut = stream_lut();
             let n = WIDTH * HEIGHT;
             let mut out = vec![0u8; n * 3];
             let mut lin_buf: Vec<i32> = Vec::new();
             let mut codes_buf: Vec<u16> = Vec::new();
             let mut stdin = ffmpeg.as_mut().and_then(|f| f.stdin.take());
             // (x0, y0, w, h, rgba) in un-rotated frame coordinates, display-linear white=1.
-            let mut overlay: Option<(usize, usize, usize, usize, Vec<f32>)> = None;
+            let mut overlay: Option<LiveOverlay> = None;
             #[cfg(feature = "calibrate")]
             let mut cal_settings: Option<chameleon::CurrentSettings> = None;
             #[cfg(feature = "calibrate")]
-            let mut cal_info = chameleon::RawInfo {
-                width: WIDTH, height: HEIGHT, rgb: true, bitdepth: 8, bitdepthold: 8, black: 0., white: 1., make: "Webcam".into(), model: "Live Capture".into(),
-                makeoffset: 0, makelen: 0, modeloffset: 0, modellen: 0, cfa: Vec::new(), cfaw: 0, cfah: 0, blackoffset: 0, blackcount: 0, blacktype: 0, orientation: 9, compression: false,
-                cam2terminal9: [-0.5, 0., 3.5, -0.25, 5., -1.5, 1.5, -0.5, 0.], magic9inv: [0; 72], magicoffset: 0, profileoffset: 0, curveoffset: 0, imagedataoffset: 0, ifdoffset: 0, duck: false, save_scan: false,
-            };
+            let mut cal_info = webcam_raw_info();
             let mut mic = AlignedMic::start(shared.av_delay_ms());
             send(LiveMsg::Status(match &mic {
                 Some(m) if m.active() => format!("live: {path} → {LOOPBACK}; mic → \"opsin aligned mic\" (delayed to match)"),
@@ -788,7 +877,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                     let result = match &cal_settings {
                         None => Err("chameleon settings unavailable (~/.config/Verichrome/settings.cfg)".to_string()),
                         Some(settings) => {
-                            let mut linear: Vec<f32> = px.iter().map(|&v| (v as f32 / 256.).powi(2)).collect();
+                            let mut linear = scan_input(&px);
                             match chameleon::scan_target(&mut chameleon::ImageData::F32Data(&mut linear), &mut cal_info, settings, true) {
                                 Some((_, _, _, report, warning, live, cal)) => {
                                     // chameleon live's normalization: white to the weakest row, then the green row pulled to 0.8.
@@ -813,10 +902,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                                         }
                                     }
                                     if let Some(lo) = live {
-                                        let (x0, y0, w, h, rgba) = lo.warped();
-                                        // RGB input: the overlay comes back at 2× — bin it to frame scale.
-                                        let rgba = bin2_rgba(&rgba, w, h);
-                                        overlay = Some((x0 / 2, y0 / 2, w / 2, h / 2, rgba));
+                                        overlay = Some(live_overlay(&lo, settings));
                                         shared.overlay_frames.store(45, Ordering::Relaxed);
                                     }
                                     let readout = match cal {
@@ -857,37 +943,27 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                         let (sh, sw) = (HEIGHT - 1 - h, WIDTH - 1 - w);
                         let s = (sh * WIDTH + sw) * 3;
                         let (mut r, mut g, mut b) = (lin_lut[px[s] as usize] as f32, lin_lut[px[s + 1] as usize] as f32, lin_lut[px[s + 2] as usize] as f32);
+                        let mut light = [0u16; 3];
                         if show_overlay {
-                            if let Some((x0, y0, ow, oh, ov)) = &overlay {
-                                if sw >= *x0 && sw < x0 + ow && sh >= *y0 && sh < y0 + oh {
-                                    let i = ((sh - y0) * ow + (sw - x0)) * 4;
+                            if let Some(o) = &overlay {
+                                if sw >= o.x0 && sw < o.x0 + o.w && sh >= o.y0 && sh < o.y0 + o.h {
+                                    let p = (sh - o.y0) * o.w + (sw - o.x0);
+                                    let (ov, i) = (&o.rgba, p * 4);
                                     let a = ov[i + 3];
                                     if a > 0. {
                                         r = ov[i] * 65535. * a + r * (1. - a);
                                         g = ov[i + 1] * 65535. * a + g * (1. - a);
                                         b = ov[i + 2] * 65535. * a + b * (1. - a);
                                     }
+                                    light = o.light[p];
                                 }
                             }
                         }
                         let (tr, tg, tb) = (m[0] * r + m[1] * g + m[2] * b, m[3] * r + m[4] * g + m[5] * b, m[6] * r + m[7] * g + m[8] * b);
-                        // The stream's encode boundary, the viewer's rules in the viewer's order: EV gain → clip indicator (pre-rail) → clamp → HDR rail → transfer.
-                        let enc = |v: f32| -> u8 {
-                            let v = v * ev_gain;
-                            if clip {
-                                if v >= 65535. {
-                                    return enc_lut[0];
-                                }
-                                if v < 0. {
-                                    return enc_lut[65535];
-                                }
-                            }
-                            let i = v.clamp(0., 65535.) as i64;
-                            enc_lut[if hdr { crate::convert::hdr_rail(i) } else { i } as usize]
-                        };
-                        orow[w * 3] = enc(tr);
-                        orow[w * 3 + 1] = enc(tg);
-                        orow[w * 3 + 2] = enc(tb);
+                        let enc = |v: f32, e: u16| stream_byte(v, e, ev_gain, clip, hdr, &enc_lut);
+                        orow[w * 3] = enc(tr, light[0]);
+                        orow[w * 3 + 1] = enc(tg, light[1]);
+                        orow[w * 3 + 2] = enc(tb, light[2]);
                         if let Some(l) = lrow.as_deref_mut() {
                             l[w * 3] = tr as i32;
                             l[w * 3 + 1] = tg as i32;
@@ -955,7 +1031,8 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                 }
                 if want_frame {
                     shared.frame_pending.store(true, Ordering::Relaxed);
-                    send(LiveMsg::Frame(Frame { w: WIDTH, h: HEIGHT, lin: std::mem::take(&mut lin_buf), codes: std::mem::take(&mut codes_buf) }));
+                    let emissive = overlay.as_ref().filter(|_| show_overlay).map(|o| o.vf.clone());
+                    send(LiveMsg::Frame(Frame { w: WIDTH, h: HEIGHT, lin: std::mem::take(&mut lin_buf), codes: std::mem::take(&mut codes_buf), emissive }));
                 }
             }
             drop(stdin);
@@ -971,4 +1048,134 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
             }
         })
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod light_tests {
+    use super::*;
+
+    /// The stream adds the logo's light after EV, clip and rolloff: light lands at exactly its own byte over black whatever the exposure, and a lit channel never trips the clip indicator.
+    #[test]
+    fn stream_light_lands_at_its_own_value() {
+        let lut = stream_lut();
+        for ev in [0.0625f32, 1., 16.] {
+            for hdr in [false, true] {
+                for clip in [false, true] {
+                    assert_eq!(stream_byte(0., 65535, ev, clip, hdr, &lut), 255, "white light at ev {ev} hdr {hdr} clip {clip}");
+                    assert_eq!(stream_byte(0., 20000, ev, clip, hdr, &lut), lut[20000], "grey light moved at ev {ev} hdr {hdr}");
+                }
+            }
+        }
+        // Unlit, the boundary is unchanged: overs flag under the clip indicator, and clamp without it.
+        assert_eq!(stream_byte(70000., 0, 1., true, false, &lut), lut[0]);
+        assert_eq!(stream_byte(70000., 0, 1., false, false, &lut), 255);
+    }
+
+    /// The viewfinder shows the frame turned 180°: the light must land on the same scene pixel there as in the stream.
+    #[cfg(feature = "calibrate")]
+    #[test]
+    fn viewfinder_light_turns_with_the_frame() {
+        let (x0, y0, w, h) = (10, 20, 3, 2);
+        let light: Vec<[u16; 3]> = (0..w * h).map(|i| [i as u16 + 1; 3]).collect();
+        let vf = viewfinder_light(x0, y0, w, h, &light);
+        for sy in y0..y0 + h {
+            for sx in x0..x0 + w {
+                assert_eq!(vf.at(WIDTH - 1 - sx, HEIGHT - 1 - sy), light[(sy - y0) * w + (sx - x0)], "source ({sx},{sy})");
+            }
+        }
+        assert_eq!(vf.at(0, 0), [0; 3]);
+    }
+}
+
+#[cfg(all(test, feature = "calibrate"))]
+mod overlay_tests {
+    use super::*;
+
+    /// Live's overlay must land on the frame it was solved from. A real target (chameleon's Colour.dng, rendered to an 8-bit gamma-2 4K frame the way a webcam delivers it) goes through live's own scan input, RawInfo, warp, bin and composite units; the patch wedges sit on their own patches, so they must agree. chameleon's white-level guard was `.max(1.0)`, a ceiling on this 0..1 input, and ran the overlay log2(1/white) stops hot (Nick 2026-10-07: "still at least a stop bright... this is on live").
+    #[test]
+    fn live_overlay_lands_on_the_frame() {
+        let src = std::path::Path::new("/mnt/Harbor/Code/chameleon/Colour.dng");
+        if !src.exists() {
+            return;
+        }
+        let (ok, settings) = chameleon::get_settings();
+        if !ok {
+            return;
+        }
+        let dec = crate::convert::load_any(src).unwrap();
+        let (w, h, lin) = crate::convert::to_linear(&dec).unwrap();
+        let mut sorted = lin.clone();
+        sorted.sort();
+        // Expose so the brightest patches sit well under sensor white — the case the old guard got wrong.
+        let k = 0.6 * 65535. / sorted[sorted.len() * 995 / 1000].max(1) as f32;
+        let mut px = vec![0u8; WIDTH * HEIGHT * 3];
+        for y in 0..h.min(HEIGHT) {
+            for x in 0..w.min(WIDTH) {
+                for c in 0..3 {
+                    let v = (lin[(y * w + x) * 3 + c] as f32 * k / 65535.).clamp(0., 1.);
+                    px[(y * WIDTH + x) * 3 + c] = (v.sqrt() * 255.).round() as u8;
+                }
+            }
+        }
+        let mut cal_info = webcam_raw_info();
+        let mut linear = scan_input(&px);
+        let r = chameleon::scan_target(&mut chameleon::ImageData::F32Data(&mut linear), &mut cal_info, &settings, true);
+        let (_, _, _, _, _, live, _) = r.expect("scan");
+        let lo = live.expect("overlay");
+        let o = live_overlay(&lo, &settings);
+        let (x0, y0, ow, oh, rgba) = (o.x0, o.y0, o.w, o.h, &o.rgba);
+        // The logo is light, not paint: its cell is TRUE black in the scene raster, and the light beside it is white text at exactly 65535 somewhere plus a rail at exactly 65535 in one channel somewhere, each normalized on the frame pixels the stream shows.
+        let lit: Vec<usize> = (0..o.light.len()).filter(|&p| o.light[p] != [0; 3]).collect();
+        assert!(!lit.is_empty(), "no logo light");
+        for &p in &lit {
+            let i = p * 4;
+            if rgba[i + 3] > 0.999 {
+                assert!(rgba[i..i + 3].iter().all(|&v| v == 0.), "logo cell not true black at {p}: {:?}", &rgba[i..i + 4]);
+            }
+        }
+        assert!(o.light.iter().any(|c| *c == [65535; 3]), "the wordmark never reaches display white");
+        assert!(o.light.iter().any(|c| c.contains(&65535) && c.iter().any(|&v| v < 65000)), "the rail never reaches white in a channel");
+        // And the stream shows the white text at full white at any exposure.
+        let lut = stream_lut();
+        for ev in [0.25f32, 4.] {
+            assert_eq!(stream_byte(0., 65535, ev, false, true, &lut), 255);
+        }
+        if let Some(dir) = std::env::var_os("OV_DUMP") {
+            // The overlay rect as the stream encodes it (identity matrix, ev 1, no rolloff): scene overlay composited before, logo light added last.
+            let lin_lut = frame_lin_lut();
+            let mut out = format!("P6\n{ow} {oh}\n255\n").into_bytes();
+            for sy in y0..y0 + oh {
+                for sx in x0..x0 + ow {
+                    let p = (sy - y0) * ow + (sx - x0);
+                    let s = (sy.min(HEIGHT - 1) * WIDTH + sx.min(WIDTH - 1)) * 3;
+                    let a = rgba[p * 4 + 3];
+                    for c in 0..3 {
+                        let v = rgba[p * 4 + c] * 65535. * a + lin_lut[px[s + c] as usize] as f32 * (1. - a);
+                        out.push(stream_byte(v, o.light[p][c], 1., false, false, &lut));
+                    }
+                }
+            }
+            std::fs::write(std::path::Path::new(&dir).join("live_logo.ppm"), out).unwrap();
+        }
+        let lin_lut = frame_lin_lut();
+        let (mut near, mut over, mut n) = (0usize, 0usize, 0usize);
+        for sy in y0..(y0 + oh).min(HEIGHT) {
+            for sx in x0..(x0 + ow).min(WIDTH) {
+                let i = ((sy - y0) * ow + (sx - x0)) * 4;
+                let s = (sy * WIDTH + sx) * 3;
+                let cap: f32 = (0..3).map(|c| lin_lut[px[s + c] as usize] as f32).sum();
+                let o: f32 = (0..3).map(|c| rgba[i + c] * 65535.).sum();
+                if rgba[i + 3] < 0.999 || cap < 0.02 * 65535. || o <= 0. {
+                    continue;
+                }
+                let stops = (o / cap).log2();
+                n += 1;
+                near += (stops.abs() < 1.) as usize;
+                over += (stops > 3.) as usize;
+            }
+        }
+        assert!(n > 1000, "too few comparable pixels: {n}");
+        assert!(near * 10 > n * 4, "only {near}/{n} overlay pixels within a stop of the frame");
+        assert!(over * 50 < n, "{over}/{n} overlay pixels more than 3 stops OVER the frame");
+    }
 }

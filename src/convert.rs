@@ -120,6 +120,21 @@ pub fn display_channel_gains(dec: &Decoded, target: Target) -> [f32; 3] {
     }
 }
 
+/// Camera counts ABOVE BLACK → display-linear (white = 1), the exact per-channel transform the render applies to a sample: each camera channel normalized by its own white−black range, then the display matrix. `baseline_ev` is left OUT — a caller that wants the file's opening gain multiplies `2^(baseline + operator)` itself, the way the viewer's overlay draw does. For anything drawn in raw sensor terms over the capture (the calibration overlay, which chameleon emits as raw counts scaled to the scanned white patch) — it lands on the same tone as the pixels under it by construction. Identity-over-range when there is no usable matrix, which is what the render does too.
+pub fn camera_to_display(dec: &Decoded, target: Target) -> [f32; 9] {
+    let mut m = display_matrix(&dec.img, target, 0.).unwrap_or([1., 0., 0., 0., 1., 0., 0., 0., 1.]);
+    let k = dec.img.channel_count();
+    for ch in 0..3 {
+        let black = level(&dec.img.black, ch, k, "black").unwrap_or(0.);
+        let white = level(&dec.img.white, ch, k, "white").unwrap_or(65535.);
+        let range = (white - black).max(1.);
+        for o in 0..3 {
+            m[o * 3 + ch] /= range;
+        }
+    }
+    m
+}
+
 fn display_matrix(img: &SpectralImage, target: Target, baseline_ev: f32) -> Option<[f32; 9]> {
     let gain = baseline_ev.exp2();
     let Some(profile) = img.profile.as_ref() else {
@@ -1173,6 +1188,7 @@ mod tests {
         assert_eq!(px(3), &[3, 4, 5]); // B
     }
 }
+
 
 
 
