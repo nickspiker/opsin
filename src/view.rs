@@ -20,8 +20,7 @@ use crate::panel::{HIST_OVERSAMPLE, Observer, PanelTools};
 pub const BACKDROP: u32 = 0xFF_F2_F2_F2;
 /// Panel background — a shade above the backdrop so the tool area reads as a surface.
 const PANEL_BG: u32 = 0xFF_E6_E6_E6;
-/// Const-context version of `paint::pack_argb` — same visible-RGB → α+darkness packing, in the SURFACE's byte order: fluor's `fmt` swaps R↔B on Android's RGBA_8888 buffer and is the identity elsewhere.
-/// Every pixel opsin packs itself (this, [`encode_pixels`], the navigator thumb, the histogram) takes this path; without it the whole viewer rendered red-for-blue inside photon on Android (Nick 2026-10-05, "red blue swap or something").
+/// Const-context version of `paint::pack_argb` — same visible-RGB → α+darkness packing, in the SURFACE's byte order: fluor's `fmt` swaps R↔B on Android's RGBA_8888 buffer and is the identity elsewhere. Every pixel opsin packs itself (this, [`encode_pixels`], the navigator thumb, the histogram) takes this path; without it the whole viewer rendered red-for-blue inside photon on Android (Nick 2026-10-05, "red blue swap or something").
 pub(crate) const fn argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
     fluor::theme::fmt(((a as u32) << 24) | (((255 - r) as u32) << 16) | (((255 - g) as u32) << 8) | ((255 - b) as u32))
 }
@@ -366,8 +365,7 @@ impl Domain {
 ///
 /// `clip_show` is lumis's `preview_sub` indicator relocated to opsin's one display clamp — HERE, after the magic-9 and the EV gain, so it marks what is clipping AT DISPLAY under the current exposure and moves live with the slider. Channel-wise, same inversion as lumis: a channel at/over display white renders DARK, a channel below zero renders BLOWN. Indicator-only — `lin` is never touched, so re-encodes and the JPEG export (which takes `lin` directly) stay clean of it by construction.
 ///
-/// `hdr` applies the highlight rolloff [`crate::convert::hdr_rail`] after the clamp and before the transfer — per channel, in linear, exactly where oriel applies its `sin(πx/2)` twin. A second 64Ki LUT bakes curve+sqrt together, so the per-pixel cost is unchanged. The clip indicator is untouched by it: the inversion fires on the pre-curve over/under test, and `f(1) = 1` keeps "at display white" meaning the same thing.
-/// Display-linear 0..65535 → 0..255: the highlight rolloff when `hdr`, then the sqrt transfer. The single definition of the tone the viewer shows — [`encode_pixels`] bakes the channel-inverted form of this into its own LUT, and the calibration overlay indexes it directly, so the overlay can never land on a different tone than the capture beneath it.
+/// `hdr` applies the highlight rolloff [`crate::convert::hdr_rail`] after the clamp and before the transfer — per channel, in linear, exactly where oriel applies its `sin(πx/2)` twin. A second 64Ki LUT bakes curve+sqrt together, so the per-pixel cost is unchanged. The clip indicator is untouched by it: the inversion fires on the pre-curve over/under test, and `f(1) = 1` keeps "at display white" meaning the same thing. Display-linear 0..65535 → 0..255: the highlight rolloff when `hdr`, then the sqrt transfer. The single definition of the tone the viewer shows — [`encode_pixels`] bakes the channel-inverted form of this into its own LUT, and the calibration overlay indexes it directly, so the overlay can never land on a different tone than the capture beneath it.
 pub fn display_tone(hdr: bool) -> &'static [u8] {
     static LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     static LUT_HDR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
@@ -518,30 +516,34 @@ fn frame_lines(dec: &crate::convert::Decoded, meta: Option<&crate::tiff::FrameMe
     let mut v = Vec::new();
     let size = |b: u64| if b >= 1 << 20 { format!("{:.1} MB", b as f64 / (1u64 << 20) as f64) } else { format!("{:.0} kB", b as f64 / 1024.) };
     let rat = |(n, d): (u32, u32)| if d == 0 { 0. } else { n as f64 / d as f64 };
-    let datetime = meta.and_then(|m| m.datetime.clone()).unwrap_or_default();
+    let cap = &dec.capture;
+    let datetime = if cap.at_text.is_empty() { meta.and_then(|m| m.datetime.clone()).unwrap_or_default() } else { cap.at_text.clone() };
     v.push(format!("{file_name}  {}  {datetime}", size(file_size)));
     let layout = match &img.layout {
         vsf::spectral_image::PlaneLayout::Mosaic { cfa } => format!("CFA {}×{} {:?}", cfa.shape[1], cfa.shape[0], cfa.data),
         vsf::spectral_image::PlaneLayout::Planar => "planar".to_string(),
     };
     v.push(format!("{} {}  {}×{}  {} ch  {}-bit  {layout}", img.make, img.model, img.width, img.height, img.channel_count(), dec.src_bits));
-    if let Some(m) = meta {
+    {
         let mut parts = Vec::new();
-        if let Some(f) = m.focal {
-            parts.push(format!("{} mm", trim_f(rat(f), 3)));
+        if let Some(f) = cap.focal_mm.map(|f| f as f64).or_else(|| meta.and_then(|m| m.focal).map(rat)) {
+            parts.push(format!("{} mm", trim_f(f, 3)));
         }
-        if let Some(f) = m.f_number {
-            parts.push(format!("f/{:.1}", rat(f)));
+        if let Some(f) = cap.f_number.map(|f| f as f64).or_else(|| meta.and_then(|m| m.f_number).map(rat)) {
+            parts.push(format!("f/{f:.1}"));
         }
-        if let Some(t) = m.exposure_s {
-            let t = rat(t);
+        if let Some(t) = cap.exposure_s.map(|t| t as f64).or_else(|| meta.and_then(|m| m.exposure_s).map(rat)) {
             parts.push(if t > 0. && t < 1. { format!("1/{:.0} s ({:.4} s)", 1. / t, t) } else { format!("{t:.3} s") });
         }
-        if let Some(i) = m.iso {
-            parts.push(format!("ISO {i}"));
+        if let Some(i) = cap.iso.or_else(|| meta.and_then(|m| m.iso).map(|i| i as f32)) {
+            parts.push(format!("ISO {}", trim_f(i as f64, 1)));
         }
-        if let Some(b) = m.baseline_exposure {
-            parts.push(format!("baseline {:+.2} EV", if b.1 == 0 { 0. } else { b.0 as f64 / b.1 as f64 }));
+        if dec.baseline_ev.abs() > 1e-4 {
+            parts.push(format!("baseline {:+.2} EV", dec.baseline_ev));
+        }
+        if let Some(c) = cap.location {
+            let (lat, lon) = c.to_lat_lon();
+            parts.push(format!("{lat:.5}, {lon:.5}"));
         }
         if !parts.is_empty() {
             v.push(parts.join("  "));
@@ -636,6 +638,19 @@ pub fn load_image_folded_with(path: &Path, max_edge: Option<usize>, keep_decode:
 
 /// The convert's heavy half, off the UI thread: re-decode the source, record the orientation the view showed and the view ops APPENDED to the translateration log (so the ingest-recorded orientation op rides ahead), write the VSF beside it.
 fn convert_to_vsf(src: &Path, out: &Path, code: u16, ops: Vec<vsf::spectral_image::ViewOp>) -> Result<(), String> {
+    if src == out {
+        // Edit in place: a generation carrying the view — the orientation shown, then the ops — appended to the file.
+        let mut all = Vec::with_capacity(ops.len() + 1);
+        if code != 1 {
+            all.push(vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] });
+        }
+        all.extend(ops);
+        let f = std::fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let doc = vsf::container::Document::open(f).map_err(|e| e.to_string())?;
+        let bytes = vsf::visual::Visual::still_edit_generation(&doc, "opsin", "view", &all).map_err(|e| e.to_string())?;
+        drop(doc);
+        return vsf::container::append_to_file(src, &bytes).map_err(|e| e.to_string());
+    }
     let mut dec = crate::convert::load_any(src)?;
     let op = vsf::spectral_image::ViewOp { name: "orientation".to_string(), class: vsf::spectral_image::IdtClass::Technical, params: vec![code as f32] };
     match &mut dec.img.view {
@@ -653,7 +668,7 @@ fn convert_to_vsf(src: &Path, out: &Path, code: u16, ops: Vec<vsf::spectral_imag
             None => dec.img.view = Some(vsf::spectral_image::ViewTransform { space: "vsf_rgb_linear".to_string(), ops }),
         }
     }
-    crate::convert::write_vsf(&dec.img, out)
+    crate::convert::write_vsf(&dec, out)
 }
 
 /// The viewer. See the module doc for the host contract.
@@ -720,8 +735,7 @@ pub struct View {
     export_requested: bool,
     /// A background export in flight: the label and how far along, for the bar over the image.
     busy: Option<(String, f32)>,
-    /// Which frame is on screen. Bumped by every install, so a demosaic that finishes after the
-    /// operator has arrowed on is dropped instead of landing on the wrong picture.
+    /// Which frame is on screen. Bumped by every install, so a demosaic that finishes after the operator has arrowed on is dropped instead of landing on the wrong picture.
     frame_gen: u64,
     /// The preview is the full-resolution demosaic, not the tile bin — what the HUD reports.
     preview_full: bool,
@@ -912,9 +926,7 @@ impl View {
     /// The host's wake-sender for the view's background work.
     pub fn set_wake(&mut self, wake: std::sync::Arc<dyn fluor::host::WakeSender<Msg>>) {
         self.wake = Some(wake);
-        // The FIRST image is loaded before the host's event loop exists, so `View::new` had no way to
-        // report a demosaic and skipped it. This is the moment that becomes possible — without this,
-        // the frame opsin was launched on stayed binned forever and only arrowing to another upgraded.
+        // The FIRST image is loaded before the host's event loop exists, so `View::new` had no way to report a demosaic and skipped it. This is the moment that becomes possible — without this, the frame opsin was launched on stayed binned forever and only arrowing to another upgraded.
         self.start_preview_upgrade();
     }
 
@@ -1295,13 +1307,11 @@ impl View {
         let Some(src) = self.source.clone() else {
             return Err("no source file to convert".to_string());
         };
-        if crate::sniff::sniff_path(&src) == Some(crate::sniff::Kind::Vsf) {
-            return Err("already a VSF image".to_string());
-        }
         if self.busy.is_some() {
             return Ok(None);
         }
-        let out = src.with_extension("vsf");
+        // A VSF source is edited in place: the view is appended as a generation (old bytes untouched, byte-exact undo); any other source is converted to a new VSF beside it.
+        let out = if crate::sniff::sniff_path(&src) == Some(crate::sniff::Kind::Vsf) { src.clone() } else { src.with_extension("vsf") };
         // The display orientation as the view holds it NOW (ingest's EXIF code composed with any 90° turns), and the live view ops.
         let code = self.raw.orient;
         let mut ops = Vec::new();
@@ -1358,12 +1368,7 @@ impl View {
                 return Ok(None);
             }
         };
-        // A JPEG is a DELIVERABLE, so it goes out at the sensor's own resolution: the decode is
-        // re-rendered through RCD rather than reusing the view's binned buffer (a quarter of the
-        // pixels). That costs ~0.8 s on a 12.5 MP frame, far too long to block the window, so it runs
-        // on a thread and reports progress; without a retained decode or a wake sender — a host that
-        // dropped the decode to save memory, a live frame — the view buffer is exactly right and goes
-        // out directly, on the spot.
+        // A JPEG is a DELIVERABLE, so it goes out at the sensor's own resolution: the decode is re-rendered through RCD rather than reusing the view's binned buffer (a quarter of the pixels). That costs ~0.8 s on a 12.5 MP frame, far too long to block the window, so it runs on a thread and reports progress; without a retained decode or a wake sender — a host that dropped the decode to save memory, a live frame — the view buffer is exactly right and goes out directly, on the spot.
         let (ev, hdr, crop) = (self.ev, self.hdr, self.crop);
         let (view_w, view_h) = (self.img_w.max(1), self.img_h.max(1));
         let slice = move |lin: &[i32], w: usize, h: usize| -> (Vec<i32>, usize, usize) {
@@ -1444,12 +1449,20 @@ impl View {
         self.crop = Some((ax0.min(ax1 - 1), ay0.min(ay1 - 1), ax1, ay1));
     }
 
-    /// Crop mode on/off — `X` and the Crop pill share this. On: the rect seeds as the full frame (nothing dimmed yet; pull corners in), off: cleared. Both refit, so the composition always frames what's armed.
+    /// Crop mode on/off — `X` and the Crop pill share this. On: the rect seeds as the full frame (nothing dimmed yet; pull corners in), off: cleared. Both refit, so the composition always frames what's armed. The maker's crop on the frame as it is shown now — through the CFA tile, the orientation (the file's plus any 90° turns since) and the fold. `None` when the file states no crop.
+    fn crop_suggestion(&self) -> Option<(usize, usize, usize, usize)> {
+        let r = &self.raw;
+        sensor_rect_to_display(self.dec.as_ref()?.crop_hint?, (r.tile_w, r.tile_h), r.orient, (r.pre_w, r.pre_h), (r.or_w, r.or_h), (r.fold_w, r.fold_h))
+            .map(|(x0, y0, x1, y1)| (x0.min(self.img_w), y0.min(self.img_h), x1.min(self.img_w), y1.min(self.img_h)))
+            .filter(|&(x0, y0, x1, y1)| x0 < x1 && y0 < y1)
+    }
+
+    /// Crop on: start from the maker's recommended crop when the file states one (a CR2's 5472×3648 inside the full 5568×3708 the view shows), else the whole frame. Off: back to everything.
     fn toggle_crop(&mut self, ctx: &mut Context) {
         if self.img_w == 0 {
             return;
         }
-        self.crop = if self.crop.is_none() { Some((0, 0, self.img_w, self.img_h)) } else { None };
+        self.crop = if self.crop.is_none() { Some(self.crop_suggestion().unwrap_or((0, 0, self.img_w, self.img_h))) } else { None };
         self.crop_drag = None;
         self.btn_crop.set_fill(self.crop.is_some().then_some(INFO_ON_FILL));
         self.fit();
@@ -1513,26 +1526,14 @@ impl View {
         ctx.window.request_redraw();
     }
 
-    /// Histogram source: rendered light ↔ raw ADC codes. `Out` bins `lin`, the buffer the picture is
-    /// encoded from, so the plot and the screen agree about where the data sits and what clips —
-    /// the only way they can, since the display matrix mixes channels. `Raw` bins the sensor's own
-    /// codes per CFA channel, pre-matrix and pre-debayer: what the capture holds, hot pixels and CFA
-    /// phase included, with each channel scaled by the gain the render gives it so the two modes
-    /// agree on a neutral subject and part company exactly where the colour transform does.
+    /// Histogram source: rendered light ↔ raw ADC codes. `Out` bins `lin`, the buffer the picture is encoded from, so the plot and the screen agree about where the data sits and what clips — the only way they can, since the display matrix mixes channels. `Raw` bins the sensor's own codes per CFA channel, pre-matrix and pre-debayer: what the capture holds, hot pixels and CFA phase included, with each channel scaled by the gain the render gives it so the two modes agree on a neutral subject and part company exactly where the colour transform does.
     fn toggle_hist_source(&mut self, ctx: &mut Context) {
         self.hist_raw = !self.hist_raw;
         self.btn_source.set_label(if self.hist_raw { "Raw" } else { "Out" });
         ctx.window.request_redraw();
     }
 
-    /// Weave the demosaic in behind the preview: the binned render is on screen in milliseconds, then
-    /// RCD re-renders the same decode at the sensor's own resolution and swaps in when it lands
-    /// (Nick 2026-10-05: "can we weave in the debayer after the initial loads?"). The composition is
-    /// held in relative terms — a centre fraction and a span-relative zoom — so the only thing the
-    /// swap has to re-base is `zoom_rel`, which halves as the buffer doubles, and the crop rect, which
-    /// is in display pixels. Dropped if the operator has moved on (generation), and never started for
-    /// a host that folded the display copy to save memory (a phone), a live frame, a non-Bayer tile,
-    /// or a sensor big enough that the full buffer would be the memory problem the fold was avoiding.
+    /// Weave the demosaic in behind the preview: the binned render is on screen in milliseconds, then RCD re-renders the same decode at the sensor's own resolution and swaps in when it lands (Nick 2026-10-05: "can we weave in the debayer after the initial loads?"). The composition is held in relative terms — a centre fraction and a span-relative zoom — so the only thing the swap has to re-base is `zoom_rel`, which halves as the buffer doubles, and the crop rect, which is in display pixels. Dropped if the operator has moved on (generation), and never started for a host that folded the display copy to save memory (a phone), a live frame, a non-Bayer tile, or a sensor big enough that the full buffer would be the memory problem the fold was avoiding.
     fn start_preview_upgrade(&mut self) {
         #[cfg(feature = "live")]
         if self.live.is_some() {
@@ -1566,8 +1567,7 @@ impl View {
         if w <= self.img_w {
             return;
         }
-        // Hold the picture exactly where it is: the image's on-screen size is `img_w × zoom`, so the
-        // relative zoom scales down by however much the buffer grew.
+        // Hold the picture exactly where it is: the image's on-screen size is `img_w × zoom`, so the relative zoom scales down by however much the buffer grew.
         let (sx, sy) = (w as f32 / self.img_w as f32, h as f32 / self.img_h as f32);
         self.zoom_rel /= sx;
         self.crop = self.crop.map(|(x0, y0, x1, y1)| {
@@ -1658,6 +1658,7 @@ impl View {
             clip.matrix = outcome.matrix;
             clip.illuminant = 23; // D50 — what chameleon writes.
             clip.source = format!("chameleon scan of {}", path.display());
+            clip.provenance = crate::idt::IdtProvenance::of_scan(&outcome.observer, outcome.cal.clone());
             clip.paste_into(&path, false)
         });
         match pasted {
@@ -1731,11 +1732,7 @@ impl View {
             *rec = None;
             self.btn_rec.set_fill(Some(INFO_ON_FILL));
         } else {
-            // Recordings go to the big disk, never $HOME. Live capture is 4K h264 at ~50 Mbit/s plus two
-            // PCM tracks — roughly 25 GB an hour — and the home partition is 237 GB shared with
-            // everything else. It filled mid-call on 2026-09-23; ffmpeg was killed before it could
-            // write the index, and a 30 GB unrepeatable conversation became unplayable.
-            // OPSIN_RECORD_DIR overrides; the default is the Harbor volume.
+            // Recordings go to the big disk, never $HOME. Live capture is 4K h264 at ~50 Mbit/s plus two PCM tracks — roughly 25 GB an hour — and the home partition is 237 GB shared with everything else. It filled mid-call on 2026-09-23; ffmpeg was killed before it could write the index, and a 30 GB unrepeatable conversation became unplayable. OPSIN_RECORD_DIR overrides; the default is the Harbor volume.
             let dir = std::env::var_os("OPSIN_RECORD_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/mnt/Harbor/Videos/opsin"));
@@ -2484,21 +2481,10 @@ impl View {
             // The plot body takes the rest of the rect, below the pill band.
             let (hy, hh) = (hy + pill_band.min(hh), hh.saturating_sub(pill_band));
 
-            // Histogram body — the RENDERED light of WHAT'S IN VIEW, per frame, equal-energy: every
-            // visible display pixel tallies its three linear values into the per-level table (exact
-            // integers, no axis math per sample); the spread then deposits each level over the bin
-            // interval its quantization step covers through the active axis. Comb-free by construction;
+            // Histogram body — the RENDERED light of WHAT'S IN VIEW, per frame, equal-energy: every visible display pixel tallies its three linear values into the per-level table (exact integers, no axis math per sample); the spread then deposits each level over the bin interval its quantization step covers through the active axis. Comb-free by construction;
             // XOR stop hairlines render in panel::render_hist.
             //
-            // This bins `lin` — display-linear Rec.2020, the light that actually reaches the eye — and
-            // NOT raw ADC codes, which is a reversal of the original "pre-matrix, pre-debayer" rule and
-            // the only way the plot can agree with the picture. A per-raw-channel histogram cannot: the
-            // display matrix MIXES channels (this camera's green output is −4.30·R + 17.30·G − 6.23·B),
-            // so a per-channel scalar is exact only for a neutral pixel. On a real frame that put green
-            // 62% off and read 0.1% clipped where the screen had 7.9% (Nick 2026-10-05: "histogram is
-            // still not matching the output"). Nothing is curved and nothing is hidden — `lin` is linear
-            // light, the axis stays linear or an explicit log2, and a stop of exposure still moves every
-            // peak exactly 2×. The raw ADC codes per CFA channel remain a cursor reading in the HUD.
+            // This bins `lin` — display-linear Rec.2020, the light that actually reaches the eye — and NOT raw ADC codes, which is a reversal of the original "pre-matrix, pre-debayer" rule and the only way the plot can agree with the picture. A per-raw-channel histogram cannot: the display matrix MIXES channels (this camera's green output is −4.30·R + 17.30·G − 6.23·B), so a per-channel scalar is exact only for a neutral pixel. On a real frame that put green 62% off and read 0.1% clipped where the screen had 7.9% (Nick 2026-10-05: "histogram is still not matching the output"). Nothing is curved and nothing is hidden — `lin` is linear light, the axis stays linear or an explicit log2, and a stop of exposure still moves every peak exactly 2×. The raw ADC codes per CFA channel remain a cursor reading in the HUD.
             if hw > 0 && hh > 0 {
                 let bins = hw * HIST_OVERSAMPLE;
                 let codes: Vec<[u32; 3]> = if !self.lin.is_empty() && self.img_w > 0 && zoom > 0. {
@@ -2687,10 +2673,7 @@ impl View {
             paint::fill_rect(canvas, (divider_px + 1) as isize, area_y0 as isize, (area_x1.saturating_sub(divider_px + 1)) as isize, (area_y1 - area_y0) as isize, PANEL_BG, clip, None);
         }
 
-        // Progress bar and confirmation toast — centred over the image area, drawn BEFORE the image
-        // like the HUD so the under-compose order puts them on top. The bar is whatever long job is
-        // running (a full-resolution export takes ~0.8 s of demosaic on a 12 MP frame); the toast is
-        // the receipt, and fades on its own via the Tick its timer raises. Drawn with or without an image: the first load's bar has nothing under it yet.
+        // Progress bar and confirmation toast — centred over the image area, drawn BEFORE the image like the HUD so the under-compose order puts them on top. The bar is whatever long job is running (a full-resolution export takes ~0.8 s of demosaic on a 12 MP frame); the toast is the receipt, and fades on its own via the Tick its timer raises. Drawn with or without an image: the first load's bar has nothing under it yet.
         if self.img_w > 0 || self.busy.is_some() || self.toast.is_some() {
             let bandf = band as f32;
             let font = bandf * 0.9;
@@ -2942,7 +2925,25 @@ impl Container for View {
     }
 }
 
-/// Carry a display-space rect `[x0, x1) × [y0, y1)` on an `ow × oh` frame through a 90° turn of that frame. CW maps a point (x, y) → (oh − 1 − y, x), so the x-extent becomes [oh − y1, oh − y0) and the y-extent [x0, x1); CCW maps (x, y) → (y, ow − 1 − x).
+/// Carry a display-space rect `[x0, x1) × [y0, y1)` on an `ow × oh` frame through a 90° turn of that frame. CW maps a point (x, y) → (oh − 1 − y, x), so the x-extent becomes [oh − y1, oh − y0) and the y-extent [x0, x1); CCW maps (x, y) → (y, ow − 1 − x). A SENSOR-pixel rect `[x0, y0, x1, y1)` → the displayed frame's pixel rect: the whole CFA tiles inside it, through the forward orientation, scaled by the fold (oriented tile grid → the resolution shown). The forward twin of `RawView::sensor_of`, and conservative at every rounding — the result never strays outside the sensor rect.
+fn sensor_rect_to_display(rect: [usize; 4], tile: (usize, usize), orient: u16, pre: (usize, usize), or: (usize, usize), fold: (usize, usize)) -> Option<(usize, usize, usize, usize)> {
+    let [x0, y0, x1, y1] = rect;
+    let (tw, th) = (tile.0.max(1), tile.1.max(1));
+    let (tx0, ty0) = (x0.div_ceil(tw), y0.div_ceil(th));
+    let (tx1, ty1) = ((x1 / tw).min(pre.0), (y1 / th).min(pre.1));
+    if tx1 <= tx0 || ty1 <= ty0 {
+        return None;
+    }
+    let a = crate::convert::orientation_dst(orient, pre.0, pre.1, tx0, ty0);
+    let b = crate::convert::orientation_dst(orient, pre.0, pre.1, tx1 - 1, ty1 - 1);
+    let (ox0, ox1, oy0, oy1) = (a.0.min(b.0), a.0.max(b.0) + 1, a.1.min(b.1), a.1.max(b.1) + 1);
+    // Oriented tile grid → shown grid: ceil the start, floor the end.
+    let (fx, fy) = ((fold.0, or.0.max(1)), (fold.1, or.1.max(1)));
+    let (dx0, dx1) = ((ox0 * fx.0).div_ceil(fx.1), ox1 * fx.0 / fx.1);
+    let (dy0, dy1) = ((oy0 * fy.0).div_ceil(fy.1), oy1 * fy.0 / fy.1);
+    (dx0 < dx1 && dy0 < dy1).then_some((dx0, dy0, dx1, dy1))
+}
+
 fn rotate_rect((x0, y0, x1, y1): (usize, usize, usize, usize), ow: usize, oh: usize, cw: bool) -> (usize, usize, usize, usize) {
     if cw { (oh - y1, x0, oh - y0, x1) } else { (y0, ow - x1, y1, ow - x0) }
 }
@@ -3073,6 +3074,38 @@ mod tests {
         assert_eq!(display_tone(true)[65535], display_tone(false)[65535]);
     }
 
+    /// The maker's crop lands on the frame as shown, under every orientation and both preview scales (binned, and the full-resolution upgrade): every displayed pixel inside the suggested rect maps — by the same bridge `RawView::sensor_of` walks — back inside the sensor rect, and the rect is tight, losing no whole tile (Nick 2026-10-08: "when you press the crop button it auto-sizes to the suggested manufacturer crop").
+    #[test]
+    fn maker_crop_maps_onto_the_shown_frame() {
+        // A 40×24 Bayer sensor (2×2 tiles ⇒ a 20×12 bin), maker's crop [6, 4, 34, 20) — CR2-shaped: a border on every side.
+        let (sw, sh, tile) = (40usize, 24usize, 2usize);
+        let rect = [6usize, 4, 34, 20];
+        let (pw, ph) = (sw / tile, sh / tile);
+        for orient in 1..=8u16 {
+            let (ow, oh) = if orient >= 5 { (ph, pw) } else { (pw, ph) };
+            for scale in [1usize, 2] {
+                let (fw, fh) = (ow * scale, oh * scale);
+                let (x0, y0, x1, y1) = sensor_rect_to_display(rect, (tile, tile), orient, (pw, ph), (ow, oh), (fw, fh)).expect("a crop");
+                let to_sensor = |dx: usize, dy: usize| {
+                    let (ux, uy) = (dx * ow / fw, dy * oh / fh);
+                    let (px, py) = crate::convert::orientation_src(orient, pw, ph, ux, uy);
+                    (px * tile, py * tile)
+                };
+                let inside = |(sx, sy): (usize, usize)| sx >= rect[0] && sy >= rect[1] && sx + tile <= rect[2] && sy + tile <= rect[3];
+                for dy in y0..y1 {
+                    for dx in x0..x1 {
+                        assert!(inside(to_sensor(dx, dy)), "orient {orient} scale {scale}: ({dx},{dy}) outside the maker's crop");
+                    }
+                }
+                // Tight: the whole tiles of the crop are 14×8, so the rect is exactly that many tiles, oriented and scaled.
+                let (cw, ch) = if orient >= 5 { (8, 14) } else { (14, 8) };
+                assert_eq!((x1 - x0, y1 - y0), (cw * scale, ch * scale), "orient {orient} scale {scale}");
+            }
+        }
+        // No crop inside a single tile.
+        assert_eq!(sensor_rect_to_display([1, 1, 2, 2], (2, 2), 1, (20, 12), (20, 12), (20, 12)), None);
+    }
+
     #[test]
     fn rotate_rect_rides_the_frame() {
         // A 10×4 frame, rect x∈[2,5) y∈[1,3). CW: the frame becomes 4×10, the rect's x-extent is the old y mirrored: [4−3, 4−1) = [1,3), y-extent = old x [2,5).
@@ -3136,8 +3169,7 @@ mod tests {
         assert!((total(0.) - EV_MIN).abs() < 1e-5, "full left reaches four stops BELOW the capture, not merely back to it");
         assert!((total(1.) - EV_MAX).abs() < 1e-5);
 
-        // The regression this fixes: the old mapping bottomed out at operator -4, i.e. total 0, where sensor
-        // saturation lands exactly on display white — so a blown sky stayed white however far you pulled.
+        // The regression this fixes: the old mapping bottomed out at operator -4, i.e. total 0, where sensor saturation lands exactly on display white — so a blown sky stayed white however far you pulled.
         assert!(ev_of_slider(0., b) < -4., "full left must go below -4 operator stops when the file declares +4");
 
         // "As the file says" stays reachable, and its detent slides along the track with the baseline.
@@ -3156,10 +3188,7 @@ mod tests {
     }
 
     #[test]
-    /// The display domain puts a rendered level exactly where the screen has it: a buffer sitting at
-    /// a quarter of display white bins at a quarter of the way along, a stop of exposure doubles that,
-    /// and light past white lands in the clip bin. This is the agreement the raw-count histogram could
-    /// never hold once the colour matrix mixed channels (2026-10-05).
+    /// The display domain puts a rendered level exactly where the screen has it: a buffer sitting at a quarter of display white bins at a quarter of the way along, a stop of exposure doubles that, and light past white lands in the clip bin. This is the agreement the raw-count histogram could never hold once the colour matrix mixed channels (2026-10-05).
     #[test]
     fn display_domain_bins_rendered_light_where_it_renders() {
         let bins = 64;
@@ -3172,8 +3201,7 @@ mod tests {
                 let want = (frac * bins as f32) as usize;
                 assert!(peak(&d, ch).abs_diff(want) <= 1, "frac {frac} ch {ch}: binned at {} want {want}", peak(&d, ch));
             }
-            // A stop of exposure moves it exactly 2× — the rule that outlives the domain change —
-            // until it runs out of screen, where it clips like the picture does.
+            // A stop of exposure moves it exactly 2× — the rule that outlives the domain change — until it runs out of screen, where it clips like the picture does.
             let d2 = Domain::display(16).spread(&codes, false, bins, 2.);
             let (a, b) = (peak(&d, 0), peak(&d2, 0));
             if frac * 2. <= 1. {
@@ -3230,10 +3258,7 @@ mod preview_upgrade_tests {
         }
     }
 
-    /// The image opsin was LAUNCHED on must upgrade too. It is loaded before the host's event loop
-    /// exists, so `View::new` has no wake sender and cannot report a demosaic — the upgrade has to be
-    /// kicked again when that sender arrives. Without this the launched frame stayed binned forever
-    /// and only arrowing to another one ever sharpened (2026-10-05).
+    /// The image opsin was LAUNCHED on must upgrade too. It is loaded before the host's event loop exists, so `View::new` has no wake sender and cannot report a demosaic — the upgrade has to be kicked again when that sender arrives. Without this the launched frame stayed binned forever and only arrowing to another one ever sharpened (2026-10-05).
     #[test]
     fn the_launched_frame_upgrades_once_the_wake_sender_arrives() {
         let (w, h) = (64usize, 48usize);
@@ -3252,7 +3277,7 @@ mod preview_upgrade_tests {
             profile: None,
             view: None,
         };
-        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0. };
+        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() };
         let loaded = Loaded::from_decoded(dec, None, "t.dng", 0, None, true).unwrap();
         assert_eq!((loaded.w, loaded.h), (w / 2, h / 2), "the view starts on the binned render");
         let mut counter: HitId = 0;

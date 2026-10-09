@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 use std::path::Path;
-use vsf::spectral_image::{self, ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileTier, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
+use vsf::spectral_image::{ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileTier, Provenance, SpectralChannel, SpectralImage, Transfer, ViewOp, ViewTransform};
 use vsf::{BitPackedTensor, Tensor};
 
 /// Is `path` a file the viewer lists for arrow navigation? Decided by its first bytes ([`crate::sniff`]), never its name: a file whose bytes carry a signature we decode. A file with no signature still OPENS (the headerless guesser takes it) — it just isn't swept up when arrowing thru a folder of images.
@@ -22,6 +22,12 @@ pub struct Decoded {
     pub baseline_ev: f32,
     /// The SOURCE file's sample depth, which is not `img.bit_depth()`. Every display-referred ingest expands its samples into linear u16 and packs the plane at 16, so the stored depth describes opsin's buffer, not the file — an 8-bit WebP would otherwise report itself as 16-bit in the HUD (Nick 2026-09-22: "it says 16 bit planar, and it's 8 bit three channel"). The plane's depth still drives the histogram, which reads actual stored counts; this is for the reading shown to the operator.
     pub src_bits: u8,
+    /// The maker's recommended crop, `[x0, y0, x1, y1)` in SENSOR pixel coordinates (the stored plane's own grid) — DNG `DefaultCropOrigin`/`DefaultCropSize` offset by `ActiveArea`, or a camera's published crop (a CR2's 5472×3648 inside its 5568×3708 sensor). A suggestion, never applied: the plane and the view show everything recorded, masked borders included, and the crop tool starts here when switched on (Nick 2026-10-08: "show the full area… when you press the crop button it auto-sizes to the suggested manufacturer crop").
+    pub crop_hint: Option<[usize; 4]>,
+    /// The capture facts — the exposure triangle, optics, when and where, body and lens — read from the source's headers at ingest (EXIF/DNG) or carried by a VSF visual. `baseline` is mirrored in `baseline_ev` above. What a VSF convert keeps that a DNG→JPEG loses.
+    pub capture: vsf::visual::Capture,
+    /// Foreign metadata carried verbatim across a VSF convert: XMP packet, ICC bytes, the source's profile name and calibration signature.
+    pub foreign: vsf::visual::Foreign,
 }
 
 /// Transpose a 3×3 — bridges vsf::colour's column-major storage to opsin's row-major convention. const so the bridged constants are compile-time.
@@ -90,8 +96,19 @@ fn single_entry_profile(entry: ProfileEntry) -> ColourProfile {
     ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry], dng_colormatrix: [None, None], patches: None, cal: None }
 }
 
-/// **Absolute IDT** characterization from a DNG colour matrix (`XYZ → camera`): camera → XYZ → linear **VSF RGB**, straight inversion, NO chromatic adaptation and NO scaling — the scene illuminant's cast is preserved as captured, per the VERICHROME taxonomy (chromatic adaptation / "white balance" is a Creative IDT). The matrix is stored unscaled; the illuminant code rides alongside so display can re-derive an exposure scalar. `None` if the matrix is singular. `source` names which DNG matrix this came from.
-fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<ProfileEntry> {
+/// **Absolute IDT** characterization from a DNG colour matrix (`XYZ → camera`): camera → XYZ → linear **VSF RGB**, straight inversion, NO chromatic adaptation and NO scaling — the scene illuminant's cast is preserved as captured, per the VERICHROME taxonomy (chromatic adaptation / "white balance" is a Creative IDT). The matrix is stored unscaled; the illuminant code rides alongside so display can re-derive an exposure scalar. `None` if the matrix is singular. `source` names which DNG matrix this came from. Is the file's matrix a chameleon IDT? Three ways to know: named so ("Verichrome scene-relative IDT", chameleon's own DNG); a `CameraCalibrationSignature` beginning "VERICHROME" (the appended-IFD paste, `idt.rs`) whose XMP doesn't say the pasted IDT was merely a `model`-tier transplant; or the OLD in-place paste's signature — ONE matrix in every ColorMatrix slot at D50, which a factory pair never has. The identity sentinel (an uncalibrated lumis frame) is never one.
+pub(crate) fn chameleon_idt(cm1: Option<[f32; 9]>, ill1: u16, cm2: Option<[f32; 9]>, named_verichrome: bool, uncalibrated: bool, signed: bool, xmp_tier: Option<&str>) -> bool {
+    named_verichrome
+        || (signed && xmp_tier != Some("model"))
+        || (!uncalibrated
+            && match (cm1, cm2) {
+                (Some(a), Some(b)) => a == b,
+                (Some(_), None) => ill1 == 23,
+                _ => false,
+            })
+}
+
+pub(crate) fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<ProfileEntry> {
     let cam_to_xyz = inv3(&cm)?;
     let matrix = matmul3(&XYZ_TO_VSF_RGB, &cam_to_xyz);
     Some(ProfileEntry {
@@ -104,8 +121,7 @@ fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Option<Profile
     })
 }
 
-/// The display matrix for an image: `VSF_RGB2REC2020 × (camera→VSF RGB)`, then normalized so the scene white lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. NO profile is not an error and not "uncharacterized": untagged samples ARE VSF RGB by specification, so the camera matrix is the identity and the white is Illuminant E — which XYZ→VSF RGB maps to exactly (1, 1, 1), VSF RGB being E-normalized, so for the VSF-RGB target the normalization is provably a no-op. `None` only when the target isn't VSF RGB or the result is singular ⇒ raw passthrough. `baseline_ev` is the file's declared opening gain (see [`Decoded::baseline_ev`]), folded in here as `2^ev` beside the white normalization — the same place, for the same reason: it is the file's statement, derived fresh, never stored.
-/// The linear space a render lands in. `Rec2020` is the viewer's display space; `VsfRgb` keeps the buffer in VSF RGB for a host that converts at its own display step (photon, 2026-09-11: "vsf rgb as much as possible").
+/// The display matrix for an image: `VSF_RGB2REC2020 × (camera→VSF RGB)`, then normalized so the scene white lands at display peak 1 (a legally-exposed scene doesn't clip). The scalar is DERIVED here, never stored — it depends on the monitor target. NO profile is not an error and not "uncharacterized": untagged samples ARE VSF RGB by specification, so the camera matrix is the identity and the white is Illuminant E — which XYZ→VSF RGB maps to exactly (1, 1, 1), VSF RGB being E-normalized, so for the VSF-RGB target the normalization is provably a no-op. `None` only when the target isn't VSF RGB or the result is singular ⇒ raw passthrough. `baseline_ev` is the file's declared opening gain (see [`Decoded::baseline_ev`]), folded in here as `2^ev` beside the white normalization — the same place, for the same reason: it is the file's statement, derived fresh, never stored. The linear space a render lands in. `Rec2020` is the viewer's display space; `VsfRgb` keeps the buffer in VSF RGB for a host that converts at its own display step (photon, 2026-09-11: "vsf rgb as much as possible").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Rec2020,
@@ -175,7 +191,7 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let kind = crate::sniff::sniff(&bytes);
     let known = match kind {
-        Kind::Vsf => spectral_image::read(&bytes).map(|img| Decoded { src_bits: img.bit_depth(), img, baseline_ev: 0. }).map_err(|e| e.to_string()),
+        Kind::Vsf => vsf::visual::Visual::read(&bytes).map_err(|e| e.to_string()).and_then(decoded_of_visual),
         Kind::Jxl => ingest_jxl(&bytes),
         Kind::Jpeg => ingest_jpeg(&bytes),
         Kind::WebP => ingest_webp(&bytes),
@@ -202,7 +218,82 @@ pub fn ingest_linear_vsf_rgb(w: usize, h: usize, planar: Vec<u16>, source: &str)
     dec
 }
 
-/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-tier entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL, JPEG, WebP and display-referred TIFF paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly.
+/// Assemble a display-referred ingest into a [`Decoded`]: LINEAR planar u16 RGB (transfer already un-done by the caller) + a single `Assumed`-tier entry mapping the tagged/conventional display primaries → VSF RGB. Shared by the JXL, JPEG, WebP and display-referred TIFF paths — the characterization is the format's word, not a measurement, and `Assumed` says so honestly. The view log for an EXIF Orientation (tag 274) — the capture's display-time claim, recorded verbatim and never applied to the stored plane. Codes 2..=8 are real transforms; 1 (normal), 0 and limbus's absent-sentinel 9 record nothing. Every source that carries the tag goes through here, so they all land in the same op that [`orientation_code`] reads back.
+fn orientation_view(code: u16) -> Option<ViewTransform> {
+    (2..=8).contains(&code).then(|| ViewTransform {
+        space: "vsf_rgb_linear".to_string(),
+        ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![code as f32] }],
+    })
+}
+
+/// Orientation (tag 0x0112) from an EXIF TIFF block — IFD0 only, where the tag lives. Either byte order. `None` for a malformed block or an absent tag; never panics on hostile bytes.
+fn exif_orientation(tiff: &[u8]) -> Option<u16> {
+    let le = match tiff.get(..4)? {
+        [b'I', b'I', 42, 0] => true,
+        [b'M', b'M', 0, 42] => false,
+        _ => return None,
+    };
+    let u16_at = |o: usize| tiff.get(o..o + 2).map(|b| if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) });
+    let u32_at = |o: usize| tiff.get(o..o + 4).map(|b| if le { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) });
+    let ifd = u32_at(4)? as usize;
+    let count = u16_at(ifd)? as usize;
+    (0..count).find_map(|i| {
+        let e = ifd + 2 + i * 12;
+        // SHORT (type 3), one value: it sits in the first two bytes of the value field, in the block's byte order.
+        (u16_at(e)? == 0x0112 && u16_at(e + 2)? == 3).then(|| u16_at(e + 8)).flatten()
+    })
+}
+
+/// The EXIF block of a JPEG: the APP1 segment opening `Exif\0\0`, walked marker by marker up to the scan data (EXIF must precede it).
+fn jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.get(..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut o = 2;
+    loop {
+        // Fill bytes (repeated 0xFF) may pad between segments.
+        while *bytes.get(o)? == 0xFF && *bytes.get(o + 1)? == 0xFF {
+            o += 1;
+        }
+        if *bytes.get(o)? != 0xFF {
+            return None;
+        }
+        let marker = *bytes.get(o + 1)?;
+        match marker {
+            0xDA | 0xD9 => return None,
+            0x01 | 0xD0..=0xD7 => {
+                o += 2;
+                continue;
+            }
+            _ => {}
+        }
+        let len = u16::from_be_bytes([*bytes.get(o + 2)?, *bytes.get(o + 3)?]) as usize;
+        let data = bytes.get(o + 4..o + 2 + len.max(2))?;
+        if marker == 0xE1 && data.starts_with(b"Exif\0\0") {
+            return Some(&data[6..]);
+        }
+        o += 2 + len;
+    }
+}
+
+/// The EXIF block of a WebP: the RIFF `EXIF` chunk. The spec says it holds a bare TIFF block; some writers keep JPEG's `Exif\0\0` prefix, so that is stripped when present.
+fn webp_exif(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
+        return None;
+    }
+    let mut o = 12;
+    while o + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?) as usize;
+        let data = bytes.get(o + 8..o + 8 + size)?;
+        if &bytes[o..o + 4] == b"EXIF" {
+            return Some(data.strip_prefix(b"Exif\0\0").unwrap_or(data));
+        }
+        // Chunks pad to an even length.
+        o += 8 + size + (size & 1);
+    }
+    None
+}
+
 fn display_referred(w: usize, h: usize, planar: Vec<u16>, cam_to_vsf: [f32; 9], source: &str, tier: ProfileTier, illuminant: u16, src_bits: u8) -> Decoded {
     planar_rgb(w, h, planar, Some(single_entry_profile(absolute_entry(cam_to_vsf, source, tier, illuminant))), src_bits)
 }
@@ -223,7 +314,7 @@ fn planar_rgb(w: usize, h: usize, planar: Vec<u16>, profile: Option<ColourProfil
         profile,
         view: None,
     };
-    Decoded { img, src_bits, baseline_ev: 0. }
+    Decoded { img, src_bits, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() }
 }
 
 /// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` tier, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` tier, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the tier.
@@ -280,7 +371,7 @@ fn icc8_to_linear_planar(px: &[u8], stride: usize, n: usize, trc: &[crate::icc::
     planar
 }
 
-/// JPEG → [`Decoded`]: an embedded matrix/TRC ICC (APP2) is honoured — see [`display_referred_8bit`] — else assumed sRGB (the web's defined default — same assumption every platform makes), sRGB EOTF un-done to linear via a 256-entry LUT, stored planar u16 with an sRGB→VSF-RGB `Assumed` entry.  EXIF orientation is not parsed yet (most posts are pre-rotated); greyscale JPEGs come back RGB from the decoder's requested output space.
+/// JPEG → [`Decoded`]: an embedded matrix/TRC ICC (APP2) is honoured — see [`display_referred_8bit`] — else assumed sRGB (the web's defined default — same assumption every platform makes), sRGB EOTF un-done to linear via a 256-entry LUT, stored planar u16 with an sRGB→VSF-RGB `Assumed` entry.  EXIF Orientation (APP1) is recorded as the view log's `orientation` op, like every TIFF-family source — display honours it, the stored plane stays as encoded; greyscale JPEGs come back RGB from the decoder's requested output space.
 #[allow(deprecated)]
 fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     let options = zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
@@ -294,7 +385,9 @@ fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     }
     let icc = dec.icc_profile();
     let (planar, m, source, tier, ill) = display_referred_8bit(&rgb, 3, n, icc.as_deref(), "jpeg_assumed_srgb");
-    Ok(display_referred(w, h, planar, m, &source, tier, ill, 8))
+    let mut out = display_referred(w, h, planar, m, &source, tier, ill, 8);
+    out.img.view = jpeg_exif(bytes).and_then(exif_orientation).and_then(orientation_view);
+    Ok(out)
 }
 
 /// Interleaved sRGB8 (`stride` bytes a pixel: 3 for RGB, 4 for RGBA) → LINEAR planar u16 RGB, `n` pixels. sRGB EOTF un-done via a 256-entry LUT built once per process. With a fourth byte the pixel is composited over black (the linear value scaled by alpha) — opsin has no alpha plane, and a transparent region carrying leftover colour would otherwise render as garbage; over black is what a viewer with no backdrop honestly shows.
@@ -327,7 +420,7 @@ fn srgb8_to_linear_planar(px: &[u8], stride: usize, n: usize) -> Vec<u16> {
     planar
 }
 
-/// Untagged-convention WebP → [`Decoded`]: the JPEG path's twin. Lossy and lossless both decode to RGB8 (RGBA8 when the extended header carries alpha — composited over black in linear), assumed sRGB like every web file, linearized and stored planar u16 with the same sRGB→VSF-RGB `Assumed` entry. An animated file yields its first frame. An embedded matrix/TRC ICC chunk is honoured, else the sRGB convention and EXIF orientation is not parsed, matching JPEG.
+/// Untagged-convention WebP → [`Decoded`]: the JPEG path's twin. Lossy and lossless both decode to RGB8 (RGBA8 when the extended header carries alpha — composited over black in linear), assumed sRGB like every web file, linearized and stored planar u16 with the same sRGB→VSF-RGB `Assumed` entry. An animated file yields its first frame. An embedded matrix/TRC ICC chunk is honoured, else the sRGB convention; EXIF Orientation (the `EXIF` chunk) is recorded as a view op, matching JPEG.
 fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
     let mut dec = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let (w, h) = dec.dimensions();
@@ -342,7 +435,9 @@ fn ingest_webp(bytes: &[u8]) -> Result<Decoded, String> {
     }
     let icc = dec.icc_profile().ok().flatten();
     let (planar, m, source, tier, ill) = display_referred_8bit(&px, stride, n, icc.as_deref(), "webp_assumed_srgb");
-    Ok(display_referred(w, h, planar, m, &source, tier, ill, 8))
+    let mut out = display_referred(w, h, planar, m, &source, tier, ill, 8);
+    out.img.view = webp_exif(bytes).and_then(exif_orientation).and_then(orientation_view);
+    Ok(out)
 }
 
 /// Display-referred JXL → [`Decoded`]. The inverse concession to [`export_srgb_jpeg`]'s forward one: a JXL carries finished display colour (lumis exports are Rec.2020 primaries + gamma; web files are sRGB), so ingest un-does the transfer (EOTF → linear) and stores the result as a 16-bit planar plane whose profile entry maps that display space → VSF RGB — `Assumed` tier, because the characterization is the format tag, not a measurement. The decoder applies the codestream orientation itself (JXL's own display contract — decoders MUST honour it, unlike EXIF's advisory tag), so no orientation view op is recorded. An embedded matrix/TRC ICC is honoured (its curves and colorants, `Model` tier); other ICC kinds and HDR (PQ/HLG) enum streams are declined rather than guessed at.
@@ -465,10 +560,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         dec.baseline_ev = baseline_ev_of(input);
         dec.img.make = info.make.trim_end_matches('\0').trim().to_string();
         dec.img.model = info.model.trim_end_matches('\0').trim().to_string();
-        dec.img.view = (2..=8).contains(&info.orientation).then(|| ViewTransform {
-            space: "vsf_rgb_linear".to_string(),
-            ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![info.orientation as f32] }],
-        });
+        dec.img.view = orientation_view(info.orientation as u16);
         return Ok(dec);
     }
     let (channels, layout, samples) = {
@@ -490,30 +582,41 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     };
     let k = channels.len();
 
-    // Tiered colour_profile only for 3-channel sources with a DNG colour matrix — Absolute-IDT `model`-tier entries (see derive_profile). BOTH matrices become entries, daylight-characterized one FIRST (better fit for typical scenes; ordering is a reader policy, not a destroyed decision — the loser is still carried). The verbatim DNG tags ride alongside so the derivation is auditable and re-derivable. Multispectral (k≠3) awaits the spectral resolve.
-    // An IDENTITY ColorMatrix1 with no ColorMatrix2 is lumis's explicit "uncalibrated" sentinel (chameleon hasn't scanned this camera yet) — not a characterization. Treating it as one would push raw camera counts through XYZ→VSF-RGB as if they were XYZ: the green, desaturated render. No profile ⇒ honest raw-camera rendering, and the HUD says so.
+    // Tiered colour_profile only for 3-channel sources with a DNG colour matrix — Absolute-IDT `model`-tier entries (see derive_profile). BOTH matrices become entries, daylight-characterized one FIRST (better fit for typical scenes; ordering is a reader policy, not a destroyed decision — the loser is still carried). The verbatim DNG tags ride alongside so the derivation is auditable and re-derivable. Multispectral (k≠3) awaits the spectral resolve. An IDENTITY ColorMatrix1 with no ColorMatrix2 is lumis's explicit "uncalibrated" sentinel (chameleon hasn't scanned this camera yet) — not a characterization. Treating it as one would push raw camera counts through XYZ→VSF-RGB as if they were XYZ: the green, desaturated render. No profile ⇒ honest raw-camera rendering, and the HUD says so.
     let identity = |m: &[f32; 9]| m.iter().zip(&[1f32, 0., 0., 0., 1., 0., 0., 0., 1.]).all(|(a, b)| (a - b).abs() < 1e-6);
-    let uncalibrated = info.colourmatrix1.as_ref().is_some_and(identity) && info.colourmatrix2.is_none();
-    // A "Verichrome scene-relative IDT" profile name means the matrix came from a chameleon target scan of THIS camera: `unit` tier, `relative` (DSR) class — elected first over any factory matrix. Header read only; a non-TIFF or missing tag just leaves the factory grading.
-    let verichrome = crate::tiff::FrameMeta::read_path(input).ok().and_then(|m| m.profile_name).is_some_and(|n| n.to_ascii_lowercase().contains("verichrome"));
-    let profile = if k == 3 && !uncalibrated {
+    // The DNG's effective XYZ→camera per slot is `CameraCalibration × ColorMatrix`, as the specification has every reader compute it (identity calibration when the file carries none). A VERICHROME paste lives in the calibration slot — see `idt.rs` — so this is where it takes effect.
+    let effective = |cm: Option<[f32; 9]>, cc: Option<[f32; 9]>| cm.map(|cm| match cc { Some(cc) => matmul3(&cc, &cm), None => cm });
+    let cm1 = effective(info.colourmatrix1, info.cameracalibration1);
+    let cm2 = effective(info.colourmatrix2, info.cameracalibration2);
+    let uncalibrated = cm1.as_ref().is_some_and(identity) && cm2.is_none();
+    // Header read only (a non-TIFF or a missing tag just reads as absent): the profile name, the pairing signature, and the `verichrome:` XMP that names the IDT's class and tier.
+    let meta = crate::tiff::FrameMeta::read_path(input).ok();
+    let verichrome = meta.as_ref().and_then(|m| m.profile_name.as_deref()).is_some_and(|n| n.to_ascii_lowercase().contains("verichrome"));
+    let xmp = meta.as_ref().and_then(|m| m.xmp.as_deref()).and_then(|b| std::str::from_utf8(b).ok()).map(str::to_string);
+    let xmp_class = xmp.as_deref().and_then(|x| crate::idt::xmp_attr(x, "IdtClass"));
+    let xmp_tier = xmp.as_deref().and_then(|x| crate::idt::xmp_attr(x, "IdtTier"));
+    let signed = info.calibration_signature.starts_with("VERICHROME");
+    let chameleon = chameleon_idt(cm1, info.calibrationilluminant1, cm2, verichrome, uncalibrated, signed, xmp_tier.as_deref());
+    let model = if chameleon { Vec::new() } else { limbus::model_matrices(&info.make, &info.model) };
+    let profile = if k == 3 && (!uncalibrated || !model.is_empty()) {
         let daylight = |code: u16| matches!(code, 0 | 1 | 9 | 10 | 20 | 21 | 22 | 23);
+        // A chameleon IDT is `unit` / `relative` unless its own XMP says otherwise (a paste records what it pasted).
         let tier = |mut e: ProfileEntry| {
-            if verichrome {
-                e.tier = ProfileTier::Unit;
-                e.class = IdtClass::Relative;
+            if chameleon {
+                e.tier = match xmp_tier.as_deref() { Some("model") => ProfileTier::Model, _ => ProfileTier::Unit };
+                e.class = match xmp_class.as_deref() { Some("absolute") => IdtClass::Absolute, _ => IdtClass::Relative };
             }
             e
         };
-        let e1 = info.colourmatrix1.and_then(|m| derive_profile(m, info.calibrationilluminant1, "dng_colormatrix1")).map(tier);
-        let e2 = info.colourmatrix2.and_then(|m| derive_profile(m, info.calibrationilluminant2, "dng_colormatrix2")).map(tier);
-        // Order best-first: put the daylight-family entry ahead of the other.
-        let cm2_first = daylight(info.calibrationilluminant2) && !daylight(info.calibrationilluminant1);
-        let entries: Vec<ProfileEntry> = if cm2_first {
-            [e2, e1].into_iter().flatten().collect()
+        let candidates: Vec<([f32; 9], u16, &str)> = if model.is_empty() {
+            let src = |n: u8, cc: bool| if cc { if n == 1 { "dng_cameracalibration1×colormatrix1" } else { "dng_cameracalibration2×colormatrix2" } } else if n == 1 { "dng_colormatrix1" } else { "dng_colormatrix2" };
+            [(cm1, info.calibrationilluminant1, src(1, info.cameracalibration1.is_some())), (cm2, info.calibrationilluminant2, src(2, info.cameracalibration2.is_some()))].into_iter().filter_map(|(m, ill, src)| m.map(|m| (m, ill, src))).collect()
         } else {
-            [e1, e2].into_iter().flatten().collect()
+            model.iter().map(|&(ill, m)| (m, ill, "adobe_model_matrix")).collect()
         };
+        // Order best-first: the daylight-family entry ahead of the rest (stable, so a pair keeps its own order otherwise).
+        let mut entries: Vec<ProfileEntry> = candidates.into_iter().filter_map(|(m, ill, src)| derive_profile(m, ill, src).map(tier)).collect();
+        entries.sort_by_key(|e| !daylight(e.illuminant));
         {
             // A RAW with no ColorMatrix is camera-native counts nobody has characterized — which is NOT "no profile": absence means the samples already are VSF RGB, and sensor counts are not that. The honest entry is the identity at `Assumed`: the camera's native space is taken as ≈VSF RGB and the tier says that is a guess, which is exactly what `Assumed` exists to mark. Illuminant 0 (unknown) normalizes as daylight.
             let entries = if entries.is_empty() { vec![absolute_entry(IDENTITY3, "no_colormatrix", ProfileTier::Assumed, 0)] } else { entries };
@@ -532,15 +635,8 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         None
     };
 
-    // EXIF Orientation (tag 274) enters the translateration log verbatim — the camera's display-time claim, never applied to the sensor plane. Codes 2..=8 are real transforms; 1 (normal) and limbus's absent-sentinel 9 record nothing.
-    let view = (2..=8).contains(&info.orientation).then(|| ViewTransform {
-        space: "vsf_rgb_linear".to_string(),
-        ops: vec![ViewOp {
-            name: "orientation".to_string(),
-            class: IdtClass::Technical,
-            params: vec![info.orientation as f32],
-        }],
-    });
+    // EXIF Orientation (tag 274) enters the view log verbatim — the camera's display-time claim, never applied to the sensor plane.
+    let view = orientation_view(info.orientation as u16);
 
     let img = SpectralImage {
         width: info.width,
@@ -558,7 +654,16 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     };
 
     // The baseline lives only in the TIFF headers — limbus does not surface it — and it is a fact about the FILE, so it is read here where `Decoded` is built rather than in the viewer, which would leave `--check`, `--convert` and photon rendering without it.
-    Ok(Decoded { img, src_bits: bit_depth as u8, baseline_ev: baseline_ev_of(input) })
+    let crop_hint = info.crop.map(|[x, y, w, h]| [x as usize, y as usize, (x + w) as usize, (y + h) as usize]).filter(|&[x0, y0, x1, y1]| x0 < x1 && y0 < y1 && x1 <= info.width && y1 <= info.height);
+    let baseline_ev = baseline_ev_of(input);
+    let (mut capture, foreign) = match crate::tiff::FrameMeta::read_path(input) {
+        Ok(m) => capture_of_meta(&m),
+        Err(_) => (vsf::visual::Capture::default(), vsf::visual::Foreign::default()),
+    };
+    capture.make = img.make.clone();
+    capture.model = img.model.clone();
+    capture.baseline = baseline_ev;
+    Ok(Decoded { img, src_bits: bit_depth as u8, baseline_ev, crop_hint, capture, foreign })
 }
 
 /// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input clamp is load-bearing: past the rail the cubic FOLDS BACK, so overs must pin to the rail first (the encode boundary's clamp already does). Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
@@ -602,9 +707,51 @@ pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool, out
 }
 
 /// Serialize a `SpectralImage` to a VSF-Image file.
-pub fn write_vsf(img: &SpectralImage, output: &Path) -> Result<(), String> {
-    let bytes = spectral_image::write(img)?;
+pub fn write_vsf(dec: &Decoded, output: &Path) -> Result<(), String> {
+    let bytes = visual_of(dec).write()?;
     std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))
+}
+
+/// The visual a decode writes as: the image's plane, profile and view log through the bridge, plus the capture facts (baseline included), the maker's crop and orientation on the plane, and the foreign metadata verbatim — nothing the ingest read is dropped.
+pub fn visual_of(dec: &Decoded) -> vsf::visual::Visual {
+    let mut capture = dec.capture.clone();
+    capture.baseline = dec.baseline_ev;
+    let mut v = vsf::visual::Visual::from_spectral_image(&dec.img, Some(capture), dec.foreign.clone());
+    if let Some(p) = v.planes.first_mut() {
+        p.maker_crop = dec.crop_hint.map(|[x0, y0, x1, y1]| [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]);
+        p.orientation = orientation_code(&dec.img);
+        p.at = dec.capture.at;
+    }
+    v
+}
+
+/// A visual back into a decode: the primary plane as the image, the capture facts and foreign metadata on the decode, the baseline mirrored, the maker's crop as the hint.
+fn decoded_of_visual(v: vsf::visual::Visual) -> Result<Decoded, String> {
+    let img = v.to_spectral_image().map_err(|e| e.to_string())?;
+    let plane = v.primary_plane().ok_or("visual has no plane")?;
+    let crop_hint = plane.maker_crop.map(|[x, y, w, h]| [x as usize, y as usize, (x + w) as usize, (y + h) as usize]).filter(|&[x0, y0, x1, y1]| x0 < x1 && y0 < y1 && x1 <= plane.width && y1 <= plane.height);
+    let capture = v.capture.clone().unwrap_or_default();
+    let src_bits = if plane.depth == 0 { img.bit_depth() } else { plane.depth };
+    Ok(Decoded { baseline_ev: capture.baseline, crop_hint, src_bits, capture, foreign: v.foreign.clone(), img })
+}
+
+/// The capture facts and foreign metadata out of a TIFF-family header. EXIF's date-time is local with no zone, so it rides as text; the instant stays unknown rather than guessed.
+pub fn capture_of_meta(m: &crate::tiff::FrameMeta) -> (vsf::visual::Capture, vsf::visual::Foreign) {
+    // A zero rational is a maker's "unknown" (a manual lens reports f/0 and 0 mm), not a measurement.
+    let rat = |(n, d): (u32, u32)| if d == 0 || n == 0 { None } else { Some(n as f32 / d as f32) };
+    let capture = vsf::visual::Capture {
+        exposure_s: m.exposure_s.and_then(rat),
+        f_number: m.f_number.and_then(rat),
+        iso: m.iso.filter(|i| *i > 0).map(|i| i as f32),
+        focal_mm: m.focal.and_then(rat),
+        at_text: m.datetime.clone().unwrap_or_default(),
+        location: m.gps.map(|(lat, lon)| vsf::types::WorldCoord::from_lat_lon(lat, lon)),
+        altitude_m: m.altitude_m,
+        mode: "single".into(),
+        ..Default::default()
+    };
+    let foreign = vsf::visual::Foreign { xmp: m.xmp.clone(), icc: m.icc.clone(), profile_name: m.profile_name.clone().unwrap_or_default(), calibration_signature: m.cc_signature.clone().unwrap_or_default() };
+    (capture, foreign)
 }
 
 pub(crate) fn rgb_channel_names() -> [String; 3] {
@@ -676,6 +823,20 @@ pub fn orientation_src(code: u16, w: usize, h: usize, dx: usize, dy: usize) -> (
     }
 }
 
+/// Forward mapping of an EXIF orientation: SOURCE pixel (sx, sy) in the pre-orientation `w × h` buffer → the DISPLAY pixel showing it. The exact inverse of [`orientation_src`] (tested over every code) — for carrying a sensor-space rect, like the maker's crop, onto the screen.
+pub fn orientation_dst(code: u16, w: usize, h: usize, sx: usize, sy: usize) -> (usize, usize) {
+    match code {
+        2 => (w - 1 - sx, sy),
+        3 => (w - 1 - sx, h - 1 - sy),
+        4 => (sx, h - 1 - sy),
+        5 => (sy, sx),
+        6 => (h - 1 - sy, sx),
+        7 => (h - 1 - sy, w - 1 - sx),
+        8 => (sy, w - 1 - sx),
+        _ => (sx, sy),
+    }
+}
+
 /// Compose an EXIF orientation code with a further 90° display rotation: the code `r` such that `display(r) = rot(display(code))`. The eight codes are the dihedral group of the frame; each is a signed 2×2 map from source axes to display axes (x right, y down; 6 = rotate 90 CW ⇒ x' = h−1−y, y' = x ⇒ [[0,−1],[1,0]] — the same convention [`orientation_src`] inverts), so composition is a 2×2 integer product and a table lookup. `cw` false ⇒ counter-clockwise. Applying CW four times from any code returns it.
 pub fn rotate_code(code: u16, cw: bool) -> u16 {
     const M: [[i8; 4]; 8] = [
@@ -738,13 +899,7 @@ pub fn to_linear(dec: &Decoded) -> Result<(usize, usize, Vec<i32>), String> {
     to_linear_in(dec, Target::Rec2020)
 }
 
-/// [`to_linear`] with the landing space chosen: the same integer pipeline, only the matrix differs.
-/// The same render at the sensor's OWN resolution: RCD demosaic instead of the tile bin, so an
-/// exported JPEG is a full-resolution deliverable rather than the quarter-pixel-count view buffer
-/// (a 4080×3072 Bayer frame exported 2040×1536 until 2026-10-05). Bayer only — RCD is a 2×2
-/// algorithm, so a quad-Bayer tile, a planar source or anything else falls back to [`to_linear_in`],
-/// which is also exactly right for them: a planar source has nothing to demosaic. `progress` is
-/// called with 0..=1 as the passes complete, for a host that draws a bar.
+/// [`to_linear`] with the landing space chosen: the same integer pipeline, only the matrix differs. The same render at the sensor's OWN resolution: RCD demosaic instead of the tile bin, so an exported JPEG is a full-resolution deliverable rather than the quarter-pixel-count view buffer (a 4080×3072 Bayer frame exported 2040×1536 until 2026-10-05). Bayer only — RCD is a 2×2 algorithm, so a quad-Bayer tile, a planar source or anything else falls back to [`to_linear_in`], which is also exactly right for them: a planar source has nothing to demosaic. `progress` is called with 0..=1 as the passes complete, for a host that draws a bar.
 pub fn to_linear_full(dec: &Decoded, target: Target, progress: &dyn Fn(f32)) -> Result<(usize, usize, Vec<i32>), String> {
     let img = &dec.img;
     let PlaneLayout::Mosaic { cfa } = &img.layout else { return to_linear_in(dec, target) };
@@ -782,12 +937,7 @@ pub fn to_linear_full(dec: &Decoded, target: Target, progress: &dyn Fn(f32)) -> 
             }
         }
     });
-    // RCD is a 5×5 algorithm: its interior loops run 4..n−4, and its own `border_interpolate`
-    // replicates the ring from row 4 — which is itself still inside the partially-converged zone. On
-    // a flat field the outer pixels come back ~44% high, and on a real 12 MP frame that ring was the
-    // whole of the 0.31% the full render differed from the binned one. So the ring takes the BINNED
-    // render instead: the tile average through the same matrix — real data at half resolution, which
-    // is exactly what the viewer shows there — rather than a fabricated replica of a bad row.
+    // RCD is a 5×5 algorithm: its interior loops run 4..n−4, and its own `border_interpolate` replicates the ring from row 4 — which is itself still inside the partially-converged zone. On a flat field the outer pixels come back ~44% high, and on a real 12 MP frame that ring was the whole of the 0.31% the full render differed from the binned one. So the ring takes the BINNED render instead: the tile average through the same matrix — real data at half resolution, which is exactly what the viewer shows there — rather than a fabricated replica of a bad row.
     const RCD_EDGE: usize = 8;
     if w > RCD_EDGE * 2 && h > RCD_EDGE * 2 {
         let mut tile_count = vec![0f64; 3];
@@ -971,6 +1121,127 @@ mod tests {
         assert!(is_supported(path));
     }
 
+    /// A minimal EXIF block: TIFF header + IFD0 with the one Orientation entry, in either byte order.
+    fn exif_block(code: u16, le: bool) -> Vec<u8> {
+        let (w16, w32): (fn(u16) -> [u8; 2], fn(u32) -> [u8; 4]) = if le { (u16::to_le_bytes, u32::to_le_bytes) } else { (u16::to_be_bytes, u32::to_be_bytes) };
+        let mut t = if le { b"II".to_vec() } else { b"MM".to_vec() };
+        t.extend(w16(42));
+        t.extend(w32(8));
+        t.extend(w16(1));
+        t.extend(w16(0x0112));
+        t.extend(w16(3));
+        t.extend(w32(1));
+        t.extend(w16(code));
+        t.extend([0, 0]);
+        t.extend(w32(0));
+        t
+    }
+
+    /// A 16×8 sRGB frame, left half white, right half black — so a rotation is unambiguous.
+    fn half_white() -> Vec<u8> {
+        (0..8).flat_map(|_| (0..16).flat_map(|x| [if x < 8 { 255u8 } else { 0 }; 3])).collect()
+    }
+
+    /// After orientation 6 (rotate 90° CW) the left half of the stored frame is the TOP half of the display.
+    fn assert_turned_cw(dec: &Decoded) {
+        assert_eq!(orientation_code(&dec.img), 6);
+        let (w, h, lin) = to_linear(dec).unwrap();
+        assert_eq!((w, h), (8, 16), "display dims");
+        let mean = |rows: std::ops::Range<usize>| rows.clone().flat_map(|y| (0..w).map(move |x| (y, x))).map(|(y, x)| lin[(y * w + x) * 3 + 1] as f64).sum::<f64>() / (rows.len() * w) as f64;
+        assert!(mean(0..6) > 50_000. && mean(10..16) < 5_000., "top {} bottom {}", mean(0..6), mean(10..16));
+    }
+
+    /// A chameleon IDT is recognised whether chameleon wrote the DNG (named) or opsin pasted it in place (one matrix in every slot, D50); a factory pair, a factory single at A or D65, and the uncalibrated identity sentinel are not.
+    #[test]
+    fn chameleon_idt_is_recognised_by_name_or_paste_signature() {
+        let (m, f) = ([1., 0.1, 0., 0., 1., 0., 0., 0., 1.], [0.9, 0., 0., 0., 1., 0.2, 0., 0., 1.]);
+        assert!(chameleon_idt(Some(m), 17, Some(f), true, false, false, None), "named");
+        assert!(chameleon_idt(Some(m), 23, Some(m), false, false, false, None), "old paste: same matrix in both slots");
+        assert!(chameleon_idt(Some(m), 23, None, false, false, false, None), "old paste: a lone D50 matrix");
+        assert!(chameleon_idt(Some(m), 17, Some(f), false, false, true, Some("unit")), "signed calibration, unit");
+        assert!(chameleon_idt(Some(m), 17, Some(f), false, false, true, None), "signed calibration, no XMP tier");
+        assert!(!chameleon_idt(Some(m), 17, Some(f), false, false, true, Some("model")), "signed, but a model-tier transplant");
+        assert!(!chameleon_idt(Some(m), 17, Some(f), false, false, false, None), "factory pair");
+        assert!(!chameleon_idt(Some(m), 21, None, false, false, false, None), "factory single at D65");
+        assert!(!chameleon_idt(Some(IDENTITY3), 23, None, false, true, false, None), "uncalibrated sentinel");
+        assert!(!chameleon_idt(None, 0, None, false, false, false, None), "no matrix");
+    }
+
+    #[test]
+    fn orientation_dst_inverts_orientation_src() {
+        let (w, h) = (5, 3);
+        for code in 1..=8u16 {
+            let (dw, dh) = if code >= 5 { (h, w) } else { (w, h) };
+            for dy in 0..dh {
+                for dx in 0..dw {
+                    let (sx, sy) = orientation_src(code, w, h, dx, dy);
+                    assert_eq!(orientation_dst(code, w, h, sx, sy), (dx, dy), "code {code}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exif_orientation_reads_both_byte_orders_and_rejects_junk() {
+        for code in 1..=8 {
+            assert_eq!(exif_orientation(&exif_block(code, true)), Some(code));
+            assert_eq!(exif_orientation(&exif_block(code, false)), Some(code));
+        }
+        assert_eq!(exif_orientation(b"II*\0"), None);
+        assert_eq!(exif_orientation(&[]), None);
+        let mut cut = exif_block(6, false);
+        cut.truncate(14);
+        assert_eq!(exif_orientation(&cut), None, "truncated IFD must not read past the end");
+    }
+
+    /// A JPEG's EXIF Orientation (APP1) reaches the display: tagged rotate-90-CW, it renders turned (Nick 2026-10-08: "Jpeg rotation metadata seems to be ignored").
+    #[test]
+    fn jpeg_exif_orientation_turns_the_display() {
+        let mut enc = Vec::new();
+        jpeg_encoder::Encoder::new(&mut enc, 95).encode(&half_white(), 16, 8, jpeg_encoder::ColorType::Rgb).unwrap();
+        for le in [true, false] {
+            let exif = exif_block(6, le);
+            let mut app1 = vec![0xFF, 0xE1];
+            app1.extend(((exif.len() + 8) as u16).to_be_bytes());
+            app1.extend(b"Exif\0\0");
+            app1.extend(&exif);
+            let mut jpg = enc[..2].to_vec();
+            jpg.extend(&app1);
+            jpg.extend(&enc[2..]);
+            assert_turned_cw(&ingest_jpeg(&jpg).unwrap());
+        }
+        // Untagged: nothing recorded, displayed as stored.
+        assert!(ingest_jpeg(&enc).unwrap().img.view.is_none());
+    }
+
+    /// A WebP's EXIF chunk (extended format) reaches the display the same way — bare TIFF block per the spec, or JPEG-style `Exif\0\0`-prefixed as some writers emit.
+    #[test]
+    fn webp_exif_orientation_turns_the_display() {
+        let mut simple = Vec::new();
+        image_webp::WebPEncoder::new(&mut simple).encode(&half_white(), 16, 8, image_webp::ColorType::Rgb8).unwrap();
+        for prefixed in [false, true] {
+            let mut exif = if prefixed { b"Exif\0\0".to_vec() } else { Vec::new() };
+            exif.extend(exif_block(6, true));
+            let mut body = b"WEBP".to_vec();
+            body.extend(b"VP8X");
+            body.extend(10u32.to_le_bytes());
+            body.extend([0x08, 0, 0, 0]); // EXIF present
+            body.extend(&15u32.to_le_bytes()[..3]);
+            body.extend(&7u32.to_le_bytes()[..3]);
+            body.extend(&simple[12..]); // the VP8L chunk
+            body.extend(b"EXIF");
+            body.extend((exif.len() as u32).to_le_bytes());
+            body.extend(&exif);
+            if exif.len() & 1 == 1 {
+                body.push(0);
+            }
+            let mut webp = b"RIFF".to_vec();
+            webp.extend((body.len() as u32).to_le_bytes());
+            webp.extend(body);
+            assert_turned_cw(&ingest_webp(&webp).unwrap());
+        }
+    }
+
     #[test]
     fn to_linear_honours_view_orientation() {
         // 2×1 planar RGB with no profile — VSF RGB by specification — tagged rotate-90-CCW (code 8): display comes back 1×2 with the right pixel on top. Rendered in VSF RGB so the camera matrix is the identity and the white (Illuminant E) normalizes to exactly 1: the values pass through bit-exact and only the orientation moves them. The stored plane is untouched.
@@ -991,17 +1262,12 @@ mod tests {
                 ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
             }),
         };
-        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16, baseline_ev: 0. }, Target::VsfRgb).unwrap();
+        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() }, Target::VsfRgb).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
     }
 
-    /// A profile-less 2×1 planar RGB at the given baseline, rendered in VSF RGB. No profile ⇒ identity matrix and Illuminant E, which normalizes to exactly 1, so at baseline 0 the stored counts pass through bit-exact and any change is the baseline alone.
-    /// A neutral capture — every channel at the same fraction of its range — renders to exactly
-    /// `frac × display_channel_gains`, which is the contract the histogram leans on to place a raw
-    /// count where its light actually lands. Uses a real camera matrix and a nonzero baseline, so the
-    /// row sums are nothing like `2^baseline` (the lumis frame of 2026-10-02: 18.3 / 6.8 / 22.4
-    /// against a flat 15.2) and a scalar gain would show the three channels up to 1.75 stops apart.
+    /// A profile-less 2×1 planar RGB at the given baseline, rendered in VSF RGB. No profile ⇒ identity matrix and Illuminant E, which normalizes to exactly 1, so at baseline 0 the stored counts pass through bit-exact and any change is the baseline alone. A neutral capture — every channel at the same fraction of its range — renders to exactly `frac × display_channel_gains`, which is the contract the histogram leans on to place a raw count where its light actually lands. Uses a real camera matrix and a nonzero baseline, so the row sums are nothing like `2^baseline` (the lumis frame of 2026-10-02: 18.3 / 6.8 / 22.4 against a flat 15.2) and a scalar gain would show the three channels up to 1.75 stops apart.
     #[test]
     fn neutral_capture_lands_at_the_channel_gains() {
         let dng_cm1 = [1.23615396, -0.3672920167, -0.07938161492, -0.3309353888, 1.556956172, 0.127306819, -0.1197145134, 0.4332881272, 0.5436184406];
@@ -1023,7 +1289,7 @@ mod tests {
                 profile: Some(ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry.clone()], dng_colormatrix: [None, None], patches: None, cal: None }),
                 view: None,
             };
-            let dec = Decoded { img, src_bits: 16, baseline_ev: 3.925 };
+            let dec = Decoded { img, src_bits: 16, baseline_ev: 3.925, crop_hint: None, capture: Default::default(), foreign: Default::default() };
             let gains = display_channel_gains(&dec, Target::Rec2020);
             let lin = to_linear(&dec).unwrap().2;
             for ch in 0..3 {
@@ -1046,6 +1312,9 @@ mod tests {
             },
             src_bits: 16,
             baseline_ev: 3.925,
+            crop_hint: None,
+            capture: Default::default(),
+            foreign: Default::default(),
         };
         let gains = display_channel_gains(&dec, Target::Rec2020);
         let flat = 3.925f32.exp2();
@@ -1053,17 +1322,13 @@ mod tests {
         assert!((gains[2] / flat).log2() > 0.4, "blue should sit above it, got {:+.2} stops", (gains[2] / flat).log2());
     }
 
-    /// The full-resolution path returns the sensor's own dimensions and the same light as the binned
-    /// one — a JPEG is a deliverable, so it must not be a quarter of the pixels (2026-10-05). A
-    /// non-Bayer tile has nothing RCD can do, so it falls back to the binned render rather than refuse.
+    /// The full-resolution path returns the sensor's own dimensions and the same light as the binned one — a JPEG is a deliverable, so it must not be a quarter of the pixels (2026-10-05). A non-Bayer tile has nothing RCD can do, so it falls back to the binned render rather than refuse.
     #[test]
     fn full_resolution_render_matches_the_binned_one() {
         let dng_cm1 = [1.23615396, -0.3672920167, -0.07938161492, -0.3309353888, 1.556956172, 0.127306819, -0.1197145134, 0.4332881272, 0.5436184406];
         let entry = derive_profile(dng_cm1, 21, "test").unwrap();
         let profile = Some(ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry], dng_colormatrix: [None, None], patches: None, cal: None });
-        // A flat field: binning averages a tile, demosaicing interpolates it, and on uniform light
-        // the two must land in the same place. (Real content agrees to ~0.3%; a synthetic ramp does
-        // not, and that difference is the demosaic doing its job at an edge, not an error.)
+        // A flat field: binning averages a tile, demosaicing interpolates it, and on uniform light the two must land in the same place. (Real content agrees to ~0.3%; a synthetic ramp does not, and that difference is the demosaic doing its job at an edge, not an error.)
         let (w, h) = (64usize, 48usize);
         let counts: Vec<u16> = vec![24000; w * h];
         let mk = |cfa: Tensor<u8>| SpectralImage {
@@ -1075,7 +1340,7 @@ mod tests {
             make: String::new(), model: String::new(), provenance: Provenance::default(),
             profile: profile.clone(), view: None,
         };
-        let dec = Decoded { img: mk(Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1])), src_bits: 16, baseline_ev: 0. };
+        let dec = Decoded { img: mk(Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1])), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() };
         let (bw, bh, blin) = to_linear(&dec).unwrap();
         let (fw, fh, flin) = to_linear_full(&dec, Target::Rec2020, &|_| {}).unwrap();
         assert_eq!((bw, bh), (w / 2, h / 2), "the binned path halves each axis");
@@ -1086,7 +1351,7 @@ mod tests {
             assert!((mf / mb - 1.).abs() < 0.01, "ch{ch}: binned mean {mb:.0} vs full {mf:.0}");
         }
         // Quad-Bayer: RCD is a 2×2 algorithm, so this falls back to the binned render.
-        let quad = Decoded { img: mk(Tensor::new(vec![4, 4], vec![1u8, 1, 2, 2, 1, 1, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1])), src_bits: 16, baseline_ev: 0. };
+        let quad = Decoded { img: mk(Tensor::new(vec![4, 4], vec![1u8, 1, 2, 2, 1, 1, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1])), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() };
         let (qw, qh, _) = to_linear_full(&quad, Target::Rec2020, &|_| {}).unwrap();
         assert_eq!((qw, qh), (w / 4, h / 4), "a non-Bayer tile falls back to the bin");
     }
@@ -1106,7 +1371,7 @@ mod tests {
             profile: None,
             view: None,
         };
-        to_linear_in(&Decoded { img, src_bits: 16, baseline_ev }, Target::VsfRgb).unwrap().2
+        to_linear_in(&Decoded { img, src_bits: 16, baseline_ev, crop_hint: None, capture: Default::default(), foreign: Default::default() }, Target::VsfRgb).unwrap().2
     }
 
     #[test]
@@ -1143,7 +1408,7 @@ mod tests {
         img.view = Some(op("exposure", 1.5));
         assert_eq!(stored_exposure_ev(&img), Some(1.5));
         // It is the OPERATOR's setting, so it must not also gain the render — that double-count is the whole reason baseline and slider stay separate.
-        let plain = to_linear_in(&Decoded { img: img.clone(), src_bits: 16, baseline_ev: 0. }, Target::VsfRgb).unwrap().2;
+        let plain = to_linear_in(&Decoded { img: img.clone(), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() }, Target::VsfRgb).unwrap().2;
         assert_eq!(plain, vec![10, 20, 30], "a recorded exposure does not touch the render");
         // An orientation-only log records no exposure; a non-finite param is not one either.
         img.view = Some(op("orientation", 8.));
@@ -1188,15 +1453,106 @@ mod tests {
         assert_eq!(px(3), &[3, 4, 5]); // B
     }
 }
+#[cfg(test)]
+mod visual_roundtrip {
+    //! The M1 go/no-go: a camera file converted to a VSF visual loses nothing the viewer renders from or the HUD shows, an IDT pastes into the VSF and unpastes byte for byte, and limbus reads the visual as a raw.
 
+    fn fixtures() -> Vec<std::path::PathBuf> {
+        ["/mnt/Harbor/Code/chameleon/Colour.dng", "/mnt/Chiton/MEGA/VERICHROME/Test RAWs/Sigma FP D65.DNG", "/mnt/Chiton/MEGA/Colour/Stock a7R3 color data/Sunny.ARW", "/mnt/Chiton/MEGA/Colour/LS45/210722-Color-TestPhotos/Shoes/IMG_5568.CR2"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .collect()
+    }
 
+    #[test]
+    fn convert_keeps_everything_and_renders_identically() {
+        let dir = std::env::temp_dir().join(format!("opsin-visual-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for src in fixtures() {
+            let dec = super::load_any(&src).unwrap();
+            let out = dir.join(src.file_name().unwrap()).with_extension("vsf");
+            super::write_vsf(&dec, &out).unwrap();
+            let back = super::load_any(&out).unwrap();
+            let name = src.file_name().unwrap().to_string_lossy();
+            assert_eq!(back.img.samples, dec.img.samples, "{name}: plane");
+            assert_eq!(back.img.layout, dec.img.layout, "{name}: layout");
+            assert_eq!((back.img.black.clone(), back.img.white.clone()), (dec.img.black.clone(), dec.img.white.clone()), "{name}: levels");
+            assert_eq!(back.img.profile, dec.img.profile, "{name}: profile");
+            assert_eq!(back.img.view, dec.img.view, "{name}: view ops");
+            assert_eq!((back.img.make.as_str(), back.img.model.as_str()), (dec.img.make.as_str(), dec.img.model.as_str()), "{name}: make/model");
+            assert_eq!(back.baseline_ev, dec.baseline_ev, "{name}: baseline");
+            assert_eq!(back.crop_hint, dec.crop_hint, "{name}: maker crop");
+            assert_eq!(back.capture, dec.capture, "{name}: capture facts");
+            assert_eq!(back.foreign, dec.foreign, "{name}: foreign metadata");
+            // The triangle survives when the source had one (chameleon's own DNG writer emits no EXIF IFD, so Colour.dng has none to carry).
+            if let Ok(m) = crate::tiff::FrameMeta::read_path(&src) {
+                // A zero rational is the maker's "unknown" (Sunny.ARW: a manual lens reports f/0), carried as absent.
+                let known = |r: Option<(u32, u32)>| r.is_some_and(|(n, d)| n > 0 && d > 0);
+                assert_eq!(back.capture.exposure_s.is_some(), known(m.exposure_s), "{name}: exposure not carried");
+                assert_eq!(back.capture.f_number.is_some(), known(m.f_number), "{name}: f-number not carried");
+                assert_eq!(back.capture.iso.is_some(), m.iso.is_some_and(|i| i > 0), "{name}: ISO not carried");
+                assert_eq!(back.capture.location.is_some(), m.gps.is_some(), "{name}: GPS not carried");
+            }
+            assert!(back.foreign.xmp.is_some() || back.foreign.icc.is_some() || !back.foreign.profile_name.is_empty() || src.extension().unwrap() != "DNG", "{name}: foreign metadata empty");
+            // The render is identical, pixel for pixel.
+            let a = super::to_linear(&dec).unwrap();
+            let b = super::to_linear(&back).unwrap();
+            assert_eq!((a.0, a.1), (b.0, b.1), "{name}: render dims");
+            assert_eq!(a.2, b.2, "{name}: render");
+            // limbus reads the visual as a raw with the same geometry.
+            let (info, px) = limbus::read_dng(&out).expect("limbus reads the visual");
+            assert_eq!((info.width, info.height), (dec.img.width, dec.img.height), "{name}: limbus dims");
+            assert_eq!(px.len(), dec.img.samples.len(), "{name}: limbus sample count");
+            assert_eq!(info.colourmatrix1.is_some(), dec.img.profile.as_ref().map_or(false, |p| p.dng_colormatrix[0].is_some()), "{name}: limbus matrix");
+            std::fs::remove_file(&out).ok();
+        }
+        std::fs::remove_dir(&dir).ok();
+    }
 
-
-
-
-
-
-
-
-
-
+    #[test]
+    fn idt_pastes_into_a_visual_as_a_generation_and_unpastes_byte_exact() {
+        let donor = std::path::Path::new("/mnt/Chiton/MEGA/VERICHROME/Test RAWs/Sigma FP D65.DNG");
+        let target_src = std::path::Path::new("/mnt/Chiton/MEGA/VERICHROME/Test RAWs/01.DNG");
+        if !donor.exists() || !target_src.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("opsin-visual-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.vsf");
+        super::write_vsf(&super::load_any(target_src).unwrap(), &target).unwrap();
+        let before = std::fs::read(&target).unwrap();
+        // Before: the factory pair elects as Adobe's per-model matrix (Model/Absolute) — or the file's own.
+        let dec0 = super::load_any(&target).unwrap();
+        let tier0 = dec0.img.profile.as_ref().unwrap().entries[0].tier;
+        assert_eq!(tier0, vsf::spectral_image::ProfileTier::Model);
+        // Paste the chameleon IDT (same body, focal may differ → force).
+        let clip = crate::idt::IdtClip::copy_from(donor).unwrap();
+        let report = clip.paste_into(&target, true).unwrap();
+        assert_eq!(report.vsf_generation, Some(1));
+        let after = std::fs::read(&target).unwrap();
+        assert_eq!(&after[..before.len()], &before[..], "a paste must not touch a byte of the original");
+        // After: Unit/Relative, the pasted matrix in front, and a copy out is the clip's exact rationals.
+        let dec1 = super::load_any(&target).unwrap();
+        let e = &dec1.img.profile.as_ref().unwrap().entries[0];
+        assert_eq!((e.tier, e.class), (vsf::spectral_image::ProfileTier::Unit, vsf::spectral_image::IdtClass::Relative));
+        assert_eq!(e.source, "verichrome_paste");
+        assert!(dec1.foreign.calibration_signature.starts_with("VERICHROME relative unit"));
+        let back = crate::idt::IdtClip::copy_from(&target).unwrap();
+        assert_eq!(back.provenance.class, "relative");
+        // The rationals went through f32 (the profile slot is f32); they agree to f32 precision.
+        for ((n1, d1), (n2, d2)) in back.matrix.iter().zip(&clip.matrix) {
+            let (a, b) = (*n1 as f64 / *d1 as f64, *n2 as f64 / *d2 as f64);
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+        // The render changed (a different matrix) and the plane did not.
+        assert_eq!(dec1.img.samples, dec0.img.samples);
+        assert_ne!(super::to_linear(&dec1).unwrap().2, super::to_linear(&dec0).unwrap().2);
+        // Unpaste: byte-identical to before.
+        crate::idt::IdtClip::unpaste(&target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert!(crate::idt::IdtClip::unpaste(&target).is_err());
+        std::fs::remove_file(&target).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+}

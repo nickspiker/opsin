@@ -6,7 +6,8 @@
 //!   opsin --convert <in> [out]  headless: decode <in> to a VSF-Image (default <in>.vsf). The GUI's V without a window.
 //!   opsin --copy-idt <frame>    lift the DSR IDT (DNG ColorMatrix1 + illuminant + camera fingerprint) into the clip file. The GUI's Ctrl+C.
 //!   opsin --live               headless virtual webcam (live feature): camera → saved matrix → /dev/video10, no window. Ctrl+C stops.
-//!   opsin --paste-idt [--force] <frame>...  patch the clipped IDT into each frame in place — only where the camera fingerprint matches; --force overrides a mismatch (a lens change on an interchangeable-lens body) with a warning. The GUI's Ctrl+V / Ctrl+Shift+V, for a whole folder.
+//!   opsin --paste-idt [--force] <frame>...  write the clipped IDT into each frame — as a DNG CameraCalibration onto the file's own matrix, with the class and provenance in XMP; nothing original moves — only where the camera fingerprint matches; --force overrides a mismatch (a lens change on an interchangeable-lens body) with a warning. The GUI's Ctrl+V / Ctrl+Shift+V, for a whole folder.
+//!   opsin --unpaste-idt <frame>...  undo every paste on each frame: the file comes back byte for byte.
 
 mod app;
 mod view;
@@ -93,7 +94,7 @@ fn main() {
             let in_path = std::path::Path::new(input);
             let out = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| in_path.with_extension("vsf"));
             match convert::load_any(in_path) {
-                Ok(dec) => match convert::write_vsf(&dec.img, &out) {
+                Ok(dec) => match convert::write_vsf(&dec, &out) {
                     Ok(()) => println!("opsin: wrote {}", out.display()),
                     Err(e) => {
                         eprintln!("opsin: convert: {e}");
@@ -143,6 +144,26 @@ fn main() {
                     Ok(report) => println!("opsin: {report}"),
                     Err(e) => {
                         eprintln!("opsin: paste-idt: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            if failed > 0 {
+                std::process::exit(1);
+            }
+        }
+        Some("--unpaste-idt") => {
+            let targets = &args[1..];
+            if targets.is_empty() {
+                eprintln!("opsin --unpaste-idt <frame>...");
+                std::process::exit(2);
+            }
+            let mut failed = 0;
+            for target in targets {
+                match idt::IdtClip::unpaste(std::path::Path::new(target)) {
+                    Ok(report) => println!("opsin: {report}"),
+                    Err(e) => {
+                        eprintln!("opsin: unpaste-idt: {e}");
                         failed += 1;
                     }
                 }

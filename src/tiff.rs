@@ -37,6 +37,7 @@ pub const TYPE_RATIONAL: u16 = 5;
 pub const TYPE_SRATIONAL: u16 = 10;
 
 pub const TAG_EXIF_IFD: u16 = 34665;
+pub const TAG_GPS_IFD: u16 = 34853;
 pub const TAG_EXPOSURE_TIME: u16 = 33434;
 pub const TAG_F_NUMBER: u16 = 33437;
 pub const TAG_ISO: u16 = 34855;
@@ -50,6 +51,15 @@ pub const TAG_ILL2: u16 = 50779;
 pub const TAG_PROFILE_NAME: u16 = 50936;
 pub const TAG_ICC: u16 = 34675;
 pub const TYPE_UNDEFINED: u16 = 7;
+pub const TYPE_BYTE: u16 = 1;
+/// DNG CameraCalibration1/2 (SRATIONAL×9): the per-unit correction every DNG reader multiplies ONTO the ColorMatrix — `XYZ→camera = CameraCalibration × ColorMatrix`. Where a VERICHROME IDT rides (see [`crate::idt`]).
+pub const TAG_CC1: u16 = 50723;
+pub const TAG_CC2: u16 = 50724;
+/// The pairing strings: a reader applies the CameraCalibration only when the camera profile's `ProfileCalibrationSignature` equals the `CameraCalibrationSignature`.
+pub const TAG_CC_SIGNATURE: u16 = 50931;
+pub const TAG_PROFILE_CAL_SIGNATURE: u16 = 50932;
+/// The XMP packet (TIFF tag 700): where the IDT's class, tier, observer and provenance live, in a `verichrome:` namespace.
+pub const TAG_XMP: u16 = 700;
 
 pub fn read_exact_at(f: &mut File, off: u64, buf: &mut [u8]) -> Result<(), String> {
     f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
@@ -84,6 +94,35 @@ pub fn walk_ifd(f: &mut File, ifd: u64, be: bool, tags: &[u16]) -> Result<Vec<(u
         }
     }
     Ok(out)
+}
+
+/// Every entry of one IFD, raw (12 bytes each, in file order), and its next-IFD pointer — for a writer that rebuilds the IFD elsewhere and must carry every entry it doesn't understand verbatim.
+pub fn read_ifd_raw(f: &mut File, ifd: u64, be: bool) -> Result<(Vec<[u8; 12]>, u32), String> {
+    let mut n = [0u8; 2];
+    read_exact_at(f, ifd, &mut n)?;
+    let n = u16e(&n, be) as usize;
+    let mut raw = vec![0u8; n * 12 + 4];
+    read_exact_at(f, ifd + 2, &mut raw)?;
+    let entries = (0..n).map(|i| raw[i * 12..i * 12 + 12].try_into().unwrap()).collect();
+    Ok((entries, u32e(&raw[n * 12..], be)))
+}
+
+/// The bytes of a BYTE / UNDEFINED / ASCII entry, inline when ≤ 4, else at the offset.
+pub fn bytes(f: &mut File, e: &Entry, be: bool) -> Option<Vec<u8>> {
+    if !matches!(e.ty, TYPE_BYTE | TYPE_UNDEFINED | TYPE_ASCII) || e.count == 0 {
+        return None;
+    }
+    if e.count <= 4 {
+        return Some(e.value[..e.count as usize].to_vec());
+    }
+    let mut b = vec![0u8; e.count as usize];
+    read_exact_at(f, u32e(&e.value, be) as u64, &mut b).ok()?;
+    Some(b)
+}
+
+/// A string from an ASCII or BYTE (UTF-8) entry, NUL-trimmed — the DNG signature tags are specified as either.
+pub fn text(f: &mut File, e: &Entry, be: bool) -> Option<String> {
+    bytes(f, e, be).map(|b| String::from_utf8_lossy(&b).trim_end_matches('\0').trim().to_string())
 }
 
 /// A single RATIONAL (unsigned) — `None` if the entry isn't one.
@@ -130,6 +169,20 @@ pub fn ascii(f: &mut File, e: &Entry, be: bool) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).trim_end_matches('\0').trim().to_string())
 }
 
+/// Three RATIONALs (a GPS degrees/minutes/seconds triple) as decimal degrees.
+pub fn rational3(f: &mut File, e: &Entry, be: bool) -> Option<f64> {
+    if e.ty != TYPE_RATIONAL || e.count != 3 {
+        return None;
+    }
+    let mut r = [0u8; 24];
+    read_exact_at(f, u32e(&e.value, be) as u64, &mut r).ok()?;
+    let part = |i: usize| {
+        let (n, d) = (u32e(&r[i * 8..], be), u32e(&r[i * 8 + 4..], be));
+        if d == 0 { 0.0 } else { n as f64 / d as f64 }
+    };
+    Some(part(0) + part(1) / 60.0 + part(2) / 3600.0)
+}
+
 /// The nine SRATIONALs a ColorMatrix entry points at, verbatim.
 pub fn srational9(f: &mut File, e: &Entry, be: bool) -> Result<[(i32, i32); 9], String> {
     if e.ty != TYPE_SRATIONAL || e.count != 9 {
@@ -162,16 +215,29 @@ pub struct FrameMeta {
     pub cm2: Option<Entry>,
     pub ill1: Option<Entry>,
     pub ill2: Option<Entry>,
+    /// Where IFD0 sits — the header's pointer, which a VERICHROME paste repoints at an appended copy.
+    pub ifd0: u64,
+    pub cc1: Option<Entry>,
+    pub cc2: Option<Entry>,
+    pub cc_signature: Option<String>,
+    pub profile_cal_signature: Option<String>,
+    /// The XMP packet (tag 700), verbatim.
+    pub xmp: Option<Vec<u8>>,
+    /// GPS IFD: (latitude, longitude) in signed degrees, and altitude in metres (negative below sea level) when present.
+    pub gps: Option<(f64, f64)>,
+    pub altitude_m: Option<f32>,
 }
 
 impl FrameMeta {
     pub fn read(f: &mut File) -> Result<FrameMeta, String> {
         let (be, ifd0) = header(f)?;
-        let mut m = FrameMeta { be, ..Default::default() };
+        let mut m = FrameMeta { be, ifd0, ..Default::default() };
         let mut exif_ifd = None;
-        for (tag, e) in walk_ifd(f, ifd0, be, &[TAG_EXIF_IFD, TAG_CM1, TAG_CM2, TAG_ILL1, TAG_ILL2, TAG_PROFILE_NAME, TAG_BASELINE_EXPOSURE, TAG_ICC])? {
+        let mut gps_ifd = None;
+        for (tag, e) in walk_ifd(f, ifd0, be, &[TAG_EXIF_IFD, TAG_GPS_IFD, TAG_CM1, TAG_CM2, TAG_ILL1, TAG_ILL2, TAG_PROFILE_NAME, TAG_BASELINE_EXPOSURE, TAG_ICC, TAG_CC1, TAG_CC2, TAG_CC_SIGNATURE, TAG_PROFILE_CAL_SIGNATURE, TAG_XMP])? {
             match tag {
                 TAG_EXIF_IFD => exif_ifd = Some(u32e(&e.value, be) as u64),
+                TAG_GPS_IFD => gps_ifd = Some(u32e(&e.value, be) as u64),
                 TAG_ICC if e.ty == TYPE_UNDEFINED && e.count > 4 => {
                     let mut b = vec![0u8; e.count as usize];
                     if read_exact_at(f, u32e(&e.value, be) as u64, &mut b).is_ok() {
@@ -184,6 +250,11 @@ impl FrameMeta {
                 TAG_ILL2 => m.ill2 = Some(e),
                 TAG_PROFILE_NAME => m.profile_name = ascii(f, &e, be),
                 TAG_BASELINE_EXPOSURE => m.baseline_exposure = srational(f, &e, be),
+                TAG_CC1 => m.cc1 = Some(e),
+                TAG_CC2 => m.cc2 = Some(e),
+                TAG_CC_SIGNATURE => m.cc_signature = text(f, &e, be),
+                TAG_PROFILE_CAL_SIGNATURE => m.profile_cal_signature = text(f, &e, be),
+                TAG_XMP => m.xmp = bytes(f, &e, be),
                 _ => {}
             }
         }
@@ -196,6 +267,34 @@ impl FrameMeta {
                     TAG_ISO => m.iso = scalar(&e, be),
                     TAG_DATETIME_ORIGINAL => m.datetime = ascii(f, &e, be),
                     _ => {}
+                }
+            }
+        }
+        if let Some(gps) = gps_ifd {
+            // GPSLatitudeRef(1) ASCII, GPSLatitude(2) RATIONAL×3 (deg, min, sec), GPSLongitudeRef(3), GPSLongitude(4), GPSAltitudeRef(5) BYTE (1 = below sea level), GPSAltitude(6) RATIONAL.
+            let (mut lat_ref, mut lon_ref, mut lat, mut lon, mut alt_ref, mut alt) = (String::new(), String::new(), None, None, 0u8, None);
+            for (tag, e) in walk_ifd(f, gps, be, &[1, 2, 3, 4, 5, 6])? {
+                match tag {
+                    1 => lat_ref = ascii(f, &e, be).unwrap_or_default(),
+                    3 => lon_ref = ascii(f, &e, be).unwrap_or_default(),
+                    2 => lat = rational3(f, &e, be),
+                    4 => lon = rational3(f, &e, be),
+                    5 => alt_ref = e.value[0],
+                    6 => alt = rational(f, &e, be),
+                    _ => {}
+                }
+            }
+            if let (Some(la), Some(lo)) = (lat, lon) {
+                let lat = if lat_ref.starts_with('S') { -la } else { la };
+                let lon = if lon_ref.starts_with('W') { -lo } else { lo };
+                if lat.is_finite() && lon.is_finite() {
+                    m.gps = Some((lat, lon));
+                }
+            }
+            if let Some((n, d)) = alt {
+                if d != 0 {
+                    let a = n as f32 / d as f32;
+                    m.altitude_m = Some(if alt_ref == 1 { -a } else { a });
                 }
             }
         }

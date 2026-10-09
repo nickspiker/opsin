@@ -23,6 +23,10 @@ pub struct ScanOutcome {
     pub readout: String,
     /// chameleon's full report, ANSI stripped, for stdout.
     pub report: String,
+    /// The observer the solve targeted, as the settings describe it (e.g. "CIE/CVRL 2006 2°") — into the pasted IDT's provenance.
+    pub observer: String,
+    /// The target that produced the IDT: (type, serial, its calibration timestamp).
+    pub cal: Option<(u32, u64, String)>,
 }
 
 /// Scan `path` for a target. Blocking — call from a thread. `Err` carries chameleon's reason (no target found, overexposed, no settings file…).
@@ -67,7 +71,8 @@ pub fn scan(path: &Path) -> Result<ScanOutcome, String> {
     if !warning.is_empty() {
         text.push_str(&warning);
     }
-    Ok(ScanOutcome { matrix, overlay, readout, report: strip_ansi(&text) })
+    let target = cal.as_ref().map(|c| (c.target_type, c.serial, c.timestamp.clone()));
+    Ok(ScanOutcome { matrix, overlay, readout, report: strip_ansi(&text), observer: settings.cmfdescription.clone(), cal: target })
 }
 
 /// chameleon's display light (linear, 0..1) → the encode's 0..65535 units.
@@ -114,6 +119,7 @@ mod tests {
             .and_then(|mut clip| {
                 clip.matrix = out.matrix;
                 clip.illuminant = 23;
+                clip.provenance = crate::idt::IdtProvenance::of_scan(&out.observer, out.cal.clone());
                 clip.paste_into(&p, false)
             })
             .expect("paste");
