@@ -1,6 +1,4 @@
-//! What a file IS, from its bytes — never from its name (Nick 2026-09-15: "why do we even care what the extension is?").
-//! Every format opsin opens announces itself in its first bytes; the one family that shares a signature (TIFF and the camera RAWs built on it) resolves itself further in by its own tags, and limbus already does that resolution by content.
-//! The only thing a name could tell us that bytes cannot is a headerless sensor dump, and a name cannot tell us that either — it has no dimensions, bit depth or CFA order to give. Those come from the statistics of the bytes themselves (see `headerless`).
+//! What a file IS, from its bytes — never from its name (Nick 2026-09-15: "why do we even care what the extension is?"). Every format opsin opens announces itself in its first bytes; the one family that shares a signature (TIFF and the camera RAWs built on it) resolves itself further in by its own tags, and limbus already does that resolution by content. The only thing a name could tell us that bytes cannot is a headerless sensor dump, and a name cannot tell us that either — it has no dimensions, bit depth or CFA order to give. Those come from the statistics of the bytes themselves (see `headerless`).
 
 /// The byte-recognised family of a file. Everything except `Unknown` has a decoder; `Unknown` goes to the headerless guesser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

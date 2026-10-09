@@ -1,6 +1,4 @@
-//! One-shot: wrap a 256×256 raw RGB blob into the VSF orb format `fluor::host::icon::Icon::from_vsf_bytes` expects — an `image` section with a `data` field holding a `t_u3` tensor of shape `[256, 256, 3]` (VSF-RGB gamma2, i.e. the stored bytes are the visible values the α+darkness decoder inverts). Run once to regenerate `assets/opsin_orb.vsf` after editing the source art:
-//!   magick opsin.png -resize 256x256! -depth 8 rgb:assets/opsin_orb.rgb
-//!   cargo run --bin make_orb
+//! One-shot: wrap a 256×256 raw RGB blob into the VSF orb format `fluor::host::icon::Icon::from_vsf_bytes` expects — an `image` section with a `data` field holding a `t_u3` tensor of shape `[256, 256, 3]` (VSF-RGB gamma2, i.e. the stored bytes are the visible values the α+darkness decoder inverts). Run once to regenerate `assets/opsin_orb.vsf` after editing the source art: magick opsin.png -resize 256x256! -depth 8 rgb:assets/opsin_orb.rgb cargo run --bin make_orb
 
 use vsf::{Tensor, VsfBuilder, VsfType};
 
