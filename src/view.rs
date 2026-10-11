@@ -1659,6 +1659,7 @@ impl View {
             clip.illuminant = 23; // D50 — what chameleon writes.
             clip.source = format!("chameleon scan of {}", path.display());
             clip.provenance = crate::idt::IdtProvenance::of_scan(&outcome.observer, outcome.cal.clone());
+            clip.response = outcome.response.clone();
             clip.paste_into(&path, false)
         });
         match pasted {
@@ -3277,7 +3278,7 @@ mod preview_upgrade_tests {
             profile: None,
             view: None,
         };
-        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() };
+        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None };
         let loaded = Loaded::from_decoded(dec, None, "t.dng", 0, None, true).unwrap();
         assert_eq!((loaded.w, loaded.h), (w / 2, h / 2), "the view starts on the binned render");
         let mut counter: HitId = 0;

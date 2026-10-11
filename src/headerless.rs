@@ -289,7 +289,7 @@ pub fn guess(bytes: &[u8]) -> Result<Decoded, String> {
         profile: None,
         view: None,
     };
-    Ok(Decoded { img, src_bits: (fmt.bytes() * 8) as u8, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default() })
+    Ok(Decoded { img, src_bits: (fmt.bytes() * 8) as u8, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None })
 }
 
 #[cfg(test)]

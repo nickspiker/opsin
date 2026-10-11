@@ -103,8 +103,76 @@ impl IdtProvenance {
     }
 }
 
-/// One copied IDT: the nine verbatim rationals + illuminant, what it claims, where it came from, and the fingerprint it may be pasted onto.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The camera's spectral response under the calibration light — the Relative IDT's stored half (`vsf/idt/relative.md`, "The representation"); the nine numbers are its cache. Carried in the clip, the `verichrome:` XMP of a DNG, and a VSF's `characterization`. One common scale across channels; linear band grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdtResponse {
+    pub start_nm: f32,
+    pub step_nm: f32,
+    pub channels: Vec<Vec<f32>>,
+    /// How the curves were regularised (`shortest`).
+    pub prior: String,
+    /// Identity of the calibration light (BLAKE3 of the scan), so two responses can be compared and a shot's illuminant ratio knows its reference.
+    pub light: Option<[u8; 32]>,
+}
+
+pub fn response_to_vsf(r: &IdtResponse) -> vsf::visual::SpectralResponse {
+    vsf::visual::SpectralResponse { start_nm: r.start_nm, step_nm: r.step_nm, channels: r.channels.clone(), prior: r.prior.clone(), light: r.light }
+}
+
+pub fn response_of_vsf(r: &vsf::visual::SpectralResponse) -> IdtResponse {
+    IdtResponse { start_nm: r.start_nm, step_nm: r.step_nm, channels: r.channels.clone(), prior: r.prior.clone(), light: r.light }
+}
+
+fn hex32(h: &[u8; 32]) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+impl IdtResponse {
+    /// The XMP attributes a paste writes: `ResponseGrid="start step count"`, `Response="v v …;v v …"` (channels `;`-separated, channel-major), `ResponsePrior`, `ResponseLight` (hex).
+    fn xmp_attrs(&self) -> String {
+        let n = self.channels.first().map_or(0, Vec::len);
+        let values: Vec<String> = self.channels.iter().map(|c| c.iter().map(|v| format!("{v:.6e}")).collect::<Vec<_>>().join(" ")).collect();
+        format!(
+            "\n   verichrome:ResponseGrid=\"{} {} {}\"\n   verichrome:ResponsePrior=\"{}\"\n   verichrome:ResponseLight=\"{}\"\n   verichrome:Response=\"{}\"",
+            self.start_nm,
+            self.step_nm,
+            n,
+            xml_escape(&self.prior),
+            self.light.map(|l| hex32(&l)).unwrap_or_default(),
+            values.join(";")
+        )
+    }
+
+    /// From a `verichrome:` packet; `None` when it carries no response or a malformed one.
+    pub fn from_xmp(xmp: &str) -> Option<IdtResponse> {
+        let grid = xmp_attr(xmp, "ResponseGrid")?;
+        let g: Vec<&str> = grid.split_whitespace().collect();
+        if g.len() != 3 {
+            return None;
+        }
+        let (start_nm, step_nm, n): (f32, f32, usize) = (g[0].parse().ok()?, g[1].parse().ok()?, g[2].parse().ok()?);
+        let channels: Vec<Vec<f32>> = xmp_attr(xmp, "Response")?.split(';').map(|c| c.split_whitespace().map(|v| v.parse::<f32>()).collect::<Result<Vec<_>, _>>()).collect::<Result<_, _>>().ok()?;
+        if n == 0 || channels.is_empty() || channels.iter().any(|c| c.len() != n) {
+            return None;
+        }
+        Some(IdtResponse { start_nm, step_nm, channels, prior: xmp_attr(xmp, "ResponsePrior").unwrap_or_default(), light: xmp_attr(xmp, "ResponseLight").and_then(|h| unhex32(&h)) })
+    }
+}
+
+/// One copied IDT: the nine verbatim rationals + illuminant, what it claims, where it came from, the fingerprint it may be pasted onto, and — when the scan produced one — the spectral response the nine numbers were derived from.
+#[derive(Debug, Clone, PartialEq)]
 pub struct IdtClip {
     /// Path of the frame it was copied from — audit, not identity.
     pub source: String,
@@ -114,6 +182,7 @@ pub struct IdtClip {
     /// XYZ→camera, row-major, verbatim SRATIONALs.
     pub matrix: [SRational; 9],
     pub provenance: IdtProvenance,
+    pub response: Option<IdtResponse>,
 }
 
 /// What a paste did, for the caller to surface. Undo is [`IdtClip::unpaste`]: the original IFD0 offset and file length are in the file's XMP.
@@ -306,7 +375,7 @@ fn description(clip: &IdtClip, signature: &str, orig_ifd0: u32, orig_len: u64, p
     let p = &clip.provenance;
     let matrix: Vec<String> = clip.matrix.iter().map(|(n, d)| format!("{n}/{d}")).collect();
     format!(
-        "<rdf:Description rdf:about=\"\" xmlns:verichrome=\"{VERICHROME_NS}\"\n   verichrome:IdtClass=\"{}\"\n   verichrome:IdtTier=\"{}\"\n   verichrome:Observer=\"{}\"\n   verichrome:Illuminant=\"{}\"\n   verichrome:Matrix=\"{}\"\n   verichrome:TargetType=\"{}\"\n   verichrome:TargetSerial=\"{}\"\n   verichrome:TargetCalibrated=\"{}\"\n   verichrome:Scanned=\"{}\"\n   verichrome:Source=\"{}\"\n   verichrome:Signature=\"{}\"\n   verichrome:Pasted=\"{}\"\n   verichrome:OriginalIFD0=\"{}\"\n   verichrome:OriginalLength=\"{}\"/>",
+        "<rdf:Description rdf:about=\"\" xmlns:verichrome=\"{VERICHROME_NS}\"\n   verichrome:IdtClass=\"{}\"\n   verichrome:IdtTier=\"{}\"\n   verichrome:Observer=\"{}\"\n   verichrome:Illuminant=\"{}\"\n   verichrome:Matrix=\"{}\"\n   verichrome:TargetType=\"{}\"\n   verichrome:TargetSerial=\"{}\"\n   verichrome:TargetCalibrated=\"{}\"\n   verichrome:Scanned=\"{}\"\n   verichrome:Source=\"{}\"\n   verichrome:Signature=\"{}\"\n   verichrome:Pasted=\"{}\"\n   verichrome:OriginalIFD0=\"{}\"\n   verichrome:OriginalLength=\"{}\"",
         xml_escape(&p.class),
         xml_escape(&p.tier),
         xml_escape(&p.observer),
@@ -321,7 +390,8 @@ fn description(clip: &IdtClip, signature: &str, orig_ifd0: u32, orig_len: u64, p
         pasted,
         orig_ifd0,
         orig_len
-    )
+    ) + &clip.response.as_ref().map(|r| r.xmp_attrs()).unwrap_or_default()
+        + "/>"
 }
 
 /// The description placed in a packet: into the file's existing XMP before `</rdf:RDF>` (replacing an earlier verichrome description if there is one — everything else byte for byte), else a fresh packet. Trailing whitespace padding is the XMP convention that lets later editors rewrite in place.
@@ -390,7 +460,7 @@ impl IdtClip {
                         scanned: get("Scanned"),
                     };
                     let illuminant = get("Illuminant").parse().unwrap_or(23);
-                    return Ok(IdtClip { source, fingerprint, illuminant, matrix, provenance });
+                    return Ok(IdtClip { source, fingerprint, illuminant, matrix, provenance, response: IdtResponse::from_xmp(xmp) });
                 }
             }
         }
@@ -398,7 +468,7 @@ impl IdtClip {
         let matrix = srational9(&mut f, &cm1, tags.be)?;
         let cm2 = tags.cm2.and_then(|e| srational9(&mut f, &e, tags.be).ok());
         let provenance = if looks_like_chameleon(&tags, &matrix, cm2.as_ref()) { IdtProvenance::chameleon() } else { IdtProvenance::factory() };
-        Ok(IdtClip { source, fingerprint, illuminant: tags.illuminant1(), matrix, provenance })
+        Ok(IdtClip { source, fingerprint, illuminant: tags.illuminant1(), matrix, provenance, response: None })
     }
 
     fn copy_from_vsf(path: &Path) -> Result<IdtClip, String> {
@@ -423,7 +493,7 @@ impl IdtClip {
             },
             None => IdtProvenance::factory(),
         };
-        Ok(IdtClip { source: path.display().to_string(), fingerprint, illuminant, matrix, provenance })
+        Ok(IdtClip { source: path.display().to_string(), fingerprint, illuminant, matrix, provenance, response: v.response.as_ref().map(response_of_vsf) })
     }
 
     /// Paste into a VSF visual: a generation appended to the file carrying a `characterization` with this IDT as its first entry (the file's own entries follow), the IDT's XYZ→camera matrix in the verbatim slot so a copy out is exact, the target provenance in `cal`, and the pairing string in `foreign`. Nothing original moves; undo is truncation.
@@ -449,7 +519,7 @@ impl IdtClip {
         let mut foreign = vis.foreign.clone();
         foreign.calibration_signature = signature.clone();
         let add = vsf::container::Appender::new("opsin", "paste idt")
-            .add_section("characterization", vsf::visual::characterization_fields(&profile, &observer))
+            .add_section("characterization", vsf::visual::characterization_fields(&profile, &observer, self.response.as_ref().map(response_to_vsf).as_ref()))
             .add_section("foreign", foreign.fields())
             .supersede("colour_profile")
             .build(&doc)
@@ -606,7 +676,7 @@ impl IdtClip {
         let fp = &self.fingerprint;
         let p = &self.provenance;
         let mut s = String::new();
-        s.push_str("opsin-idt 2\n");
+        s.push_str("opsin-idt 3\n");
         s.push_str(&format!("source {}\n", self.source));
         s.push_str(&format!("make {}\n", fp.make));
         s.push_str(&format!("model {}\n", fp.model));
@@ -629,6 +699,19 @@ impl IdtClip {
             s.push_str(&format!(" {n}/{d}"));
         }
         s.push('\n');
+        if let Some(r) = &self.response {
+            // The response: grid, prior, light, then one line per camera channel.
+            s.push_str(&format!("response_grid {} {} {}\n", r.start_nm, r.step_nm, r.channels.first().map_or(0, Vec::len)));
+            s.push_str(&format!("response_prior {}\n", r.prior));
+            s.push_str(&format!("response_light {}\n", r.light.map(|l| hex32(&l)).unwrap_or_else(|| "-".into())));
+            for c in &r.channels {
+                s.push_str("response");
+                for v in c {
+                    s.push_str(&format!(" {v:.6e}"));
+                }
+                s.push('\n');
+            }
+        }
         s
     }
 
@@ -638,6 +721,7 @@ impl IdtClip {
         let version = match lines.next().map(str::trim) {
             Some("opsin-idt 1") => 1,
             Some("opsin-idt 2") => 2,
+            Some("opsin-idt 3") => 3,
             _ => return Err("not an opsin-idt clip".to_string()),
         };
         let mut source = String::new();
@@ -646,6 +730,10 @@ impl IdtClip {
         let mut matrix: Option<[SRational; 9]> = None;
         let mut p = IdtProvenance::factory();
         let _ = version;
+        let mut grid: Option<(f32, f32, usize)> = None;
+        let mut channels: Vec<Vec<f32>> = Vec::new();
+        let mut response_prior = String::new();
+        let mut response_light: Option<[u8; 32]> = None;
         let rat = |s: &str| -> Result<(i64, i64), String> {
             let (n, d) = s.split_once('/').ok_or_else(|| format!("bad rational '{s}'"))?;
             Ok((n.parse().map_err(|_| format!("bad rational '{s}'"))?, d.parse().map_err(|_| format!("bad rational '{s}'"))?))
@@ -696,6 +784,15 @@ impl IdtClip {
                 }
                 "calibrated" => p.target_calibrated = rest.trim().to_string(),
                 "scanned" => p.scanned = rest.trim().to_string(),
+                "response_grid" => {
+                    if words.len() != 3 {
+                        return Err("response_grid needs start step count".to_string());
+                    }
+                    grid = Some((words[0].parse().map_err(|_| "bad response start")?, words[1].parse().map_err(|_| "bad response step")?, words[2].parse().map_err(|_| "bad response count")?));
+                }
+                "response_prior" => response_prior = rest.trim().to_string(),
+                "response_light" => response_light = unhex32(rest),
+                "response" => channels.push(words.iter().map(|w| w.parse::<f32>().map_err(|_| format!("bad response value '{w}'"))).collect::<Result<_, _>>()?),
                 "matrix" => {
                     if words.len() != 9 {
                         return Err(format!("matrix needs 9 rationals, got {}", words.len()));
@@ -715,7 +812,16 @@ impl IdtClip {
         if fp.cfa.len() != fp.cfa_w as usize * fp.cfa_h as usize {
             return Err("cfa cells don't match cfa dims".to_string());
         }
-        Ok(IdtClip { source, fingerprint: fp, illuminant, matrix, provenance: p })
+        let response = match (grid, channels.is_empty()) {
+            (Some((start_nm, step_nm, n)), false) => {
+                if channels.iter().any(|c| c.len() != n) {
+                    return Err("response channels do not match response_grid count".to_string());
+                }
+                Some(IdtResponse { start_nm, step_nm, channels, prior: response_prior, light: response_light })
+            }
+            _ => None,
+        };
+        Ok(IdtClip { source, fingerprint: fp, illuminant, matrix, provenance: p, response })
     }
 
     /// Where the clip persists: `$XDG_CONFIG_HOME/opsin/idt.clip`, else `~/.config/opsin/idt.clip`.
@@ -847,6 +953,27 @@ mod tests {
     const FACTORY_A: [SRational; 9] = [(15311, 10000), (-7263, 10000), (-2355, 10000), (-11733, 10000), (22710, 10000), (503, 10000), (854, 10000), (-3131, 10000), (16227, 10000)];
     const FACTORY_D65: [SRational; 9] = [(15708, 10000), (-7451, 10000), (-2416, 10000), (-9692, 10000), (18760, 10000), (415, 10000), (353, 10000), (-1295, 10000), (6710, 10000)];
 
+    /// A three-channel response on a 5-band grid, one common scale, as a scan would hand over.
+    fn sample_response() -> IdtResponse {
+        IdtResponse { start_nm: 400.0, step_nm: 80.0, channels: vec![vec![0.0, 0.1, 0.4, 1.0, 0.3], vec![0.1, 0.7, 1.3, 0.5, 0.0], vec![0.9, 1.1, 0.2, 0.0, 0.0]], prior: "shortest".into(), light: Some([7u8; 32]) }
+    }
+
+    /// The response rides the DNG paste in the `verichrome:` XMP and comes back on copy, exact (`{:.6e}` is more than f32 carries).
+    #[test]
+    fn a_pasted_response_rides_the_xmp_and_copies_back() {
+        let src = tmp("resp.dng", &synth_dng("SIGMA", "SIGMA fp", 6064, 4042, [0, 1, 1, 2], (45, 1), FACTORY_A, Some(FACTORY_D65), None));
+        let mut clip = chameleon_clip(&src);
+        clip.response = Some(sample_response());
+        clip.paste_into(&src, false).unwrap();
+        let back = IdtClip::copy_from(&src).unwrap();
+        assert_eq!(back.response, clip.response);
+        assert_eq!(back.matrix, MAGIC);
+        // A clip without one writes none, and a copy sees none.
+        let plain = tmp("plain.dng", &synth_dng("SIGMA", "SIGMA fp", 6064, 4042, [0, 1, 1, 2], (45, 1), FACTORY_A, Some(FACTORY_D65), None));
+        chameleon_clip(&plain).paste_into(&plain, false).unwrap();
+        assert_eq!(IdtClip::copy_from(&plain).unwrap().response, None);
+    }
+
     fn chameleon_clip(src: &Path) -> IdtClip {
         let mut clip = IdtClip::copy_from(src).unwrap();
         clip.matrix = MAGIC;
@@ -880,11 +1007,16 @@ mod tests {
         assert_eq!(clip.provenance, IdtProvenance::chameleon());
         let back = IdtClip::from_text(&clip.to_text()).unwrap();
         assert_eq!(back, clip);
+        // With a response: the curves, prior and light ride the text form exactly.
+        let mut with = clip.clone();
+        with.response = Some(sample_response());
+        let back = IdtClip::from_text(&with.to_text()).unwrap();
+        assert_eq!(back, with);
         // A factory pair copies as what it is.
         let fac = tmp("fac.dng", &synth_dng("SIGMA", "SIGMA fp", 6064, 4042, [0, 1, 1, 2], (45, 1), FACTORY_A, Some(FACTORY_D65), None));
         assert_eq!(IdtClip::copy_from(&fac).unwrap().provenance, IdtProvenance::factory());
         // A v1 clip still reads.
-        let v1 = clip.to_text().replace("opsin-idt 2", "opsin-idt 1").lines().filter(|l| !l.starts_with("class") && !l.starts_with("tier") && !l.starts_with("observer") && !l.starts_with("target") && !l.starts_with("calibrated") && !l.starts_with("scanned")).collect::<Vec<_>>().join("\n");
+        let v1 = clip.to_text().replace("opsin-idt 3", "opsin-idt 1").lines().filter(|l| !l.starts_with("class") && !l.starts_with("tier") && !l.starts_with("observer") && !l.starts_with("target") && !l.starts_with("calibrated") && !l.starts_with("scanned")).collect::<Vec<_>>().join("\n");
         assert_eq!(IdtClip::from_text(&v1).unwrap().matrix, MAGIC);
     }
 

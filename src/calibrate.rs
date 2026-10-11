@@ -27,6 +27,8 @@ pub struct ScanOutcome {
     pub observer: String,
     /// The target that produced the IDT: (type, serial, its calibration timestamp).
     pub cal: Option<(u32, u64, String)>,
+    /// The camera's spectral response under the scan's light, when the target carried spectra — what the nine numbers were derived from, and what a relight needs.
+    pub response: Option<crate::idt::IdtResponse>,
 }
 
 /// Scan `path` for a target. Blocking — call from a thread. `Err` carries chameleon's reason (no target found, overexposed, no settings file…).
@@ -72,7 +74,8 @@ pub fn scan(path: &Path) -> Result<ScanOutcome, String> {
         text.push_str(&warning);
     }
     let target = cal.as_ref().map(|c| (c.target_type, c.serial, c.timestamp.clone()));
-    Ok(ScanOutcome { matrix, overlay, readout, report: strip_ansi(&text), observer: settings.cmfdescription.clone(), cal: target })
+    let response = cal.as_ref().and_then(|c| c.spectral.as_ref()).map(|r| crate::idt::IdtResponse { start_nm: r.start_nm, step_nm: r.step_nm, channels: r.channels.clone(), prior: r.prior.clone(), light: Some(r.light) });
+    Ok(ScanOutcome { matrix, overlay, readout, report: strip_ansi(&text), observer: settings.cmfdescription.clone(), cal: target, response })
 }
 
 /// chameleon's display light (linear, 0..1) → the encode's 0..65535 units.
@@ -120,6 +123,7 @@ mod tests {
                 clip.matrix = out.matrix;
                 clip.illuminant = 23;
                 clip.provenance = crate::idt::IdtProvenance::of_scan(&out.observer, out.cal.clone());
+                clip.response = out.response.clone();
                 clip.paste_into(&p, false)
             })
             .expect("paste");
