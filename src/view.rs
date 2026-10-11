@@ -3278,7 +3278,7 @@ mod preview_upgrade_tests {
             profile: None,
             view: None,
         };
-        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None };
+        let dec = crate::convert::Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() };
         let loaded = Loaded::from_decoded(dec, None, "t.dng", 0, None, true).unwrap();
         assert_eq!((loaded.w, loaded.h), (w / 2, h / 2), "the view starts on the binned render");
         let mut counter: HitId = 0;

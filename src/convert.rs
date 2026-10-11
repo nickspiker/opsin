@@ -30,6 +30,10 @@ pub struct Decoded {
     pub foreign: vsf::visual::Foreign,
     /// The camera's spectral response under its calibration light, when the source carried one (a VSF `characterization`, or a pasted DNG's `verichrome:` XMP) — the Relative IDT's stored half.
     pub response: Option<vsf::visual::SpectralResponse>,
+    /// Free text the source carries — a visual's `text` (lumis writes its exposure provenance there) — kept across a convert.
+    pub text: String,
+    /// The observer the characterization's matrices target, as the source names it (`cie1931`, `cvrl2006`); empty when unstated.
+    pub observer: String,
 }
 
 /// Transpose a 3×3 — bridges vsf::colour's column-major storage to opsin's row-major convention. const so the bridged constants are compile-time.
@@ -316,7 +320,7 @@ fn planar_rgb(w: usize, h: usize, planar: Vec<u16>, profile: Option<ColourProfil
         profile,
         view: None,
     };
-    Decoded { img, src_bits, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None }
+    Decoded { img, src_bits, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() }
 }
 
 /// The colour decision every 8-bit display-referred ingest makes: an embedded matrix/TRC ICC profile is a DECLARED characterization and wins (its curves linearize, its colorants → XYZ → VSF RGB, `Model` tier, source `icc:<description>`); no profile — or one of a kind opsin can't honour — falls back to the sRGB convention at `Assumed` tier, and the fallback says so in the source when a profile was there but declined. Returns the linear planar plane + the camera→VSF matrix + the source label + the tier.
@@ -667,7 +671,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     capture.baseline = baseline_ev;
     // A pasted DNG carries the response in its XMP; the VSF convert keeps it in `characterization`.
     let response = foreign.xmp.as_deref().and_then(|b| std::str::from_utf8(b).ok()).and_then(crate::idt::IdtResponse::from_xmp).map(|r| crate::idt::response_to_vsf(&r));
-    Ok(Decoded { img, src_bits: bit_depth as u8, baseline_ev, crop_hint, capture, foreign, response })
+    Ok(Decoded { img, src_bits: bit_depth as u8, baseline_ev, crop_hint, capture, foreign, response, text: String::new(), observer: String::new() })
 }
 
 /// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input clamp is load-bearing: past the rail the cubic FOLDS BACK, so overs must pin to the rail first (the encode boundary's clamp already does). Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
@@ -727,17 +731,27 @@ pub fn visual_of(dec: &Decoded) -> vsf::visual::Visual {
         p.at = dec.capture.at;
     }
     v.response = dec.response.clone();
+    v.text = dec.text.clone();
+    v.observer = dec.observer.clone();
     v
 }
 
 /// A visual back into a decode: the primary plane as the image, the capture facts and foreign metadata on the decode, the baseline mirrored, the maker's crop as the hint.
 fn decoded_of_visual(v: vsf::visual::Visual) -> Result<Decoded, String> {
-    let img = v.to_spectral_image().map_err(|e| e.to_string())?;
+    let mut img = v.to_spectral_image().map_err(|e| e.to_string())?;
     let plane = v.primary_plane().ok_or("visual has no plane")?;
+    // The plane's EXIF orientation is a hint for the `orientation` op (`idt/image.md`); a writer that stated it only on the plane (lumis) still means it, so it becomes the first view op unless the graph already orients.
+    if (2..=8).contains(&plane.orientation) && orientation_code(&img) == 1 {
+        let op = ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![plane.orientation as f32] };
+        match img.view.as_mut() {
+            Some(view) => view.ops.insert(0, op),
+            None => img.view = orientation_view(plane.orientation),
+        }
+    }
     let crop_hint = plane.maker_crop.map(|[x, y, w, h]| [x as usize, y as usize, (x + w) as usize, (y + h) as usize]).filter(|&[x0, y0, x1, y1]| x0 < x1 && y0 < y1 && x1 <= plane.width && y1 <= plane.height);
     let capture = v.capture.clone().unwrap_or_default();
     let src_bits = if plane.depth == 0 { img.bit_depth() } else { plane.depth };
-    Ok(Decoded { baseline_ev: capture.baseline, crop_hint, src_bits, capture, foreign: v.foreign.clone(), response: v.response.clone(), img })
+    Ok(Decoded { baseline_ev: capture.baseline, crop_hint, src_bits, capture, foreign: v.foreign.clone(), response: v.response.clone(), text: v.text.clone(), observer: v.observer.clone(), img })
 }
 
 /// The capture facts and foreign metadata out of a TIFF-family header. EXIF's date-time is local with no zone, so it rides as text; the instant stays unknown rather than guessed.
@@ -1267,7 +1281,7 @@ mod tests {
                 ops: vec![ViewOp { name: "orientation".to_string(), class: IdtClass::Technical, params: vec![8.] }],
             }),
         };
-        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None }, Target::VsfRgb).unwrap();
+        let (w, h, lin) = to_linear_in(&Decoded { img, src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() }, Target::VsfRgb).unwrap();
         assert_eq!((w, h), (1, 2));
         assert_eq!(lin, vec![20, 40, 60, 10, 30, 50]);
     }
@@ -1294,7 +1308,7 @@ mod tests {
                 profile: Some(ColourProfile { target: "vsf_rgb".to_string(), entries: vec![entry.clone()], dng_colormatrix: [None, None], patches: None, cal: None }),
                 view: None,
             };
-            let dec = Decoded { img, src_bits: 16, baseline_ev: 3.925, crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None };
+            let dec = Decoded { img, src_bits: 16, baseline_ev: 3.925, crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() };
             let gains = display_channel_gains(&dec, Target::Rec2020);
             let lin = to_linear(&dec).unwrap().2;
             for ch in 0..3 {
@@ -1321,6 +1335,8 @@ mod tests {
             capture: Default::default(),
             foreign: Default::default(),
             response: None,
+            text: String::new(),
+            observer: String::new(),
         };
         let gains = display_channel_gains(&dec, Target::Rec2020);
         let flat = 3.925f32.exp2();
@@ -1346,7 +1362,7 @@ mod tests {
             make: String::new(), model: String::new(), provenance: Provenance::default(),
             profile: profile.clone(), view: None,
         };
-        let dec = Decoded { img: mk(Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1])), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None };
+        let dec = Decoded { img: mk(Tensor::new(vec![2, 2], vec![1u8, 2, 0, 1])), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() };
         let (bw, bh, blin) = to_linear(&dec).unwrap();
         let (fw, fh, flin) = to_linear_full(&dec, Target::Rec2020, &|_| {}).unwrap();
         assert_eq!((bw, bh), (w / 2, h / 2), "the binned path halves each axis");
@@ -1357,7 +1373,7 @@ mod tests {
             assert!((mf / mb - 1.).abs() < 0.01, "ch{ch}: binned mean {mb:.0} vs full {mf:.0}");
         }
         // Quad-Bayer: RCD is a 2×2 algorithm, so this falls back to the binned render.
-        let quad = Decoded { img: mk(Tensor::new(vec![4, 4], vec![1u8, 1, 2, 2, 1, 1, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1])), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None };
+        let quad = Decoded { img: mk(Tensor::new(vec![4, 4], vec![1u8, 1, 2, 2, 1, 1, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1])), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() };
         let (qw, qh, _) = to_linear_full(&quad, Target::Rec2020, &|_| {}).unwrap();
         assert_eq!((qw, qh), (w / 4, h / 4), "a non-Bayer tile falls back to the bin");
     }
@@ -1377,7 +1393,7 @@ mod tests {
             profile: None,
             view: None,
         };
-        to_linear_in(&Decoded { img, src_bits: 16, baseline_ev, crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None }, Target::VsfRgb).unwrap().2
+        to_linear_in(&Decoded { img, src_bits: 16, baseline_ev, crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() }, Target::VsfRgb).unwrap().2
     }
 
     #[test]
@@ -1414,7 +1430,7 @@ mod tests {
         img.view = Some(op("exposure", 1.5));
         assert_eq!(stored_exposure_ev(&img), Some(1.5));
         // It is the OPERATOR's setting, so it must not also gain the render — that double-count is the whole reason baseline and slider stay separate.
-        let plain = to_linear_in(&Decoded { img: img.clone(), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None }, Target::VsfRgb).unwrap().2;
+        let plain = to_linear_in(&Decoded { img: img.clone(), src_bits: 16, baseline_ev: 0., crop_hint: None, capture: Default::default(), foreign: Default::default(), response: None, text: String::new(), observer: String::new() }, Target::VsfRgb).unwrap().2;
         assert_eq!(plain, vec![10, 20, 30], "a recorded exposure does not touch the render");
         // An orientation-only log records no exposure; a non-finite param is not one either.
         img.view = Some(op("orientation", 8.));
@@ -1515,6 +1531,38 @@ mod visual_roundtrip {
             std::fs::remove_file(&out).ok();
         }
         std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn a_plane_orientation_hint_orients_the_render_and_text_and_observer_survive() {
+        // As lumis writes it: orientation stated on the plane only, no view op; free text and an observer on the visual.
+        use vsf::spectral_image::{ColourProfile, IdtClass, PlaneLayout, ProfileEntry, ProfileTier, SpectralChannel, Transfer};
+        use vsf::types::{BitPackedTensor, Tensor};
+        let samples: Vec<u16> = (0..8 * 4).map(|i| (i * 97 % 1000) as u16 + 64).collect();
+        let channels = super::rgb_channel_names().into_iter().map(|name| SpectralChannel { name, curve: None }).collect();
+        let mut plane = vsf::visual::Plane::sensor("b0", "s0", 8, 4, channels, PlaneLayout::Mosaic { cfa: Tensor::new(vec![2, 2], vec![0u8, 1, 1, 2]) }, vec![64.; 3], vec![1023.; 3], BitPackedTensor::pack_u16(10, vec![4, 8], &samples));
+        plane.orientation = 6;
+        // The observer belongs to a characterization; lumis writes the camera's own matrix when nothing better exists.
+        let profile = ColourProfile { target: "vsf_rgb".into(), entries: vec![ProfileEntry { matrix: [1., 0., 0., 0., 1., 0., 0., 0., 1.], source: "android_sensor_color_transform".into(), class: IdtClass::Absolute, tier: ProfileTier::Model, illuminant: 21, transfer: Transfer::Linear }], dng_colormatrix: [None, None], patches: None, cal: None };
+        let mut v = vsf::visual::Visual::still(plane, None, Some(profile), &[]);
+        v.text = "Lumis average | integration: 1x 0.0039s".into();
+        v.observer = "cie1931".into();
+        let dir = std::env::temp_dir().join(format!("opsin-orient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("lumis.vsf");
+        std::fs::write(&p, v.write().unwrap()).unwrap();
+        let dec = super::load_any(&p).unwrap();
+        assert_eq!(super::orientation_code(&dec.img), 6);
+        let (w, h, _) = super::to_linear(&dec).unwrap();
+        assert!(h > w, "a code-6 frame renders portrait: {w}×{h}");
+        assert_eq!((dec.text.as_str(), dec.observer.as_str()), ("Lumis average | integration: 1x 0.0039s", "cie1931"));
+        // And a convert keeps all three, without stacking a second orientation op.
+        let again = dir.join("again.vsf");
+        super::write_vsf(&dec, &again).unwrap();
+        let back = super::load_any(&again).unwrap();
+        assert_eq!(back.img.view.as_ref().map(|v| v.ops.iter().filter(|o| o.name == "orientation").count()), Some(1));
+        assert_eq!((back.text, back.observer), (dec.text, dec.observer));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
