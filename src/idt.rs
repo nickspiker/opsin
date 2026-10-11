@@ -6,7 +6,7 @@
 //!
 //! **No original byte moves.** New tags need a bigger IFD0, so the paste APPENDS a copy of IFD0 with the added entries (and their data) at the end of the file and repoints the header's one 4-byte IFD0 offset at it. Every entry the paste doesn't understand is carried verbatim — their offsets still point where they always did. The original IFD0 and length are recorded in the XMP, so [`IdtClip::unpaste`] restores the file byte for byte: one 4-byte write and a truncate. A second paste carries the FIRST paste's originals forward, so undo always lands on the untouched file.
 //!
-//! The fingerprint is make, model, raw-plane dims, CFA tile, focal length — any mismatch refuses by default, in two tiers: SOFT (focal, dims — a lens change, a crop mode, lumis's 2×-height slitscan ring: the same sensor legitimately changes these) and HARD (make, model, CFA tile — a different sensor). `force` pastes through either, and the report records what was overridden. Focal length is not lens trivia here: a phone's main/ultrawide/tele are DIFFERENT SENSORS behind one Make/Model ("Android"/"Lumis"), and focal length is the field that tells them apart.
+//! The fingerprint is make, model, raw-plane dims, CFA tile, focal length. The gate (Nick 2026-10-10): make and model match → paste, no warning — dims, CFA phase and focal are what one sensor legitimately changes across crop modes, lenses and lumis's slitscan ring, and the IDT is a property of the sensor; make or model differ → refuse unless forced (`Ctrl+Shift+V`, `--force`), and the report then carries a WARNING naming what differed; a different channel count (a Bayer IDT onto a monochrome sensor) → refuse always. Caveat kept on record: a phone's main/ultrawide/tele are different sensors behind one Make/Model ("Android"/"Lumis") and only focal length tells them apart — that paste goes through silently under this rule.
 //!
 //! The clip persists as readable text ([`IdtClip::to_text`]) at `$XDG_CONFIG_HOME/opsin/idt.clip`, so copy/paste crosses folders and launches, and the nine numbers can be kept, shared, and read by eye. Copy also works from a VSF-Image that carries a verbatim DNG matrix in its colour_profile (f32 there, so rationals are reconstructed exactly from the f32 — den 2^24); paste INTO a VSF is not wired yet: it would add a `unit`-tier colour_profile entry rather than patch a tag, and rewriting a container has provenance rules to settle first.
 
@@ -37,6 +37,14 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// How many colour channels the CFA tile names (3 for a Bayer tile, 1 for a monochrome sensor, 4 for RGBW) — the one thing an IDT can never be pasted across.
+    pub fn channels(&self) -> usize {
+        let mut seen: Vec<u8> = self.cfa.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len().max(1)
+    }
+
     /// Field-by-field comparison; the names of every field that differs (empty ⇒ match). Focal compares by cross-multiplication so 69/10 and 6900/1000 agree; a focal on one side only is a mismatch (an unknown is not a match).
     pub fn diff(&self, other: &Fingerprint) -> Vec<&'static str> {
         let mut d = Vec::new();
@@ -244,21 +252,22 @@ fn fingerprint_of_visual(v: &vsf::visual::Visual) -> Result<Fingerprint, String>
     Ok(Fingerprint { make: cap.make.clone(), model: cap.model.clone(), width: p.width, height: p.height, cfa_w, cfa_h, cfa, focal })
 }
 
-/// The fingerprint gate shared by every paste: without `force`, ANY differing field refuses, naming the fields and the tier. Returns the overridden fields (empty for a clean paste).
+/// The fingerprint gate shared by every paste (Nick 2026-10-10). Make and model match → paste, no warning: dims, CFA phase and focal length are what one sensor legitimately changes across crop modes, lenses and slitscan rings, and the response is a property of the sensor. Make or model differ → refuse, unless `force` (`Ctrl+Shift+V`, `--force`), and then the report carries the warning. Channel count differs (a Bayer IDT onto a Leica Monochrom, a seven-channel camera) → refuse always: an IDT for K channels has no meaning on K′, and scaling anything off a single patch without the spectral maths would be doing it wrong. Returns the fields overridden by force (empty for a clean paste).
 fn gate(clip: &Fingerprint, target: &Path, fp: &Fingerprint, force: bool) -> Result<Vec<&'static str>, String> {
+    let (kc, kt) = (clip.channels(), fp.channels());
+    if kc != kt {
+        return Err(format!("{}: the copied IDT is for a {kc}-channel camera and this frame has {kt} channels (target cfa {}×{} {:?}; clip cfa {}×{} {:?}) — no IDT crosses a channel count", target.display(), fp.cfa_w, fp.cfa_h, fp.cfa, clip.cfa_w, clip.cfa_h, clip.cfa));
+    }
     let diff = fp.diff(clip);
-    let soft_only = diff.iter().all(|f| *f == "focal" || *f == "sensor");
-    if !diff.is_empty() && !force {
-        let tier = if soft_only {
-            "focal length / raw dims differ — a lens change, a crop mode, or a slitscan ring keeps the sensor (IDT still valid); on a phone a focal change means a different camera module. Pass --force (Ctrl+Shift+V) to paste anyway"
-        } else {
-            "different CFA tile or camera name — almost certainly a different sensor. Pass --force (Ctrl+Shift+V) only if you know better"
-        };
+    let camera = diff.iter().any(|f| *f == "make" || *f == "model");
+    if !camera {
+        return Ok(Vec::new());
+    }
+    if !force {
         return Err(format!(
-            "{}: camera doesn't match the copied IDT — differs in {}: {} (target {}/{} {}×{} cfa {}×{} {:?} focal {}; clip {}/{} {}×{} cfa {}×{} {:?} focal {})",
+            "{}: a different camera from the copied IDT — differs in {} (target {}/{} {}×{} cfa {}×{} {:?} focal {}; clip {}/{} {}×{} cfa {}×{} {:?} focal {}). Pass --force (Ctrl+Shift+V) to paste anyway; the report will say so",
             target.display(),
             diff.join(", "),
-            tier,
             fp.make, fp.model, fp.width, fp.height, fp.cfa_w, fp.cfa_h, fp.cfa, fp.focal_text(),
             clip.make, clip.model, clip.width, clip.height, clip.cfa_w, clip.cfa_h, clip.cfa, clip.focal_text(),
         ));
@@ -1120,34 +1129,43 @@ mod tests {
     }
 
     #[test]
-    fn paste_refuses_a_different_sensor_and_names_the_fields() {
-        // The 005/006 case: same Make/Model, but the ultrawide — dims, CFA phase, and focal all differ. Nothing is written.
+    fn same_make_and_model_pastes_silently_whatever_else_differs() {
+        // The 005/006 case: same Make/Model, but dims, CFA phase and focal all differ (a crop mode, another module). Nick's rule: let them, no warning.
         let src = tmp("i.dng", &synth_dng("Android", "Lumis", 4080, 3072, [1, 2, 0, 1], (69, 10), MAGIC, None, None));
-        let before = synth_dng("Android", "Lumis", 4000, 3000, [2, 1, 1, 0], (22, 10), IDENT, None, None);
-        let dst = tmp("j.dng", &before);
-        let err = IdtClip::copy_from(&src).unwrap().paste_into(&dst, false).unwrap_err();
-        assert!(err.contains("sensor") && err.contains("cfa") && err.contains("focal"), "{err}");
-        assert!(!err.contains("make"), "{err}");
-        assert_eq!(std::fs::read(&dst).unwrap(), before, "a refused paste must not touch the file");
+        let dst = tmp("j.dng", &synth_dng("Android", "Lumis", 4000, 3000, [2, 1, 1, 0], (22, 10), IDENT, None, None));
+        let report = IdtClip::copy_from(&src).unwrap().paste_into(&dst, false).unwrap();
+        assert!(report.forced_over.is_empty());
+        assert!(!report.to_string().contains("WARNING"));
+        assert_eq!(IdtClip::copy_from(&dst).unwrap().matrix, MAGIC);
     }
 
     #[test]
-    fn focal_only_mismatch_is_the_soft_tier_and_force_pastes_with_a_warning() {
-        // A lens change on an interchangeable-lens body: same sensor, different focal. Refused by default with the lens-change hint; --force pastes and the report records what was overridden.
+    fn a_different_camera_refuses_and_force_pastes_with_a_warning() {
         let src = tmp("k.dng", &synth_dng("SONY", "ILCE-7M4", 7008, 4672, [0, 1, 1, 2], (50, 1), MAGIC, None, None));
-        let dst = tmp("l.dng", &synth_dng("SONY", "ILCE-7M4", 7008, 4672, [0, 1, 1, 2], (85, 1), IDENT, None, None));
+        let before = synth_dng("SONY", "ILCE-7RM5", 9504, 6336, [0, 1, 1, 2], (50, 1), IDENT, None, None);
+        let dst = tmp("l.dng", &before);
         let clip = IdtClip::copy_from(&src).unwrap();
         let err = clip.paste_into(&dst, false).unwrap_err();
-        assert!(err.contains("differs in focal:") && err.contains("lens change"), "{err}");
+        assert!(err.contains("different camera") && err.contains("model") && err.contains("sensor"), "{err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), before, "a refused paste must not touch the file");
         let report = clip.paste_into(&dst, true).unwrap();
-        assert_eq!(report.forced_over, vec!["focal"]);
-        assert!(report.to_string().contains("WARNING: forced over mismatched focal"));
+        assert_eq!(report.forced_over, vec!["model", "sensor"]);
+        assert!(report.to_string().contains("WARNING: forced over mismatched model, sensor"));
         assert_eq!(IdtClip::copy_from(&dst).unwrap().matrix, MAGIC);
-        // Hard tier reads differently — and force still goes through (user's call).
-        let dst2 = tmp("m.dng", &synth_dng("SONY", "ILCE-7M4", 7008, 4672, [1, 0, 2, 1], (50, 1), IDENT, None, None));
-        let err = clip.paste_into(&dst2, false).unwrap_err();
-        assert!(err.contains("different CFA tile or camera name"), "{err}");
-        assert_eq!(clip.paste_into(&dst2, true).unwrap().forced_over, vec!["cfa"]);
+    }
+
+    #[test]
+    fn a_channel_count_mismatch_refuses_even_when_forced() {
+        // A Bayer IDT onto a monochrome sensor (one CFA channel): no IDT crosses a channel count.
+        let src = tmp("n.dng", &synth_dng("Leica", "M11", 9528, 6328, [0, 1, 1, 2], (50, 1), MAGIC, None, None));
+        let before = synth_dng("Leica", "M11", 9528, 6328, [0, 0, 0, 0], (50, 1), IDENT, None, None);
+        let dst = tmp("o.dng", &before);
+        let clip = IdtClip::copy_from(&src).unwrap();
+        for force in [false, true] {
+            let err = clip.paste_into(&dst, force).unwrap_err();
+            assert!(err.contains("3-channel") && err.contains("1 channels"), "{err}");
+        }
+        assert_eq!(std::fs::read(&dst).unwrap(), before);
     }
 
     #[test]
