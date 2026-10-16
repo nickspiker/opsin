@@ -12,7 +12,7 @@ exclude = ["opsin.webp", "assets/opsin_orb.rgb", "assets/test"]
 
 [dependencies]
 # Container format — VSF-Image sections (sensor plane, spectral characterization, provenance chain).
-vsf = { version = "0.10", path = "../vsf", features = ["inspect", "rayon"] }
+vsf = { version = "0.11", path = "../vsf", features = ["inspect", "rayon"] }
 # Sensor intake — decodes RAW/DNG to counts + gives us both DNG ColorMatrices and illuminant codes to build the tiered colour_profile.
 limbus = { version = "0.0.1", path = "../limbus" }
 # CPU softbuffer compositor — hosts the viewer's event loop, chrome, paint primitives. Same dep shape as Photon's desktop block.
