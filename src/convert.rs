@@ -456,6 +456,9 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
         Srgb,
         Pow(f32),
         Icc([crate::icc::Trc; 3]),
+        /// BT.2100 PQ / HLG: light relative to diffuse white, highlights above it kept.
+        Pq,
+        Hlg,
     }
     let (cam_to_vsf, eotf, source, tier, illuminant): ([f32; 9], Eotf, String, ProfileTier, u16) = match &image.image_header().metadata.colour_encoding {
         ColourEncoding::Enum(enc) => {
@@ -469,6 +472,8 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
                 TransferFunction::Linear => Eotf::Linear,
                 TransferFunction::Srgb => Eotf::Srgb,
                 TransferFunction::Gamma { g, inverted } if g > 0 => Eotf::Pow(if inverted { 1e7 / g as f32 } else { g as f32 / 1e7 }),
+                TransferFunction::Pq => Eotf::Pq,
+                TransferFunction::Hlg => Eotf::Hlg,
                 other => return Err(format!("unsupported JXL transfer function {other:?}")),
             };
             (m, eotf, "jxl_colour_encoding".to_string(), ProfileTier::Assumed, 21)
@@ -488,20 +493,25 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     let n = w * h;
     let buf = fb.buf();
     // Interleaved f32 [h,w,ch] → linear planar u16 [3,h,w], alpha (ch 4) dropped. Rows are independent — rayon over the three planes' output rows via one pass per plane keeps it simple: iterate output rows of the planar buffer jointly instead.
-    let mut planar = vec![0u16; n * 3];
-    let (rp, rest) = planar.split_at_mut(n);
-    let (gp, bp) = rest.split_at_mut(n);
-    let lin_of = |e: f32, c: usize| -> u16 {
+    // Light is relative to diffuse white (1.0). SDR transfers top out there and white is 65535 as before; PQ and HLG carry light above it, so white drops to 65535 / peak and the highlights keep their place above white instead of clipping.
+    let light_of = |e: f32, c: usize| -> f32 {
         let e = e.clamp(0., 1.);
         #[allow(deprecated)]
-        let l = match &eotf {
+        match &eotf {
             Eotf::Linear => e,
             Eotf::Srgb => vsf::colour::srgb_eotf(e),
             Eotf::Pow(p) => e.powf(*p),
             Eotf::Icc(trc) => trc[c].linear(e),
-        };
-        (l * 65535.).round() as u16
+            Eotf::Pq => vsf::colour::transfer::pq_light(e),
+            Eotf::Hlg => vsf::colour::transfer::hlg_light(e),
+        }
     };
+    let peak = if matches!(eotf, Eotf::Pq | Eotf::Hlg) { buf.par_chunks(ch).map(|px| (0..3).map(|c| light_of(px[c], c)).fold(0f32, f32::max)).reduce(|| 0., f32::max).max(1.) } else { 1. };
+    let white = 65535. / peak;
+    let mut planar = vec![0u16; n * 3];
+    let (rp, rest) = planar.split_at_mut(n);
+    let (gp, bp) = rest.split_at_mut(n);
+    let lin_of = |e: f32, c: usize| -> u16 { (light_of(e, c) * white).round().min(65535.) as u16 };
     rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
         let s = i * ch;
         *r = lin_of(buf[s], 0);
@@ -511,7 +521,9 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
 
     // JXL declares its sample depth in the image header; it is not always 8.
     let src_bits = image.image_header().metadata.bit_depth.bits_per_sample().clamp(1, 32) as u8;
-    Ok(display_referred(w, h, planar, cam_to_vsf, &source, tier, illuminant, src_bits))
+    let mut dec = display_referred(w, h, planar, cam_to_vsf, &source, tier, illuminant, src_bits);
+    dec.img.white = vec![white; 3];
+    Ok(dec)
 }
 
 /// DNG `BaselineExposure` (tag 50730) in stops, or 0 when the file has none, isn't a TIFF, or divides by zero. See [`Decoded::baseline_ev`].
