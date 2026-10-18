@@ -7,6 +7,8 @@
 //!   opsin --copy-idt <frame>    lift the DSR IDT (DNG ColorMatrix1 + illuminant + camera fingerprint) into the clip file. The GUI's Ctrl+C.
 //!   opsin --live               headless virtual webcam (live feature): camera → saved matrix → /dev/video10, no window. Ctrl+C stops.
 //!   opsin --paste-idt [--force] <frame>...  write the clipped IDT into each frame — as a DNG CameraCalibration onto the file's own matrix, with the class and provenance in XMP; nothing original moves — only where the camera fingerprint matches; --force overrides a mismatch (a lens change on an interchangeable-lens body) with a warning. The GUI's Ctrl+V / Ctrl+Shift+V, for a whole folder.
+//!   opsin --paste-idt <folder>...  a folder pastes onto every DNG / VSF directly inside it (not recursive).
+//!   opsin --copy-idt / --paste-idt --notify …  the file manager's right-click form: results as a notification, failures as a dialog, and a camera mismatch asks "Paste anyway?" instead of only refusing.
 //!   opsin --unpaste-idt <frame>...  undo every paste on each frame: the file comes back byte for byte.
 
 mod app;
@@ -22,6 +24,7 @@ mod headerless;
 #[cfg(target_os = "macos")]
 mod mac_open;
 mod sniff;
+mod shell;
 mod icc;
 mod idt;
 mod instance;
@@ -83,7 +86,10 @@ fn ctrlc_handler(f: impl Fn() + Send + Sync + 'static) -> Result<(), ()> {
 
 fn main() {
     install_panic_log();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--notify` anywhere: report thru desktop notifications and dialogs instead of only stdout/stderr — what the file manager's right-click actions pass, since nothing reads their terminal.
+    let notify = args.iter().any(|a| a == "--notify");
+    args.retain(|a| a != "--notify");
     match args.first().map(String::as_str) {
         Some("--version") => println!("opsin {}", env!("CARGO_PKG_VERSION")),
         Some("--convert") => {
@@ -109,46 +115,102 @@ fn main() {
         }
         Some("--copy-idt") => {
             let Some(input) = args.get(1) else {
-                eprintln!("opsin --copy-idt <frame>");
+                eprintln!("opsin --copy-idt [--notify] <frame>");
                 std::process::exit(2);
             };
+            if notify && args.len() > 2 {
+                shell::alert("Copy IDT", "Select one frame to copy the IDT from.");
+                std::process::exit(2);
+            }
             match idt::IdtClip::copy_from(std::path::Path::new(input)).and_then(|c| c.save().map(|p| (c, p))) {
                 Ok((clip, p)) => {
                     print!("{}", clip.to_text());
                     println!("opsin: clip saved to {}", p.display());
+                    if notify {
+                        let fp = &clip.fingerprint;
+                        shell::notify("IDT copied", &format!("{} {} ({} {}) from {}", fp.make, fp.model, clip.provenance.class, clip.provenance.tier, shell::name(std::path::Path::new(input))));
+                    }
                 }
                 Err(e) => {
                     eprintln!("opsin: copy-idt: {e}");
+                    if notify {
+                        shell::alert("Copy IDT failed", &e);
+                    }
                     std::process::exit(1);
                 }
             }
         }
         Some("--paste-idt") => {
             let force = args.get(1).map(String::as_str) == Some("--force");
-            let targets = &args[if force { 2 } else { 1 }..];
+            let targets = shell::idt_targets(&args[if force { 2 } else { 1 }..]);
             if targets.is_empty() {
-                eprintln!("opsin --paste-idt [--force] <frame>...");
+                if notify {
+                    shell::alert("Paste IDT", "No frames that can carry an IDT (DNG or VSF) in the selection.");
+                } else {
+                    eprintln!("opsin --paste-idt [--force] [--notify] <frame|folder>...");
+                }
                 std::process::exit(2);
             }
             let clip = match idt::IdtClip::load() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("opsin: paste-idt: {e}");
+                    if notify {
+                        shell::alert("Paste IDT failed", &e);
+                    }
                     std::process::exit(1);
                 }
             };
             // Every target is judged on its own fingerprint; a refusal names the differing fields and moves on, so a mixed folder pastes onto exactly the frames it should.
-            let mut failed = 0;
-            for target in targets {
-                match clip.paste_into(std::path::Path::new(target), force) {
-                    Ok(report) => println!("opsin: {report}"),
-                    Err(e) => {
-                        eprintln!("opsin: paste-idt: {e}");
-                        failed += 1;
+            let mut pasted = 0;
+            let mut forced = 0;
+            let mut mismatched: Vec<std::path::PathBuf> = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            let mut paste = |target: &std::path::Path, force: bool, mismatched: &mut Vec<std::path::PathBuf>| match clip.paste_into(target, force) {
+                Ok(report) => {
+                    println!("opsin: {report}");
+                    pasted += 1;
+                    if !report.forced_over.is_empty() {
+                        forced += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("opsin: paste-idt: {e}");
+                    if !force && e.contains(idt::MISMATCH) {
+                        mismatched.push(target.to_path_buf());
+                    } else {
+                        failed.push(format!("{}: {}", shell::name(target), e.strip_prefix(&format!("{}: ", target.display())).unwrap_or(&e)));
+                    }
+                }
+            };
+            for target in &targets {
+                paste(target, force, &mut mismatched);
+            }
+            // Without a terminal the refusals would vanish, so the file-manager paste asks: the frames from another body get one deliberate click, and a forced paste is still on record in each file.
+            if notify && !mismatched.is_empty() {
+                let fp = &clip.fingerprint;
+                let names: Vec<String> = mismatched.iter().map(|p| shell::name(p)).collect();
+                let body = format!(
+                    "{} of {} frames are from a different camera than the copied IDT ({} {}):\n\n{}\nPaste anyway? Each forced paste is recorded in the file, and opsin --unpaste-idt undoes it.",
+                    mismatched.len(), targets.len(), fp.make, fp.model, shell::listing(&names, 8)
+                );
+                if shell::confirm("Paste IDT — camera mismatch", &body, "Paste anyway") {
+                    for target in std::mem::take(&mut mismatched) {
+                        paste(&target, true, &mut Vec::new());
                     }
                 }
             }
-            if failed > 0 {
+            drop(paste);
+            if notify {
+                let skipped = if mismatched.is_empty() { String::new() } else { format!(", {} skipped (different camera)", mismatched.len()) };
+                let forced = if forced == 0 { String::new() } else { format!(", {forced} forced") };
+                if failed.is_empty() {
+                    shell::notify("IDT pasted", &format!("{pasted} of {} frames{forced}{skipped}", targets.len()));
+                } else {
+                    shell::alert("Paste IDT", &format!("{pasted} of {} frames pasted{forced}{skipped}.\n\n{} could not take the IDT:\n{}", targets.len(), failed.len(), shell::listing(&failed, 8)));
+                }
+            }
+            if !failed.is_empty() || !mismatched.is_empty() {
                 std::process::exit(1);
             }
         }

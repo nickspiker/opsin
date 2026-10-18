@@ -253,6 +253,9 @@ fn fingerprint_of_visual(v: &vsf::visual::Visual) -> Result<Fingerprint, String>
 }
 
 /// The fingerprint gate shared by every paste (Nick 2026-10-10). Make and model match → paste, no warning: dims, CFA phase and focal length are what one sensor legitimately changes across crop modes, lenses and slitscan rings, and the response is a property of the sensor (a phone's lenses are different models — lumis names each sensor by its Camera2 id). Make or model differ → refuse, unless `force` (`Ctrl+Shift+V`, `--force`), and then the report carries the warning. Channel count differs (a Bayer IDT onto a Leica Monochrom, a seven-channel camera) → refuse always: an IDT for K channels has no meaning on K′, and scaling anything off a single patch without the spectral maths would be doing it wrong. Returns the fields overridden by force (empty for a clean paste).
+/// The phrase every camera-mismatch refusal carries — how a batch caller (the file-manager paste) tells "different camera, `--force` would go thru" from a frame that cannot take an IDT at all.
+pub const MISMATCH: &str = "a different camera from the copied IDT";
+
 fn gate(clip: &Fingerprint, target: &Path, fp: &Fingerprint, force: bool) -> Result<Vec<&'static str>, String> {
     let (kc, kt) = (clip.channels(), fp.channels());
     if kc != kt {
@@ -265,7 +268,7 @@ fn gate(clip: &Fingerprint, target: &Path, fp: &Fingerprint, force: bool) -> Res
     }
     if !force {
         return Err(format!(
-            "{}: a different camera from the copied IDT — differs in {} (target {}/{} {}×{} cfa {}×{} {:?} focal {}; clip {}/{} {}×{} cfa {}×{} {:?} focal {}). Pass --force (Ctrl+Shift+V) to paste anyway; the report will say so",
+            "{}: {MISMATCH} — differs in {} (target {}/{} {}×{} cfa {}×{} {:?} focal {}; clip {}/{} {}×{} cfa {}×{} {:?} focal {}). Pass --force (Ctrl+Shift+V) to paste anyway; the report will say so",
             target.display(),
             diff.join(", "),
             fp.make, fp.model, fp.width, fp.height, fp.cfa_w, fp.cfa_h, fp.cfa, fp.focal_text(),

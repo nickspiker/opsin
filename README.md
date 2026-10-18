@@ -48,9 +48,11 @@ Formats in: `vsf` native, DNG and the common camera RAWs through [iris](https://
 
 ## Install
 
-`cargo build --release` gives you the binary, and on Linux that is the whole story — the `.desktop` `%f` hands a double-clicked file straight to `argv`.
+`cargo build --release` gives you the binary, and on Linux that is the whole story — the `.desktop` `%f` hands a double-clicked file straight to `argv`. `sh packaging/linux/install.sh` installs it to `~/.local/bin` and adds the IDT actions below to Dolphin, Nautilus, Nemo and Caja.
 
 macOS needs a bundle. Finder delivers an opened document as an Apple Event and only ever to an application bundle, so a bare binary on `$PATH` can be your shell's `opsin` but can never be the thing Finder opens a raw file with. `sh packaging/macos/install.sh` builds opsin, wraps it in `Opsin.app` with the orb as its icon, ad-hoc signs it (unsigned Mach-O bundles are refused at launch), installs the CLI to `~/.local/bin`, and claims every content type opsin decodes — VSF and the raw family and the display-referred trio — as the default handler. Re-run it to upgrade in place. The bundle is local and not notarized: it runs on the machine that built it, not on one you copy it to.
+
+Either script takes `FEATURES=calibrate` to build with chameleon target scanning (the Cal pill / K), and both install two right-click actions: **Copy IDT** on one frame, and **Paste IDT** on any selection of frames and folders (a folder means every DNG / VSF directly inside it). On macOS they are Finder Quick Actions; on Linux, file-manager actions (under Scripts in Nautilus and Caja). Frames from the copied camera's make and model take the paste silently, whatever the lens or crop; frames from a different camera are listed in a "Paste anyway?" dialog, and skipped unless you say so. The outcome comes back as a notification, failures as a dialog, and `opsin --unpaste-idt` undoes any of it byte for byte. They are `opsin --copy-idt --notify` and `opsin --paste-idt --notify`, so the same thing works from a terminal.
 
 
 ## Landing
