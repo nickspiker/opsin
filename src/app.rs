@@ -43,9 +43,11 @@ pub struct OpsinApp {
     show_hitmask: bool,
     /// 256 random opaque colours (α+darkness), regenerated on each []h enable so distinct ids always pop.
     debug_hit_colours: Vec<u32>,
-    // --- background loads (2026-10-05, "it just looks like a big UI hang"): every decode runs on its own thread with the view's bar up; the UI thread only installs results.
+    // --- background loads (2026-10-05, "it just looks like a big UI hang"): every decode runs off the UI thread (one at a time, newest wins — see `load_job`) with the view's bar up; the UI thread only installs results.
     /// The load in flight — a result carrying an older token is a frame the operator has since moved past, and is dropped.
     load_token: u64,
+    /// The decodes, newest request wins: a held arrow queues over the waiting decode instead of spawning one thread (and one whole frame in memory) per keypress.
+    load_job: crate::view::LatestJob,
     /// The arrow direction of the load in flight (0 = an open/drop): a file that fails to decode is skipped in that direction, as the synchronous walk did.
     load_step: isize,
     /// Files skipped during one arrow walk, so a folder of undecodable files ends the walk instead of circling.
@@ -128,6 +130,7 @@ impl OpsinApp {
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
             load_token: 0,
+            load_job: Default::default(),
             load_step: 0,
             load_tries: 0,
             pending_open: None,
@@ -145,16 +148,13 @@ impl OpsinApp {
         let token = self.load_token;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.view.set_busy(Some(&format!("Loading {name}…")));
-        std::thread::Builder::new()
-            .name("opsin-load".into())
-            .spawn(move || {
-                let w2 = wake.clone();
-                let r = crate::view::load_image_folded_with(&path, None, true, &move |p| {
-                    let _ = w2.send(Msg::LoadProgress(token, p));
-                });
-                let _ = wake.send(Msg::Loaded(token, path, r));
-            })
-            .ok();
+        self.load_job.submit("opsin-load", move || {
+            let w2 = wake.clone();
+            let r = crate::view::load_image_folded_with(&path, None, true, &move |p| {
+                let _ = w2.send(Msg::LoadProgress(token, p));
+            });
+            let _ = wake.send(Msg::Loaded(token, path, r));
+        });
     }
 
     /// A load came back: install it, or — an arrow walk that hit an undecodable file — step on past it.

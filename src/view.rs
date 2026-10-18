@@ -97,6 +97,37 @@ pub enum Msg {
     Tick,
 }
 
+/// A one-deep background job slot where the newest job wins: at most ONE job runs and at most one waits, and submitting while one waits drops the waiting one (and everything it captured — a whole decode, for a preview) unrun. Every arrow press used to spawn its own decode thread and every install its own demosaic thread, none cancellable, so a held arrow stacked dozens of whole frames in flight at once (2.5 GB live after 20 steps through 20 MP DNGs, every one of them for a frame already scrolled past) and each new load fought all of them for the cores — the "every image loads slower and memory climbs" of 2026-10-17. Results still come back by token/generation and stale ones are still dropped; this only stops the stale work from being started.
+#[derive(Clone, Default)]
+pub struct LatestJob(std::sync::Arc<std::sync::Mutex<(Option<Box<dyn FnOnce() + Send>>, bool)>>);
+
+impl LatestJob {
+    /// Queue `job`, replacing any queued-but-unstarted one; spawn the worker (named `name`) if none is running. The worker drains the slot and exits when it finds it empty.
+    pub fn submit(&self, name: &str, job: impl FnOnce() + Send + 'static) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.0 = Some(Box::new(job));
+        if slot.1 {
+            return;
+        }
+        let cell = self.0.clone();
+        let worker = move || loop {
+            let job = {
+                let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+                match slot.0.take() {
+                    Some(j) => j,
+                    None => {
+                        slot.1 = false;
+                        return;
+                    }
+                }
+            };
+            // A decoder that panics on a malformed file must cost only that job: an unwinding worker would leave the slot marked running forever, and every later load would queue behind a thread that no longer exists. The panic hook has already logged it.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        };
+        slot.1 = std::thread::Builder::new().name(name.into()).spawn(worker).is_ok();
+    }
+}
+
 /// Panel section rects (x0, y0, w, h) — named fields, no position-coded indexing.
 struct PanelRects {
     nav: (usize, usize, usize, usize),
@@ -737,6 +768,8 @@ pub struct View {
     busy: Option<(String, f32)>,
     /// Which frame is on screen. Bumped by every install, so a demosaic that finishes after the operator has arrowed on is dropped instead of landing on the wrong picture.
     frame_gen: u64,
+    /// The demosaic upgrades, newest frame wins — arrowing past a frame drops its queued upgrade (and the decode it holds) instead of stacking one full-resolution RCD per step.
+    preview_job: LatestJob,
     /// The preview is the full-resolution demosaic, not the tile bin — what the HUD reports.
     preview_full: bool,
     /// A finished action's confirmation, and when it was raised — it fades out on its own.
@@ -867,6 +900,7 @@ impl View {
             export_requested: false,
             busy: None,
             frame_gen: 0,
+            preview_job: LatestJob::default(),
             preview_full: false,
             toast: None,
             plain_changed: false,
@@ -1549,13 +1583,10 @@ impl View {
             return;
         }
         let frame_gen = self.frame_gen;
-        std::thread::Builder::new()
-            .name("opsin-preview".into())
-            .spawn(move || {
-                let r = crate::convert::to_linear_full(&dec, crate::convert::Target::Rec2020, &|_| {});
-                let _ = wake.send(Msg::Preview(frame_gen, r));
-            })
-            .ok();
+        self.preview_job.submit("opsin-preview", move || {
+            let r = crate::convert::to_linear_full(&dec, crate::convert::Target::Rec2020, &|_| {});
+            let _ = wake.send(Msg::Preview(frame_gen, r));
+        });
     }
 
     /// Swap a finished demosaic in under the live composition.
