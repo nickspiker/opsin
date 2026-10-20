@@ -94,7 +94,7 @@ fn illuminant_xyz(code: u16) -> [f32; 3] {
 
 /// A single Absolute entry: `matrix` takes camera → linear VSF RGB, `tier` says how it was come by, `illuminant` is the scene white the display scalar is derived from.
 fn absolute_entry(matrix: [f32; 9], source: &str, tier: ProfileTier, illuminant: u16) -> ProfileEntry {
-    ProfileEntry { matrix, source: source.to_string(), class: IdtClass::Absolute, tier, illuminant, transfer: Transfer::Linear }
+    ProfileEntry { matrix, source: source.to_string(), class: IdtClass::Absolute, tier, illuminant, transfer: Transfer::Linear, scale: None }
 }
 
 /// A profile of one entry, targeting VSF RGB, with no DNG matrices, patches or calibration riding along.
@@ -124,6 +124,7 @@ pub(crate) fn derive_profile(cm: [f32; 9], illuminant: u16, source: &str) -> Opt
         tier: ProfileTier::Model,
         illuminant,
         transfer: Transfer::Linear,
+        scale: None,
     })
 }
 
@@ -1555,7 +1556,7 @@ mod visual_roundtrip {
         let mut plane = vsf::visual::Plane::sensor("b0", "s0", 8, 4, channels, PlaneLayout::Mosaic { cfa: Tensor::new(vec![2, 2], vec![0u8, 1, 1, 2]) }, vec![64.; 3], vec![1023.; 3], BitPackedTensor::pack_u16(10, vec![4, 8], &samples));
         plane.orientation = 6;
         // The observer belongs to a characterization; lumis writes the camera's own matrix when nothing better exists.
-        let profile = ColourProfile { target: "vsf_rgb".into(), entries: vec![ProfileEntry { matrix: [1., 0., 0., 0., 1., 0., 0., 0., 1.], source: "android_sensor_color_transform".into(), class: IdtClass::Absolute, tier: ProfileTier::Model, illuminant: 21, transfer: Transfer::Linear }], dng_colormatrix: [None, None], patches: None, cal: None };
+        let profile = ColourProfile { target: "vsf_rgb".into(), entries: vec![ProfileEntry { matrix: [1., 0., 0., 0., 1., 0., 0., 0., 1.], source: "android_sensor_color_transform".into(), class: IdtClass::Absolute, tier: ProfileTier::Model, illuminant: 21, transfer: Transfer::Linear, scale: None }], dng_colormatrix: [None, None], patches: None, cal: None };
         let mut v = vsf::visual::Visual::still(plane, None, Some(profile), &[]);
         v.text = "Lumis average | integration: 1x 0.0039s".into();
         v.observer = "cie1931".into();
