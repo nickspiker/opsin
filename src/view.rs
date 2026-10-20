@@ -80,6 +80,9 @@ pub enum Msg {
     /// A background target scan finished (the `calibrate` feature): the frame it ran on, and chameleon's verdict.
     #[cfg(feature = "calibrate")]
     Scan(PathBuf, Result<crate::calibrate::ScanOutcome, String>),
+    /// A scan's deferred spectral solve finished: the frame, and the scan's IDT with its response filled in, to paste over the matrix-only paste.
+    #[cfg(feature = "calibrate")]
+    ScanResponse(PathBuf, crate::idt::IdtClip),
     /// From the live capture thread (`live` feature).
     #[cfg(feature = "live")]
     Live(crate::live::LiveMsg),
@@ -1691,10 +1694,26 @@ impl View {
             clip.source = format!("chameleon scan of {}", path.display());
             clip.provenance = crate::idt::IdtProvenance::of_scan(&outcome.observer, outcome.cal.clone());
             clip.response = outcome.response.clone();
-            clip.paste_into(&path, false)
+            clip.paste_into(&path, false).map(|report| (clip, report))
         });
         match pasted {
-            Ok(report) => println!("opsin: {report}"),
+            Ok((clip, report)) => {
+                println!("opsin: {report}");
+                // The matrix is in the file and on screen; the spectral response (most of a scan's time) follows on its own thread and re-pastes the same IDT with the curves — a re-paste keeps the first paste's undo coordinates, so --unpaste-idt still lands on the untouched file.
+                if let (Some(pending), Some(wake)) = (outcome.pending_response, self.wake.clone()) {
+                    let path = path.clone();
+                    std::thread::Builder::new()
+                        .name("opsin-response".into())
+                        .spawn(move || {
+                            if let Some(r) = pending.solve() {
+                                let mut clip = clip;
+                                clip.response = Some(r);
+                                let _ = wake.send(Msg::ScanResponse(path, clip));
+                            }
+                        })
+                        .ok();
+                }
+            }
             Err(e) => {
                 eprintln!("opsin: calibrate: paste failed: {e}");
                 self.cal_readout = Some(format!("cal: solved, but paste failed: {e}"));
@@ -1718,6 +1737,27 @@ impl View {
             self.cal_readout = Some(outcome.readout);
         }
         ctx.window.request_redraw();
+    }
+
+    /// The deferred spectral response is ready: re-paste the scan's IDT with it (same matrix, same fingerprint, so the gate passes by construction), and give the frame on screen its response without a reload — nothing it renders changes, only what a convert or a copy carries.
+    #[cfg(feature = "calibrate")]
+    fn finish_scan_response(&mut self, path: PathBuf, clip: crate::idt::IdtClip, ctx: &mut Context) {
+        match clip.paste_into(&path, false) {
+            Ok(report) => println!("opsin: spectral response added — {report}"),
+            Err(e) => {
+                eprintln!("opsin: calibrate: response paste failed: {e}");
+                return;
+            }
+        }
+        if self.source.as_deref() == Some(path.as_path()) {
+            if let (Some(dec), Some(r)) = (self.dec.as_mut().map(std::sync::Arc::make_mut), clip.response.as_ref()) {
+                dec.response = Some(crate::idt::response_to_vsf(r));
+            }
+            if let Some(line) = self.cal_readout.as_mut() {
+                line.push_str("  + spectral response");
+            }
+            ctx.window.request_redraw();
+        }
     }
 
     /// Live on/off — `L` and the Live pill. On: the saved matrix (or identity) into the sliders, the capture thread started, the viewer becomes the viewfinder. Off: the thread stopped (the loopback stream ends with it) and the last frame stays on screen.
@@ -1894,6 +1934,11 @@ impl View {
             #[cfg(feature = "calibrate")]
             Msg::Scan(path, result) => {
                 self.finish_scan(path, result, ctx);
+                true
+            }
+            #[cfg(feature = "calibrate")]
+            Msg::ScanResponse(path, clip) => {
+                self.finish_scan_response(path, clip, ctx);
                 true
             }
             Msg::Preview(frame_gen, r) => {

@@ -188,13 +188,13 @@ fn viewfinder_light(x0: usize, y0: usize, w: usize, h: usize, light: &[[u16; 3]]
     crate::view::Emissive { frame_w: WIDTH, x0: ox0, y0: oy0, w, h, rgb }
 }
 
-/// A scan's overlay, ready to composite: both rasters warped by chameleon's own mesh and binned from its 2× space to frame pixels; the logo coverage turned into display light (white wordmark, illuminant-E rail in the destination space, each normalized on its own).
+/// A scan's overlay, ready to composite: both rasters warped thru chameleon's 8×7 mesh ([`crate::calibrate::mesh_warp`]) and binned from its 2× space to frame pixels; the logo coverage turned into display light (white wordmark, illuminant-E rail in the destination space, each normalized on its own).
 #[cfg(feature = "calibrate")]
 fn live_overlay(lo: &chameleon::LiveOverlay, settings: &chameleon::CurrentSettings) -> LiveOverlay {
-    let (x0, y0, w, h, rgba) = lo.warped();
+    let (x0, y0, w, h) = (lo.min_x, lo.min_y, lo.width, lo.height);
+    let (rgba, cov) = rayon::join(|| crate::calibrate::mesh_warp(lo, &lo.flat, lo.cross_colour), || crate::calibrate::mesh_warp(lo, &lo.logo, [0.; 3]));
     // RGB input: the overlay comes back at 2× — bin it to frame scale.
     let rgba = bin2_rgba(&rgba, w, h);
-    let (_, _, _, _, cov) = lo.warped_logo();
     let cov = bin2_rgba(&cov, w, h);
     let rail = chameleon::logo::rail_display(settings);
     // Normalized over the frame-pixel raster the stream actually shows: text and rail each to their own white.
