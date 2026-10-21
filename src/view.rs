@@ -13,6 +13,7 @@ use fluor::paint::{self, Clip};
 use fluor::pixel::{Blend, BlendMode};
 
 use std::path::{Path, PathBuf};
+use crate::convert::fold_linear;
 
 use crate::panel::{HIST_OVERSAMPLE, Observer, PanelTools};
 
@@ -482,44 +483,6 @@ pub fn encode_pixels_lit(lin: &[i32], ev: f32, clip_show: bool, hdr: bool, emiss
             fluor::theme::fmt(0xFF000000 | (ch(px[0]) << 16) | (ch(px[1]) << 8) | ch(px[2]))
         })
         .collect()
-}
-
-/// Fold linear i32 RGB to `max_edge` on the long side: a box mean over the source block of each output pixel, integer all the way, the division remainder carried along the row per channel so the row's sum is exact instead of every pixel sitting up to an LSB low. Returns the input untouched when it already fits.
-fn fold_linear(lin: Vec<i32>, w: usize, h: usize, max_edge: usize) -> (usize, usize, Vec<i32>) {
-    use rayon::prelude::*;
-    if w.max(h) <= max_edge || w == 0 || h == 0 {
-        return (w, h, lin);
-    }
-    let (tw, th) = if w >= h { (max_edge, (h * max_edge / w).max(1)) } else { ((w * max_edge / h).max(1), max_edge) };
-    let mut out = vec![0i32; tw * th * 3];
-    out.par_chunks_mut(tw * 3).enumerate().for_each(|(ty, row)| {
-        let y0 = ty * h / th;
-        let y1 = ((ty + 1) * h / th).max(y0 + 1).min(h);
-        let mut rem = [0i64; 3];
-        for tx in 0..tw {
-            let x0 = tx * w / tw;
-            let x1 = ((tx + 1) * w / tw).max(x0 + 1).min(w);
-            let mut acc = [0i64; 3];
-            let mut n = 0i64;
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let i = (sy * w + sx) * 3;
-                    acc[0] += lin[i] as i64;
-                    acc[1] += lin[i + 1] as i64;
-                    acc[2] += lin[i + 2] as i64;
-                    n += 1;
-                }
-            }
-            let n = n.max(1);
-            for ch in 0..3 {
-                let t = acc[ch] + rem[ch];
-                let q = t.div_euclid(n);
-                rem[ch] = t - q * n;
-                row[tx * 3 + ch] = q as i32;
-            }
-        }
-    });
-    (tw, th, out)
 }
 
 /// Turn a W×H linear buffer 90°: CW maps source (x, y) to (H−1−y, x) on the H×W result, CCW to (y, W−1−x). The plane itself never moves anywhere else — this is the display's copy.

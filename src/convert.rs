@@ -197,15 +197,7 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
     use crate::sniff::Kind;
     let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let kind = crate::sniff::sniff(&bytes);
-    let known = match kind {
-        Kind::Vsf => vsf::visual::Visual::read(&bytes).map_err(|e| e.to_string()).and_then(decoded_of_visual),
-        Kind::Jxl => ingest_jxl(&bytes),
-        Kind::Jpeg => ingest_jpeg(&bytes),
-        Kind::WebP => ingest_webp(&bytes),
-        Kind::Tiff | Kind::Cr3 | Kind::Raf | Kind::Crw => ingest_image(input),
-        Kind::Unknown => Err(String::new()),
-    };
-    match known {
+    match decode_known(input, &bytes, kind) {
         Ok(dec) => Ok(dec),
         Err(why) => {
             let mut dec = crate::headerless::guess(&bytes).map_err(|e| format!("{}: {e}", input.display()))?;
@@ -214,6 +206,26 @@ pub fn load_any(input: &Path) -> Result<Decoded, String> {
             }
             Ok(dec)
         }
+    }
+}
+
+/// [`load_any`] without the headerless fallback: only a decoder that recognises the bytes may answer, so a VSF that holds no image (a log, a message) or a file with no signature is an error rather than a picture of its bytes. The thumbnailer's load — a file manager should show the type's icon for those, not noise.
+pub fn load_known(input: &Path) -> Result<Decoded, String> {
+    let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let kind = crate::sniff::sniff(&bytes);
+    decode_known(input, &bytes, kind).map_err(|why| if kind == crate::sniff::Kind::Unknown { "no signature opsin decodes".to_string() } else { format!("{}: {why}", kind.label()) })
+}
+
+/// The decoder the signature names; `Err` for [`crate::sniff::Kind::Unknown`] (empty message — there is no decoder to complain).
+fn decode_known(input: &Path, bytes: &[u8], kind: crate::sniff::Kind) -> Result<Decoded, String> {
+    use crate::sniff::Kind;
+    match kind {
+        Kind::Vsf => vsf::visual::Visual::read(bytes).map_err(|e| e.to_string()).and_then(decoded_of_visual),
+        Kind::Jxl => ingest_jxl(bytes),
+        Kind::Jpeg => ingest_jpeg(bytes),
+        Kind::WebP => ingest_webp(bytes),
+        Kind::Tiff | Kind::Cr3 | Kind::Raf | Kind::Crw => ingest_image(input),
+        Kind::Unknown => Err(String::new()),
     }
 }
 
@@ -698,13 +710,22 @@ pub fn hdr_rail(x: i64) -> i64 {
 pub const HDR_CURVE_COEFS: [f32; 4] = [0., 1.5, 0., -0.5];
 
 /// Export the rendered view as an sRGB JPEG — the ONE legacy-space concession, for posts on platforms that assume sRGB and strip everything else. Input is [`to_linear`]'s output (signed linear Rec.2020, white = 65535, orientation already applied); the live exposure is baked as a linear gain, then Rec.2020 → sRGB (thru vsf's deprecated legacy constants — deliberately: sRGB IS the legacy), clamp to gamut (the single display clamp, same boundary rule as the viewer), the HDR rolloff when on (same [`hdr_rail`] the viewer encodes with, so the JPEG is the screen), sRGB OETF, quality-95 JPEG. Untagged on purpose — an untagged JPEG is defined-sRGB everywhere that matters, which is exactly the consistency being bought. Nothing is written back to the source: the sensor plane stays as captured, the JPEG is a rendering.
-#[allow(deprecated)]
 pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool, out: &Path) -> Result<(), String> {
-    if lin.len() != w * h * 3 {
-        return Err(format!("linear buffer {} != {w}×{h}×3", lin.len()));
-    }
     if w > u16::MAX as usize || h > u16::MAX as usize {
         return Err(format!("{w}×{h} exceeds JPEG's 65535 dimension limit"));
+    }
+    let rgb8 = srgb8(lin, w, h, ev, hdr)?;
+    let encoder = jpeg_encoder::Encoder::new_file(out, 95).map_err(|e| format!("{}: {e}", out.display()))?;
+    encoder
+        .encode(&rgb8, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+        .map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// The sRGB encode behind [`export_srgb_jpeg`] and [`write_thumbnail`]: [`to_linear`]'s output → interleaved 8-bit sRGB, exposure baked as a linear gain, Rec.2020 → sRGB, the single display clamp, the HDR rolloff when on, sRGB OETF.
+#[allow(deprecated)]
+pub fn srgb8(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool) -> Result<Vec<u8>, String> {
+    if lin.len() != w * h * 3 {
+        return Err(format!("linear buffer {} != {w}×{h}×3", lin.len()));
     }
     const SRGB_FROM_VSF_RGB: [f32; 9] = t3(vsf::colour::VSF_RGB2SRGB);
     let m = matmul3(&SRGB_FROM_VSF_RGB, &inv3(&VSF_RGB_TO_REC2020).ok_or("Rec.2020 matrix singular")?);
@@ -721,10 +742,59 @@ pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool, out
             }
         }
     });
-    let encoder = jpeg_encoder::Encoder::new_file(out, 95).map_err(|e| format!("{}: {e}", out.display()))?;
-    encoder
-        .encode(&rgb8, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
-        .map_err(|e| format!("{}: {e}", out.display()))
+    Ok(rgb8)
+}
+
+/// A file manager's thumbnail — the freedesktop thumbnailer contract (`opsin --thumbnail %i %o %s`): decode `input` ([`load_known`] — no picture of bytes), render it as the viewer opens it (the binned [`to_linear`], the file's recorded exposure else EV 0, HDR off), box-fold the long edge to `size`, and write an sRGB PNG to `out`. sRGB like the JPEG export, because that is what a file manager assumes of a thumbnail. Nothing is written to the source.
+pub fn write_thumbnail(input: &Path, size: usize, out: &Path) -> Result<(), String> {
+    let dec = load_known(input)?;
+    let ev = stored_exposure_ev(&dec.img).unwrap_or(0.);
+    let (w, h, lin) = to_linear(&dec)?;
+    drop(dec);
+    let (w, h, lin) = fold_linear(lin, w, h, size.max(1));
+    let rgb8 = srgb8(&lin, w, h, ev, false)?;
+    let file = std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().and_then(|mut wr| wr.write_image_data(&rgb8)).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// Fold linear i32 RGB to `max_edge` on the long side: a box mean over the source block of each output pixel, integer all the way, the division remainder carried along the row per channel so the row's sum is exact instead of every pixel sitting up to an LSB low. Returns the input untouched when it already fits.
+pub fn fold_linear(lin: Vec<i32>, w: usize, h: usize, max_edge: usize) -> (usize, usize, Vec<i32>) {
+    if w.max(h) <= max_edge || w == 0 || h == 0 {
+        return (w, h, lin);
+    }
+    let (tw, th) = if w >= h { (max_edge, (h * max_edge / w).max(1)) } else { ((w * max_edge / h).max(1), max_edge) };
+    let mut out = vec![0i32; tw * th * 3];
+    out.par_chunks_mut(tw * 3).enumerate().for_each(|(ty, row)| {
+        let y0 = ty * h / th;
+        let y1 = ((ty + 1) * h / th).max(y0 + 1).min(h);
+        let mut rem = [0i64; 3];
+        for tx in 0..tw {
+            let x0 = tx * w / tw;
+            let x1 = ((tx + 1) * w / tw).max(x0 + 1).min(w);
+            let mut acc = [0i64; 3];
+            let mut n = 0i64;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy * w + sx) * 3;
+                    acc[0] += lin[i] as i64;
+                    acc[1] += lin[i + 1] as i64;
+                    acc[2] += lin[i + 2] as i64;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            for ch in 0..3 {
+                let t = acc[ch] + rem[ch];
+                let q = t.div_euclid(n);
+                rem[ch] = t - q * n;
+                row[tx * 3 + ch] = q as i32;
+            }
+        }
+    });
+    (tw, th, out)
 }
 
 /// Serialize a `SpectralImage` to a VSF-Image file.

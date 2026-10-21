@@ -10,6 +10,7 @@
 //!   opsin --paste-idt <folder>...  a folder pastes onto every DNG / VSF directly inside it (not recursive).
 //!   opsin --copy-idt / --paste-idt --notify …  the file manager's right-click form: results as a notification, failures as a dialog, and a camera mismatch asks "Paste anyway?" instead of only refusing.
 //!   opsin --unpaste-idt <frame>...  undo every paste on each frame: the file comes back byte for byte.
+//!   opsin --thumbnail <in> <out.png> [size]  headless: the file manager's thumbnailer (`%i %o %s`) — the image as it opens, sRGB PNG, long edge ≤ size (default 256).
 
 mod app;
 mod view;
@@ -111,6 +112,17 @@ fn main() {
                     eprintln!("opsin: {input}: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Some("--thumbnail") => {
+            let (Some(input), Some(out)) = (args.get(1), args.get(2)) else {
+                eprintln!("opsin --thumbnail <in> <out.png> [size]");
+                std::process::exit(2);
+            };
+            let size = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256);
+            if let Err(e) = convert::write_thumbnail(input.as_ref(), size, out.as_ref()) {
+                eprintln!("opsin: thumbnail {input}: {e}");
+                std::process::exit(1);
             }
         }
         Some("--copy-idt") => {

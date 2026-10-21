@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build opsin, install the CLI, and add "Copy IDT" / "Paste IDT" to the file managers' right-click menus.
+# Build opsin, install the CLI, add "Copy IDT" / "Paste IDT" to the file managers' right-click menus, and
+# register .vsf as image/vnd.vsf with opsin as its thumbnailer and viewer.
 #
 # On Linux the binary on $PATH is the whole app, so the work here is the menus. Each file manager has
 # its own extension format; this writes all of them (an absent file manager just never reads its file):
@@ -88,7 +89,61 @@ Selection=notnone
 Extensions=any;
 NEMO
 
+echo "==> registering VSF and its thumbnailer"
+# Without a MIME type a .vsf is application/octet-stream, and no thumbnailer or "open with" can attach to
+# that. image/vnd.vsf (vsf/MEDIA-TYPE.md) takes *.vsf and the RÅ< magic; logs keep their own extension
+# and the container type — the longest glob wins, so *.log.vsf never reaches the image thumbnailer.
+mkdir -p "$DATA/mime/packages"
+cat >"$DATA/mime/packages/opsin-vsf.xml" <<-MIME
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.vsf">
+    <comment>VSF document</comment>
+    <glob pattern="*.log.vsf"/>
+    <magic priority="40"><match type="big32" offset="0" value="0x52c3853c"/></magic>
+  </mime-type>
+  <mime-type type="image/vnd.vsf">
+    <comment>VSF spectral image</comment>
+    <sub-class-of type="application/vnd.vsf"/>
+    <glob pattern="*.vsf"/>
+    <generic-icon name="image-x-generic"/>
+  </mime-type>
+</mime-info>
+MIME
+command -v update-mime-database >/dev/null 2>&1 && update-mime-database "$DATA/mime"
+
+# The freedesktop thumbnailer: Nemo, Caja, Thunar (tumbler) and Nautilus all read this. opsin renders the
+# image as it opens and writes a PNG; a VSF that holds no image fails and keeps the type's icon.
+# Nautilus runs thumbnailers in a bubblewrap sandbox that only sees /usr, so there it needs
+# CLI_PREFIX=/usr/local/bin or similar; Nemo, Caja and Thunar run $BIN directly.
+mkdir -p "$DATA/thumbnailers"
+cat >"$DATA/thumbnailers/opsin.thumbnailer" <<-THUMB
+[Thumbnailer Entry]
+TryExec=$BIN
+Exec="$BIN" --thumbnail %i %o %s
+MimeType=image/vnd.vsf;
+THUMB
+
+# The application entry: what makes a double-clicked image open in opsin and puts it in "Open With".
+mkdir -p "$DATA/applications"
+cat >"$DATA/applications/opsin.desktop" <<-DESKTOP
+[Desktop Entry]
+Type=Application
+Name=opsin
+GenericName=Spectral Image Viewer
+Comment=Spectral image viewer and converter — the observer is a variable
+Exec="$BIN" %F
+Icon=opsin
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=image;viewer;raw;dng;vsf;spectral;calibrate;lumis;verichrome;
+MimeType=image/vnd.vsf;image/x-adobe-dng;image/jxl;image/jpeg;image/webp;image/tiff;image/x-sony-arw;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-fuji-raf;image/x-panasonic-rw2;image/x-olympus-orf;image/x-pentax-pef;image/x-samsung-srw;
+StartupNotify=false
+DESKTOP
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DATA/applications"
+
 echo
 echo "opsin installed: $BIN  (ensure $CLI is on your PATH)"
+echo "  .vsf files are image/vnd.vsf with opsin thumbnails (restart the file manager to pick up the thumbnailer)"
 echo "  right-click → Copy IDT / Paste IDT in Dolphin, Nemo; → Scripts in Nautilus and Caja"
 command -v zenity >/dev/null 2>&1 || command -v kdialog >/dev/null 2>&1 || echo "  note: install zenity or kdialog to be asked before pasting onto a different camera (without one, mismatches are skipped)"
