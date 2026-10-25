@@ -5000,7 +5000,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "bitvec",
  "blake3",

@@ -38,10 +38,10 @@ fn install_panic_log() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let log = std::env::temp_dir().join("opsin-panic.log");
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let osc = vsf::eagle_time_oscillations();
         let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log).map(|mut f| {
             use std::io::Write;
-            let _ = writeln!(f, "[unix {secs}] opsin {}: {info}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(f, "[eagle {osc}] opsin {}: {info}", env!("CARGO_PKG_VERSION"));
         });
         default(info);
     }));

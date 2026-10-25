@@ -73,7 +73,7 @@ impl Rng {
 
     /// `count` positions below `bound` (repeats allowed — a vote, not a census).
     fn positions(&mut self, bound: usize, count: usize) -> Vec<usize> {
-        (0..count.min(bound)).map(|_| (self.next() % bound as u64) as usize).collect()
+        (0..count).map(|_| (self.next() % bound as u64) as usize).collect()
     }
 }
 
@@ -126,8 +126,9 @@ fn guess_width(lum: &[f32], pair_lum: Option<&[f32]>, rng: &mut Rng) -> Option<(
         return None;
     }
     let root = (n as f64).sqrt();
+    // WHY/PROOF: n is the file's own sample count, and below 64 samples sqrt(n) / 8 floors to width 0 — the vote then divides n by zero.
     let lo = ((root / ASPECT_BAND).floor() as usize).max(1);
-    let hi = ((root * ASPECT_BAND).ceil() as usize).min(n / 2).max(lo + 1);
+    let hi = (root * ASPECT_BAND).ceil() as usize;
     let idx = rng.positions(n, SAMPLES);
     let scored: Vec<(f32, usize, bool)> = (lo..=hi)
         .into_par_iter()
@@ -272,7 +273,7 @@ pub fn guess(bytes: &[u8]) -> Result<Decoded, String> {
     let mut planar = vec![0u16; out_w * out_h * 3];
     for (c, plane) in rgb.iter_mut().enumerate() {
         planar[c * out_w * out_h..(c + 1) * out_w * out_h].par_iter_mut().zip(plane.par_iter()).for_each(|(o, &v)| {
-            *o = if v.is_finite() { ((v - black) * scale).round().clamp(0., 65535.) as u16 } else { 0 };
+            *o = if v.is_finite() { ((v - black) * scale).round() as u16 } else { 0 };
         });
     }
     let img = SpectralImage {

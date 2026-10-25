@@ -157,19 +157,22 @@ fn stream_byte(v: f32, light: u16, ev_gain: f32, clip: bool, hdr: bool, enc_lut:
             return enc_lut[65535];
         }
     }
+    // WHY/PROOF: v is the camera's light thru the operator's matrix and gain, outside 0..65535 both ways — a float → i64 cast does not saturate, and the value indexes the 64Ki LUT and feeds `hdr_rail`.
     let i = v.clamp(0., 65535.) as i64;
     let t = if hdr { crate::convert::hdr_rail(i) } else { i };
+    // WHY/PROOF: scene light at white plus logo light sums past 65535 — one past the LUT.
     enc_lut[(t + light as i64).min(65535) as usize]
 }
 
 /// Display linear 0..65535 → the loopback's byte: BT.2020 with a 2.4 transfer.
 fn stream_lut() -> Vec<u8> {
-    (0..65536u32).map(|v| ((v as f32 / 65535.).powf(1. / 2.4) * 255.).min(255.) as u8).collect()
+    (0..65536u32).map(|v| ((v as f32 / 65535.).powf(1. / 2.4) * 255.) as u8).collect()
 }
 
 /// The logo light (source grid, origin x0,y0, w×h) re-gridded for the viewfinder, which shows the frame turned 180°: source (sx, sy) → (WIDTH−1−sx, HEIGHT−1−sy).
 #[cfg(feature = "calibrate")]
 fn viewfinder_light(x0: usize, y0: usize, w: usize, h: usize, light: &[[u16; 3]]) -> crate::view::Emissive {
+    // WHY/PROOF: the logo rect is where chameleon found it in the camera frame, and it can reach past the frame's edge — WIDTH − (x0 + w) would underflow.
     let ox0 = WIDTH.saturating_sub(x0 + w);
     let oy0 = HEIGHT.saturating_sub(y0 + h);
     let mut rgb = vec![[0u16; 3]; w * h];
@@ -308,6 +311,7 @@ fn rgb_to_yuv420(rgb: &[u8], yuv: &mut [u8]) {
                     sr += (r - yl) as i64;
                 }
             }
+            // WHY/PROOF: chroma from the corrected camera frame leaves the 16..240 video range on saturated colours, and an i64 → u8 cast wraps instead of saturating.
             urow[x] = (128 + ((sb * cb_scale) >> 18)).clamp(16, 240) as u8;
             vrow[x] = (128 + ((sr * cr_scale) >> 18)).clamp(16, 240) as u8;
         }
@@ -455,7 +459,7 @@ impl Recorder {
         }
         // Time-of-day timecode at the camera's rate: HH:MM:SS:FF, frames from the sub-second part.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?;
-        let (h, m, sec, ff) = local_hms(now.as_secs(), (now.subsec_millis() as u32 * REC_FPS / 1000).min(REC_FPS - 1));
+        let (h, m, sec, ff) = local_hms(now.as_secs(), now.subsec_millis() as u32 * REC_FPS / 1000);
         let timecode = format!("{h:02}:{m:02}:{sec:02}:{ff:02}");
         let size = format!("{WIDTH}x{HEIGHT}");
         // A fresh FIFO for the audio: opsin's mic thread writes s16 mono into it from the sample that matches the first frame. Both inputs are plain count-based streams that start at 0 together — opsin owns the clock (CFR-conformed video, contiguous audio), ffmpeg does no timestamp arithmetic at all.
@@ -642,7 +646,8 @@ fn start_audio_tap(shared: Arc<Shared>, which: fn(&Shared) -> &AudioTap, extra_a
                         // Backlog from the moment the first frame was captured (the ring's newest sample is "now"), whole frames of channels, then every block as it comes.
                         let backlog: Vec<u8> = {
                             let ring = tap.ring.lock().unwrap();
-                            let frames = (((ring.1 - from_ms) / 1000. * RATE as f64).round().max(0.) as usize).min(ring.0.len() / channels);
+                            // WHY/PROOF: the requested start can predate the 2 s the ring holds (a slow encoder start, a wall-clock step) — n past the ring's length would underflow the skip.
+                            let frames = (((ring.1 - from_ms) / 1000. * RATE as f64).round() as usize).min(ring.0.len() / channels);
                             let n = frames * channels;
                             ring.0.iter().skip(ring.0.len() - n).flat_map(|v| v.to_le_bytes()).collect()
                         };
@@ -800,7 +805,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
             let pool = rayon::ThreadPoolBuilder::new().num_threads(12).thread_name(|i| format!("opsin-live-{i}")).build().expect("live pool");
             // yuv420p planes for both ffmpegs (limited range, BT.2020 non-constant luminance): half the bytes of rgb24, and no swscale on the far side — ffmpeg's rgb→yuv conversion is single-threaded and at 4K it was the bottleneck of both the loopback and the recorder.
             let mut yuv = vec![0u8; n * 3 / 2];
-            let mut frame_no = 0u32;
+            let mut frame_no = 0u64;
             while !shared.stop.load(Ordering::Relaxed) {
                 // Recording requests from the UI: a new path starts (or replaces) a recording, None ends it.
                 {
@@ -816,6 +821,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                                     // The first frame is due now; its audio starts at the moment that frame was captured: now − opsin's pipe − the camera's own latency (the operator's constant less the downstream part, which doesn't apply to a file).
                                     let now = wall_ms();
                                     rec_next_due = now;
+                                    // WHY/PROOF: extra_ms is the operator's constant (keys or the saved matrix) and can sit under the downstream share — the u32 subtraction underflows.
                                     let cam_ms = shared.extra_ms.load(Ordering::Relaxed).saturating_sub(DOWNSTREAM_MS) as f64;
                                     let pipe_ms = shared.pipe_ms10.load(Ordering::Relaxed) as f64 / 10.;
                                     let from = now - pipe_ms - cam_ms;
@@ -1009,7 +1015,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                     let ema = if prev == 0. { pipe } else { prev * 0.9 + pipe * 0.1 };
                     shared.pipe_ms10.store((ema * 10.) as u32, Ordering::Relaxed);
                 }
-                frame_no = frame_no.wrapping_add(1);
+                frame_no += 1;
                 if frame_no % 30 == 0 {
                     if let Some(m) = mic.as_mut() {
                         m.set_delay(shared.av_delay_ms());

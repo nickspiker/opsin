@@ -15,6 +15,7 @@ pub fn encode_pixels(lin: &[i32], ev: f32, clip_show: bool) -> Vec<u32> {
                 let idx = if clip_show {
                     if g >= 65535 { 0 } else if g < 0 { 65535 } else { g }
                 } else {
+                    // WHY/PROOF: g is file light times the exposure gain, below 0 for noise under black and past 65535 for anything brighter than display white — it indexes the 64Ki LUT, so an unclamped value panics out of bounds.
                     g.clamp(0, 65535)
                 };
                 lut[idx as usize]

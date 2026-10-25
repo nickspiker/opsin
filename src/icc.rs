@@ -28,7 +28,6 @@ pub enum Trc {
 impl Trc {
     /// Encoded [0, 1] → linear [0, 1].
     pub fn linear(&self, x: f32) -> f32 {
-        let x = x.clamp(0., 1.);
         match self {
             Trc::Gamma(g) => x.powf(*g),
             Trc::Table(t) => {
@@ -36,6 +35,7 @@ impl Trc {
                     return x;
                 }
                 let p = x * (t.len() - 1) as f32;
+                // WHY/PROOF: the table length is the file's curv count, and at x = 1 p lands exactly on the last entry — without the cap t[i + 1] reads one past the end.
                 let i = (p as usize).min(t.len() - 2);
                 let f = p - i as f32;
                 t[i] + (t[i + 1] - t[i]) * f
@@ -86,11 +86,13 @@ pub fn parse(bytes: &[u8]) -> Option<MatrixTrc> {
         return None;
     }
     let n = be32(&bytes[128..132]) as usize;
+    // WHY/PROOF: the tag count is a file field — a hostile or truncated profile names more tags than it holds, and slicing past the end panics.
     let table = bytes.get(132..132 + n * 12)?;
     let tag = |sig: &[u8; 4]| -> Option<&[u8]> {
         (0..n).find(|&i| &table[i * 12..i * 12 + 4] == sig).and_then(|i| {
             let off = be32(&table[i * 12 + 4..]) as usize;
             let len = be32(&table[i * 12 + 8..]) as usize;
+            // WHY/PROOF: a tag's offset and length are file fields and can point past the profile — slicing them unchecked panics.
             bytes.get(off..off + len)
         })
     };
@@ -112,6 +114,7 @@ pub fn parse(bytes: &[u8]) -> Option<MatrixTrc> {
             }
             b"para" => {
                 let kind = u16::from_be_bytes([t[8], t[9]]);
+                // WHY/PROOF: the function type is a file field and only 0..=4 exist — indexing the parameter-count table with anything else panics.
                 let np = [1, 3, 4, 5, 7].get(kind as usize).copied()?;
                 let mut p = [0f32; 7];
                 for (i, v) in p.iter_mut().enumerate().take(np) {
@@ -142,10 +145,12 @@ pub fn parse(bytes: &[u8]) -> Option<MatrixTrc> {
     let description = tag(b"desc").map(|t| match &t[0..4] {
         b"desc" => {
             let len = be32(&t[8..]) as usize;
+            // WHY/PROOF: the description length is a file field and can exceed its tag — slicing past the tag's end panics.
             String::from_utf8_lossy(&t[12..(12 + len).min(t.len())]).trim_end_matches('\0').to_string()
         }
         b"mluc" => {
             let (len, off) = (be32(&t[20..]) as usize, be32(&t[24..]) as usize);
+            // WHY/PROOF: the mluc record's offset and length are file fields and can point past the tag — slicing them unchecked panics.
             let u: Vec<u16> = t.get(off..off + len).map(|s| s.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()).unwrap_or_default();
             String::from_utf16_lossy(&u)
         }

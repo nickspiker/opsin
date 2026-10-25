@@ -134,14 +134,17 @@ pub fn mesh_warp(lo: &chameleon::LiveOverlay, layer: &[f32], cross: [f32; 3]) ->
             if !(lx.is_finite() && hx.is_finite() && ly.is_finite() && hy.is_finite()) || hx < 0. || hy < 0. || lx > (w - 1) as f64 || ly > (h - 1) as f64 {
                 continue;
             }
+            // WHY/PROOF: the mesh nodes are where chameleon found the target in the camera frame and run past its edges — an unclamped bound indexes off the output rows.
             let clamp = |v: f64, n: usize| v.clamp(0., (n - 1) as f64) as usize;
             cells.push(Cell { q, cx: cx as f64, cy: cy as f64, x0: clamp(lx.floor(), w), x1: clamp(hx.ceil(), w), y0: clamp(ly.floor(), h), y1: clamp(hy.ceil(), h) });
         }
     }
     let tap = |fx: f64, fy: f64| -> [f32; 4] {
+        // WHY/PROOF: u and v reach 1 inclusive, so the far cell edge lands on or past the flat raster's last column or row — chameleon sizes that raster, and an unclamped tap reads past it.
         let fx = fx.clamp(0., (fw - 1) as f64);
         let fy = fy.clamp(0., (fh - 1) as f64);
         let (ix, iy) = (fx as usize, fy as usize);
+        // WHY/PROOF: at the raster's last column or row the bilinear neighbour is one past the end.
         let (ix1, iy1) = ((ix + 1).min(fw - 1), (iy + 1).min(fh - 1));
         let (tx, ty) = ((fx - ix as f64) as f32, (fy - iy as f64) as f32);
         let px = |x: usize, y: usize, c: usize| layer[(y * fw + x) * 4 + c];
@@ -169,6 +172,7 @@ pub fn mesh_warp(lo: &chameleon::LiveOverlay, layer: &[f32], cross: [f32; 3]) ->
         }
         // Colour is the mean over the subsamples that landed in the overlay (as the splat normalizes by its weights); alpha also carries how much of the pixel the overlay covers, so its outer edge is antialiased.
         for x in 0..w {
+            // WHY/PROOF: neighbouring cells share their edge, so a seam pixel collects up to 8 subsample hits — coverage past 4 would push alpha past 1, and live's overlay lerp extrapolates with it.
             let n = hits[x].min(4);
             if hits[x] > 0 {
                 let k = 1. / hits[x] as f32;
@@ -183,9 +187,11 @@ pub fn mesh_warp(lo: &chameleon::LiveOverlay, layer: &[f32], cross: [f32; 3]) ->
     let size = lo.bullseyesize;
     let (weight, arm) = ((size / 87.) as usize + 1, (size / 5.) as usize + 1);
     for i in 0..4 {
+        // WHY/PROOF: the bullseye centres are where the scan found them, and one can sit left of or above the overlay's crop origin — the subtraction underflows.
         let (Some(bx), Some(by)) = (lo.bullseyesw[i].checked_sub(lo.min_x), lo.bullseyesh[i].checked_sub(lo.min_y)) else { continue };
         let (bx, by) = (bx + 1, by + 1);
         for (hw, hh) in [(weight, arm), (arm, weight)] {
+            // WHY/PROOF: a bullseye near the overlay's edge puts its arm past 0 — the subtraction underflows into a huge loop.
             for yy in by.saturating_sub(hh)..by + hh {
                 for xx in bx.saturating_sub(hw)..bx + hw {
                     if yy < h - 1 && xx < w - 1 {
@@ -238,7 +244,7 @@ fn inverse_bilinear(q: &[[f64; 2]; 4], p: [f64; 2]) -> Option<(f64, f64)> {
 
 /// chameleon's display light (linear, 0..1) → the encode's 0..65535 units.
 pub fn to_light(c: [f32; 3]) -> [u16; 3] {
-    c.map(|v| (v.clamp(0., 1.) * 65535.).round() as u16)
+    c.map(|v| (v * 65535.).round() as u16)
 }
 
 fn strip_ansi(s: &str) -> String {

@@ -68,11 +68,12 @@ impl RcdData {
         let mut vh_dir = vec![0.0f32; raw_image.width * raw_image.height];
 
         // Step 1.1: Calculate vertical and horizontal local discrimination
+        // WHY/PROOF: every `saturating_sub` on raw_image.height / width in this function — the dims are the file's, and a frame under 4 (or 2) pixels on a side would underflow the loop bound into a huge range that indexes far past the buffers.
         for row in 4..raw_image.height.saturating_sub(4) {
             for col in 4..raw_image.width.saturating_sub(4) {
                 let indx = row * raw_image.width + col;
 
-                // Safe bounds checking for array access
+                // WHY/PROOF: a flat patch of the file makes both statistics 0, and v / (v + h) is then 0 / 0 — NaN that spreads thru green into black pixels.
                 let v_stat = self.calculate_v_stat(&cfa, indx, w1, w2, w3, w4).max(EPSSQ);
                 let h_stat = self.calculate_h_stat(&cfa, indx).max(EPSSQ);
 
@@ -158,7 +159,7 @@ impl RcdData {
                 let h_est = (w_grad * e_est + e_grad * w_est) / (e_grad + w_grad);
 
                 // G@B and G@R interpolation
-                rgb[indx][1] = (vh_disc * h_est + (1.0 - vh_disc) * v_est).clamp(0.0, 1.0);
+                rgb[indx][1] = vh_disc * h_est + (1.0 - vh_disc) * v_est;
             }
         }
 
@@ -172,6 +173,7 @@ impl RcdData {
             for col in (start_col..raw_image.width.saturating_sub(4)).step_by(2) {
                 let indx = row * raw_image.width + col;
 
+                // WHY/PROOF: a flat patch makes both diagonal statistics 0, and p / (p + q) is then 0 / 0 — NaN thru red and blue.
                 let p_stat = self.calculate_p_stat(&cfa, indx, w1, w2, w3, w4).max(EPSSQ);
                 let q_stat = self.calculate_q_stat(&cfa, indx, w1, w2, w3, w4).max(EPSSQ);
 
@@ -232,8 +234,7 @@ impl RcdData {
                 let q_est = (ne_grad * sw_est + sw_grad * ne_est) / (ne_grad + sw_grad);
 
                 // R@B and B@R interpolation
-                rgb[indx][c] =
-                    (rgb[indx][1] + (1.0 - pq_disc) * p_est + pq_disc * q_est).clamp(0.0, 1.0);
+                rgb[indx][c] = rgb[indx][1] + (1.0 - pq_disc) * p_est + pq_disc * q_est;
             }
         }
 
@@ -290,8 +291,7 @@ impl RcdData {
                     let h_est = (e_grad * w_est + w_grad * e_est) / (e_grad + w_grad);
 
                     // R@G and B@G interpolation
-                    rgb[indx][c] =
-                        (rgb[indx][1] + (1.0 - vh_disc) * v_est + vh_disc * h_est).clamp(0.0, 1.0);
+                    rgb[indx][c] = rgb[indx][1] + (1.0 - vh_disc) * v_est + vh_disc * h_est;
                 }
             }
         }

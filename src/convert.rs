@@ -150,6 +150,7 @@ pub fn camera_to_display(dec: &Decoded, target: Target) -> [f32; 9] {
     for ch in 0..3 {
         let black = level(&dec.img.black, ch, k, "black").unwrap_or(0.);
         let white = level(&dec.img.white, ch, k, "white").unwrap_or(65535.);
+        // WHY/PROOF: black and white are the file's levels, and white at or under black would divide by zero or flip the channel.
         let range = (white - black).max(1.);
         for o in 0..3 {
             m[o * 3 + ch] /= range;
@@ -247,6 +248,7 @@ fn orientation_view(code: u16) -> Option<ViewTransform> {
 
 /// Orientation (tag 0x0112) from an EXIF TIFF block — IFD0 only, where the tag lives. Either byte order. `None` for a malformed block or an absent tag; never panics on hostile bytes.
 fn exif_orientation(tiff: &[u8]) -> Option<u16> {
+    // WHY/PROOF: every `.get` here — the block, its IFD offset and its entry count are the file's bytes, and any of them can point past the end.
     let le = match tiff.get(..4)? {
         [b'I', b'I', 42, 0] => true,
         [b'M', b'M', 0, 42] => false,
@@ -265,6 +267,7 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
 
 /// The EXIF block of a JPEG: the APP1 segment opening `Exif\0\0`, walked marker by marker up to the scan data (EXIF must precede it).
 fn jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
+    // WHY/PROOF: every `.get` here — segment lengths are the file's bytes and can run past the end, and a length under 2 would reverse the slice.
     if bytes.get(..2)? != [0xFF, 0xD8] {
         return None;
     }
@@ -297,6 +300,7 @@ fn jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
 
 /// The EXIF block of a WebP: the RIFF `EXIF` chunk. The spec says it holds a bare TIFF block; some writers keep JPEG's `Exif\0\0` prefix, so that is stripped when present.
 fn webp_exif(bytes: &[u8]) -> Option<&[u8]> {
+    // WHY/PROOF: every `.get` here — chunk sizes are the file's bytes and can run past the end.
     if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
         return None;
     }
@@ -508,6 +512,7 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     // Interleaved f32 [h,w,ch] → linear planar u16 [3,h,w], alpha (ch 4) dropped. Rows are independent — rayon over the three planes' output rows via one pass per plane keeps it simple: iterate output rows of the planar buffer jointly instead.
     // Light is relative to diffuse white (1.0). SDR transfers top out there and white is 65535 as before; PQ and HLG carry light above it, so white drops to 65535 / peak and the highlights keep their place above white instead of clipping.
     let light_of = |e: f32, c: usize| -> f32 {
+        // WHY/PROOF: the decoder hands back the file's floats, which sit outside 0..1 for out-of-gamut and HDR overshoot — powf of a negative is NaN and the PQ/HLG curves are defined on 0..1 only.
         let e = e.clamp(0., 1.);
         #[allow(deprecated)]
         match &eotf {
@@ -519,12 +524,13 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
             Eotf::Hlg => vsf::colour::transfer::hlg_light(e),
         }
     };
+    // WHY/PROOF: an all-black (or wholly dim) PQ/HLG file peaks at 0 (or under 1), and 65535 / 0 is an infinite white — SDR-range content keeps white at 65535.
     let peak = if matches!(eotf, Eotf::Pq | Eotf::Hlg) { buf.par_chunks(ch).map(|px| (0..3).map(|c| light_of(px[c], c)).fold(0f32, f32::max)).reduce(|| 0., f32::max).max(1.) } else { 1. };
     let white = 65535. / peak;
     let mut planar = vec![0u16; n * 3];
     let (rp, rest) = planar.split_at_mut(n);
     let (gp, bp) = rest.split_at_mut(n);
-    let lin_of = |e: f32, c: usize| -> u16 { (light_of(e, c) * white).round().min(65535.) as u16 };
+    let lin_of = |e: f32, c: usize| -> u16 { (light_of(e, c) * white).round() as u16 };
     rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
         let s = i * ch;
         *r = lin_of(buf[s], 0);
@@ -533,6 +539,7 @@ fn ingest_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     });
 
     // JXL declares its sample depth in the image header; it is not always 8.
+    // WHY/PROOF: the sample depth is the file's header — 0 or past 32 is not a depth any later shift or LUT can take.
     let src_bits = image.image_header().metadata.bit_depth.bits_per_sample().clamp(1, 32) as u8;
     let mut dec = display_referred(w, h, planar, cam_to_vsf, &source, tier, illuminant, src_bits);
     dec.img.white = vec![white; 3];
@@ -583,6 +590,7 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
         let (rp, rest) = planar.split_at_mut(n);
         let (gp, bp) = rest.split_at_mut(n);
         rp.par_iter_mut().zip(gp.par_iter_mut()).zip(bp.par_iter_mut()).enumerate().for_each(|(i, ((r, g), b))| {
+            // WHY/PROOF: a file whose samples exceed its declared bit depth indexes past the LUT, which has only 2^bits entries.
             *r = lut[0][(pixels[i * 3] as usize).min(white as usize)];
             *g = lut[1][(pixels[i * 3 + 1] as usize).min(white as usize)];
             *b = lut[2][(pixels[i * 3 + 2] as usize).min(white as usize)];
@@ -699,11 +707,11 @@ pub fn ingest_image(input: &Path) -> Result<Decoded, String> {
     Ok(Decoded { img, src_bits: bit_depth as u8, baseline_ev, crop_hint, capture, foreign, response, text: String::new(), observer: String::new() })
 }
 
-/// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input clamp is load-bearing: past the rail the cubic FOLDS BACK, so overs must pin to the rail first (the encode boundary's clamp already does). Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
+/// The HDR highlight rolloff — Photon's audio wire shaper (`call/qgain.rs::cubic_rail`) on the u16 display domain: `y = (3x − (x³ >> 32)) >> 1`, i.e. `(3x − x³)/2` with the rail at 65535. Integer, branchless, one multiply chain; `f(0) = 0`, `f(rail) = rail`, slope 3/2 at black, slope 0 exactly at the rail — a soft shoulder that reaches display white tangentially, so the clamp lands where the curve is already flat and no edge shows; its only distortion product is 3rd-order. Brightens the low end (+0.58 stop) and compresses the top; pull exposure down ~3× and the top ~1.5 stops that used to clip now roll off. The input must already sit in 0..65535: past the rail the cubic FOLDS BACK, so overs pin to the rail first — every caller's encode-boundary clamp does that, so this function trusts its input. Per channel, in linear, at the ONE encode boundary — viewer LUT and JPEG export call this same function, so they are bit-identical. A Creative op: recorded, never silent. Oriel's `sin(πx/2)` rolloff is the same shape within 0.023.
 #[inline]
 pub fn hdr_rail(x: i64) -> i64 {
-    let x = x.clamp(0, 65535);
-    ((3 * x - ((x * x * x) >> 32)) >> 1).clamp(0, 65535)
+    // WHY/PROOF: every caller hands in 0..65535, and over that range the cubic is monotone and never negative but tops out at 65536 for x = 65535 — one past the LUTs it indexes.
+    ((3 * x - ((x * x * x) >> 32)) >> 1).min(65535)
 }
 
 /// `dr_curve` view-op params for [`hdr_rail`]: polynomial coefficients [c0, c1, c2, c3] of f(x) = Σ cᵢxⁱ.
@@ -735,6 +743,7 @@ pub fn srgb8(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool) -> Result<Vec<
         for x in 0..w {
             let c = [irow[x * 3] as f32 * gain, irow[x * 3 + 1] as f32 * gain, irow[x * 3 + 2] as f32 * gain];
             for o in 0..3 {
+                // WHY/PROOF: lin is signed file light thru the exposure gain and leaves 0..1 both ways — `hdr_rail` folds back past the rail, and that is the one clamp before it.
                 let v = (m[o * 3] * c[0] + m[o * 3 + 1] * c[1] + m[o * 3 + 2] * c[2]).clamp(0., 1.);
                 // Through the integer rail so the export's shoulder is bit-identical to the viewer's LUT.
                 let v = if hdr { hdr_rail((v * 65535.).round() as i64) as f32 / 65535. } else { v };
@@ -751,6 +760,7 @@ pub fn write_thumbnail(input: &Path, size: usize, out: &Path) -> Result<(), Stri
     let ev = stored_exposure_ev(&dec.img).unwrap_or(0.);
     let (w, h, lin) = to_linear(&dec)?;
     drop(dec);
+    // WHY/PROOF: size is the thumbnailer's %s argument, and 0 would fold to a 0-wide frame that divides by zero.
     let (w, h, lin) = fold_linear(lin, w, h, size.max(1));
     let rgb8 = srgb8(&lin, w, h, ev, false)?;
     let file = std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -765,15 +775,16 @@ pub fn fold_linear(lin: Vec<i32>, w: usize, h: usize, max_edge: usize) -> (usize
     if w.max(h) <= max_edge || w == 0 || h == 0 {
         return (w, h, lin);
     }
+    // WHY/PROOF: w and h are the file's, and an extreme aspect scales the short side to 0 — every box below would divide by it.
     let (tw, th) = if w >= h { (max_edge, (h * max_edge / w).max(1)) } else { ((w * max_edge / h).max(1), max_edge) };
     let mut out = vec![0i32; tw * th * 3];
     out.par_chunks_mut(tw * 3).enumerate().for_each(|(ty, row)| {
         let y0 = ty * h / th;
-        let y1 = ((ty + 1) * h / th).max(y0 + 1).min(h);
+        let y1 = (ty + 1) * h / th;
         let mut rem = [0i64; 3];
         for tx in 0..tw {
             let x0 = tx * w / tw;
-            let x1 = ((tx + 1) * w / tw).max(x0 + 1).min(w);
+            let x1 = (tx + 1) * w / tw;
             let mut acc = [0i64; 3];
             let mut n = 0i64;
             for sy in y0..y1 {
@@ -785,7 +796,6 @@ pub fn fold_linear(lin: Vec<i32>, w: usize, h: usize, max_edge: usize) -> (usize
                     n += 1;
                 }
             }
-            let n = n.max(1);
             for ch in 0..3 {
                 let t = acc[ch] + rem[ch];
                 let q = t.div_euclid(n);
@@ -951,7 +961,7 @@ pub fn rotate_code(code: u16, cw: bool) -> u16 {
         [0, -1, -1, 0], // 7 transverse
         [0, 1, -1, 0],  // 8 rotate 90 CCW
     ];
-    let m = M[(code.clamp(1, 8) - 1) as usize];
+    let m = M[(code - 1) as usize];
     let r: [i8; 4] = if cw { M[5] } else { M[7] };
     // r · m
     let p = [r[0] * m[0] + r[1] * m[2], r[0] * m[1] + r[1] * m[3], r[2] * m[0] + r[3] * m[2], r[2] * m[1] + r[3] * m[3]];
@@ -1013,6 +1023,7 @@ pub fn to_linear_full(dec: &Decoded, target: Target, progress: &dyn Fn(f32)) -> 
     progress(0.05);
 
     // RCD wants each pixel's own CFA channel in place, the other two zero; it fills them in.
+    // WHY/PROOF: CFA channel indices are the file's, and past 2 they index off RCD's three channels.
     let tile: Vec<usize> = cfa.data.iter().map(|&c| (c as usize).min(2)).collect();
     let mut rcd = crate::debayer::RcdData::new(w, h, Box::new(move |row: usize, col: usize| tile[(row % 2) * 2 + col % 2]));
     for y in 0..h {
@@ -1044,6 +1055,7 @@ pub fn to_linear_full(dec: &Decoded, target: Target, progress: &dyn Fn(f32)) -> 
     if w > RCD_EDGE * 2 && h > RCD_EDGE * 2 {
         let mut tile_count = vec![0f64; 3];
         for &c in &cfa.data {
+            // WHY/PROOF: CFA channel indices are the file's, and past 2 they index off the three-slot count.
             tile_count[(c as usize).min(2)] += 1.;
         }
         let (brows, bbias) = build_coefs(img, &cmx, &tile_count)?;
@@ -1052,6 +1064,7 @@ pub fn to_linear_full(dec: &Decoded, target: Target, progress: &dyn Fn(f32)) -> 
             let mut acc = [-bbias[0], -bbias[1], -bbias[2]];
             for ty in 0..2 {
                 for tx in 0..2 {
+                    // WHY/PROOF: CFA channel indices are the file's, and past 2 they index off the three binned rows.
                     let ch = (cfa.data[ty * 2 + tx] as usize).min(2);
                     let c = &brows[ch].coef;
                     let v = counts[(by + ty) * w + bx + tx] as i64;

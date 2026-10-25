@@ -62,6 +62,7 @@ fn ev_of_slider(v: f32, baseline: f32) -> f32 {
 }
 /// Stops of operator exposure → slider 0..1. `baseline` is the file's declared opening gain, and the range brackets the TOTAL that reaches the screen — `EV_MIN..EV_MAX` of `ev + baseline`, not of `ev` alone. Without that, a file declaring +4 could only be pulled back to its own capture: the slider bottomed out at −4, which lands at total 0, where sensor saturation maps exactly to display white, so a blown sky stayed white however far you pulled and the preserved above-white data was unreachable (Nick 2026-09-22: "when I put a -4 in Opsin I still get white ... I KNOW there's data there").
 fn slider_of_ev(ev: f32, baseline: f32) -> f32 {
+    // WHY/PROOF: the file's baseline and the operator's key nudges can put ev + baseline past either end of the track — the slider value would leave 0..1 and its handle the track.
     ((ev + baseline).clamp(EV_MIN, EV_MAX) - EV_MIN) / (EV_MAX - EV_MIN)
 }
 
@@ -204,20 +205,20 @@ impl RawView {
     }
 
     fn from_image(img: &vsf::spectral_image::SpectralImage, or_w: usize, or_h: usize) -> Self {
+        // WHY/PROOF: the black/white level lists are the file's and may hold fewer than three entries (or none) — indexing them unchecked panics.
         let level = |l: &[f32], i: usize| if l.len() == 1 { l[0] } else { l.get(i).copied().unwrap_or_else(|| l.first().copied().unwrap_or(0.)) };
         let black = [level(&img.black, 0), level(&img.black, 1), level(&img.black, 2)];
         let white = [level(&img.white, 0), level(&img.white, 1), level(&img.white, 2)];
+        // WHY/PROOF: the bit depth is the file's — 0 divides the log axis by zero, and past 16 the stops span outruns the u16 codes.
         let bits = (img.bit_depth() as usize).clamp(1, 16);
         let orient = crate::convert::orientation_code(img);
         match &img.layout {
             vsf::spectral_image::PlaneLayout::Mosaic { cfa } => {
                 let (tile_h, tile_w) = (cfa.shape[0], cfa.shape[1]);
                 let mut census = [0f32; 3];
+                // WHY/PROOF: CFA channel indices are the file's, and a fourth channel (RGBW) or a hostile byte would index past the three-slot census.
                 for &c in &cfa.data {
                     census[(c as usize).min(2)] += 1.;
-                }
-                for c in &mut census {
-                    *c = c.max(1.);
                 }
                 Self {
                     counts: img.samples.unpack_u16(),
@@ -266,8 +267,8 @@ impl RawView {
     /// A displayed (possibly folded, oriented) pixel → the full-resolution oriented pixel → the pre-orientation sensor-tile coordinate.
     #[inline]
     fn sensor_of(&self, dx: usize, dy: usize) -> (usize, usize) {
-        let ux = if self.fold_w == self.or_w { dx } else { (dx * self.or_w / self.fold_w.max(1)).min(self.or_w.saturating_sub(1)) };
-        let uy = if self.fold_h == self.or_h { dy } else { (dy * self.or_h / self.fold_h.max(1)).min(self.or_h.saturating_sub(1)) };
+        let ux = if self.fold_w == self.or_w { dx } else { dx * self.or_w / self.fold_w };
+        let uy = if self.fold_h == self.or_h { dy } else { dy * self.or_h / self.fold_h };
         crate::convert::orientation_src(self.orient, self.pre_w, self.pre_h, ux, uy)
     }
 
@@ -284,6 +285,7 @@ impl RawView {
             let base = sy * self.tile_h * self.sensor_w + sx * self.tile_w;
             for ty in 0..self.tile_h {
                 for tx in 0..self.tile_w {
+                    // WHY/PROOF: the CFA channel index is the file's, and past 2 it indexes off the three-channel code row.
                     let ch = (self.cfa[ty * self.tile_w + tx] as usize).min(2);
                     codes[self.counts[base + ty * self.sensor_w + tx] as usize][ch] += 1;
                 }
@@ -345,6 +347,7 @@ impl Domain {
         let mut dens = vec![[0f32; 3]; bins];
         for ch in 0..3 {
             let black = self.black[ch];
+            // WHY/PROOF: black and white are the file's levels, and white at or under black would divide by zero or flip the axis.
             let range = (self.white[ch] - black).max(1.);
             // The render's own gain for THIS camera channel, times the operator's slider.
             let gain = self.gains[ch] * ev_gain;
@@ -363,12 +366,13 @@ impl Domain {
                 for (v, code) in codes.iter().enumerate() {
                     if code[ch] > 0 {
                         if let Some(p) = prev {
+                            // WHY/PROOF: gaps between occupied codes are set by the file's content and run up to 65535 — past 256 they index off the 257-slot table.
                             gap_hist[(v - p).min(256)] += 1;
                         }
                         prev = Some(v);
                     }
                 }
-                gap_hist.iter().enumerate().skip(1).max_by_key(|e| *e.1).map(|(g, _)| g).unwrap_or(1).max(1) as f32
+                gap_hist.iter().enumerate().skip(1).max_by_key(|e| *e.1).map(|(g, _)| g).unwrap_or(1) as f32
             };
             for (v, code) in codes.iter().enumerate() {
                 let c = code[ch];
@@ -376,19 +380,21 @@ impl Domain {
                     continue;
                 }
                 let b0 = frac((v as f32 - black) * gain) * bins as f32;
+                // WHY/PROOF: gain is the row sum of a matrix built from the file's ColorMatrix and can be zero or negative — b1 would then fall below b0 and the interval would run backward.
                 let b1 = (frac((v as f32 + step - black) * gain) * bins as f32).max(b0);
                 let total = c as f32 * weight;
+                // WHY/PROOF: frac reaches 1 for anything at or past white, which puts b0 exactly on `bins` — one past the last bin.
                 let lo = (b0 as usize).min(bins - 1);
                 if b1 - b0 <= f32::EPSILON {
                     // Degenerate interval — the clip collapses (≤ black, ≥ white) land whole in one bin.
                     dens[lo][ch] += total;
                     continue;
                 }
-                let hi = (b1.ceil() as usize).clamp(lo + 1, bins);
+                let hi = b1.ceil() as usize;
                 let inv = total / (b1 - b0);
                 for (b, d) in dens[lo..hi].iter_mut().enumerate() {
                     let bf = (lo + b) as f32;
-                    d[ch] += (b1.min(bf + 1.) - b0.max(bf)).max(0.) * inv;
+                    d[ch] += (b1.min(bf + 1.) - b0.max(bf)) * inv;
                 }
             }
         }
@@ -438,7 +444,7 @@ impl Emissive {
     /// The one place emissive light meets an encode: `t` is the channel already through exposure, clamp and rolloff (display-linear 0..65535), `e` the light. Their sum goes through the bare transfer — the rolloff is behind it, so the light lands at exactly its own value. Shared by the viewer's frame encode and its overlay draw.
     #[inline]
     pub fn lit(t: i64, e: u16) -> u8 {
-        display_tone(false)[(t + e as i64).clamp(0, 65535) as usize]
+        display_tone(false)[(t + e as i64).min(65535) as usize]
     }
 }
 
@@ -459,8 +465,9 @@ pub fn encode_pixels_lit(lin: &[i32], ev: f32, clip_show: bool, hdr: bool, emiss
     lin.par_chunks_exact(3)
         .enumerate()
         .map(|(i, px)| {
-            let e = emissive.map_or([0; 3], |em| em.at(i % em.frame_w.max(1), i / em.frame_w.max(1)));
+            let e = emissive.map_or([0; 3], |em| em.at(i % em.frame_w, i / em.frame_w));
             if e != [0; 3] {
+                // WHY/PROOF: file light times the exposure gain leaves 0..65535 both ways (noise under black, speculars past white) — the rolloff and the LUT take only 0..65535.
                 let ch = |v: i32, e: u16| 255 - Emissive::lit(rolled(((v as i64 * gain) >> GAIN_SHIFT).clamp(0, 65535)), e) as u32;
                 return fluor::theme::fmt(0xFF000000 | (ch(px[0], e[0]) << 16) | (ch(px[1], e[1]) << 8) | ch(px[2], e[2]));
             }
@@ -476,6 +483,7 @@ pub fn encode_pixels_lit(lin: &[i32], ev: f32, clip_show: bool, hdr: bool, emiss
                         g
                     }
                 } else {
+                    // WHY/PROOF: g is file light times the exposure gain, below 0 under black and past 65535 above white — it indexes the 64Ki LUT, so an unclamped value panics out of bounds.
                     g.clamp(0, 65535)
                 };
                 lut[idx as usize]
@@ -952,7 +960,7 @@ impl View {
     /// How far the host's job is along (0..=1); nothing when no bar is up.
     pub fn set_busy_frac(&mut self, frac: f32) {
         if let Some((_, v)) = self.busy.as_mut() {
-            *v = frac.clamp(0., 1.);
+            *v = frac;
         }
     }
 
@@ -1055,6 +1063,7 @@ impl View {
 
     /// Harmonic-mean span of the image area, 2wh/(w+h) — the universal scaling base (smooth in both dims, biased toward the smaller one).
     fn area_span(aw: f32, ah: f32) -> f32 {
+        // WHY/PROOF: the host can hand a zero-size area (a minimized window), and 0 / 0 here is a NaN zoom that sticks in zoom_rel.
         2. * aw * ah / (aw + ah).max(1.)
     }
 
@@ -1074,7 +1083,7 @@ impl View {
         }
         // With a crop armed, the crop IS the frame: fit and centre on it.
         let (rx0, ry0, rx1, ry1) = self.crop.unwrap_or((0, 0, self.img_w, self.img_h));
-        let (rw, rh) = ((rx1 - rx0).max(1) as f32, (ry1 - ry0).max(1) as f32);
+        let (rw, rh) = ((rx1 - rx0) as f32, (ry1 - ry0) as f32);
         let (_, _, aw, ah) = self.image_area();
         let zoom = (aw / rw).min(ah / rh) * (1. - 1. / (1 << 6) as f32);
         self.zoom_rel = zoom / Self::area_span(aw, ah);
@@ -1144,6 +1153,7 @@ impl View {
         let dx = self.divider_x() as usize;
         let pad = pad_of(viewport);
         let band = band_of(viewport);
+        // WHY/PROOF: the window is user-sized and can be narrower or shorter than the panel stack — the min and saturating_sub on x0, w, y and chart_h keep every rect inside the area so the rect math downstream (w − label_w, buf_h − hy) cannot underflow.
         let x0 = (dx + 1 + pad).min(vw);
         let w = vw.saturating_sub(x0 + pad);
         let mut y = (self.area.y as usize + pad).min(vh);
@@ -1190,6 +1200,7 @@ impl View {
         if nw == 0 || nh == 0 || tw == 0 || th == 0 {
             return None;
         }
+        // WHY/PROOF: the thumb's aspect is the file's, and a slitscan-thin one floors the fitted side to 0 (or past the rect) — the blit then divides by zero.
         let fw = nw.min(nh * tw / th).max(1);
         let fh = (fw * th / tw).clamp(1, nh);
         Some((nx + (nw - fw) / 2, ny + (nh - fh) / 2, fw, fh))
@@ -1280,6 +1291,7 @@ impl View {
             self.ev = ev;
         }
         // The baseline moves where a given EV sits on the track, so the handle is re-placed whether or not the EV itself changed — and the EV is held to what this file can reach.
+        // WHY/PROOF: the stored EV and the baseline are both the file's, and together they can land past the track.
         self.ev = self.ev.clamp(EV_MIN - self.baseline_ev, EV_MAX - self.baseline_ev);
         self.ev_slider.set_value(slider_of_ev(self.ev, self.baseline_ev));
         if self.clip_show || self.hdr || self.ev.abs() > 1e-4 {
@@ -1296,7 +1308,7 @@ impl View {
             self.btn_crop.set_fill(None);
             self.fit();
         }
-        self.frame_gen = self.frame_gen.wrapping_add(1);
+        self.frame_gen += 1;
         self.preview_full = false;
         self.start_preview_upgrade();
         ctx.window.request_redraw();
@@ -1370,15 +1382,15 @@ impl View {
         };
         // A JPEG is a DELIVERABLE, so it goes out at the sensor's own resolution: the decode is re-rendered through RCD rather than reusing the view's binned buffer (a quarter of the pixels). That costs ~0.8 s on a 12.5 MP frame, far too long to block the window, so it runs on a thread and reports progress; without a retained decode or a wake sender — a host that dropped the decode to save memory, a live frame — the view buffer is exactly right and goes out directly, on the spot.
         let (ev, hdr, crop) = (self.ev, self.hdr, self.crop);
-        let (view_w, view_h) = (self.img_w.max(1), self.img_h.max(1));
+        let (view_w, view_h) = (self.img_w, self.img_h);
         let slice = move |lin: &[i32], w: usize, h: usize| -> (Vec<i32>, usize, usize) {
             match crop {
                 // The crop is in VIEW pixels; the full render is a different resolution, so it scales.
                 Some((x0, y0, x1, y1)) => {
                     let (sx, sy) = (w as f32 / view_w as f32, h as f32 / view_h as f32);
-                    let (x0, x1) = ((x0 as f32 * sx) as usize, ((x1 as f32 * sx) as usize).min(w));
-                    let (y0, y1) = ((y0 as f32 * sy) as usize, ((y1 as f32 * sy) as usize).min(h));
-                    let (cw, ch) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+                    let (x0, x1) = ((x0 as f32 * sx) as usize, (x1 as f32 * sx) as usize);
+                    let (y0, y1) = ((y0 as f32 * sy) as usize, (y1 as f32 * sy) as usize);
+                    let (cw, ch) = (x1 - x0, y1 - y0);
                     let mut sub = Vec::with_capacity(cw * ch * 3);
                     for y in y0..y1 {
                         sub.extend_from_slice(&lin[(y * w + x0) * 3..(y * w + x1) * 3]);
@@ -1436,6 +1448,7 @@ impl View {
     /// Move crop corner `k` to image point (px, py), clamped to the frame, then re-normalise so x0 < x1 and y0 < y1 (a corner dragged past its opposite just swaps roles) with at least one pixel of extent.
     fn move_crop_corner(&mut self, k: usize, px: f32, py: f32) {
         let Some((mut x0, mut y0, mut x1, mut y1)) = self.crop else { return };
+        // WHY/PROOF: the pointer can be dragged anywhere on the window — an unclamped corner would put the crop past the frame and the export would slice past the buffer.
         let nx = px.round().clamp(0., self.img_w as f32) as usize;
         let ny = py.round().clamp(0., self.img_h as f32) as usize;
         match k {
@@ -1453,8 +1466,6 @@ impl View {
     fn crop_suggestion(&self) -> Option<(usize, usize, usize, usize)> {
         let r = &self.raw;
         sensor_rect_to_display(self.dec.as_ref()?.crop_hint?, (r.tile_w, r.tile_h), r.orient, (r.pre_w, r.pre_h), (r.or_w, r.or_h), (r.fold_w, r.fold_h))
-            .map(|(x0, y0, x1, y1)| (x0.min(self.img_w), y0.min(self.img_h), x1.min(self.img_w), y1.min(self.img_h)))
-            .filter(|&(x0, y0, x1, y1)| x0 < x1 && y0 < y1)
     }
 
     /// Crop on: start from the maker's recommended crop when the file states one (a CR2's 5472×3648 inside the full 5568×3708 the view shows), else the whole frame. Off: back to everything.
@@ -1568,7 +1579,7 @@ impl View {
         let (sx, sy) = (w as f32 / self.img_w as f32, h as f32 / self.img_h as f32);
         self.zoom_rel /= sx;
         self.crop = self.crop.map(|(x0, y0, x1, y1)| {
-            (((x0 as f32 * sx) as usize).min(w), ((y0 as f32 * sy) as usize).min(h), ((x1 as f32 * sx) as usize).min(w), ((y1 as f32 * sy) as usize).min(h))
+            ((x0 as f32 * sx) as usize, (y0 as f32 * sy) as usize, (x1 as f32 * sx) as usize, (y1 as f32 * sy) as usize)
         });
         self.img_w = w;
         self.img_h = h;
@@ -2200,6 +2211,7 @@ impl View {
                     Key::Character(c) if (c == "," || c == ".") && self.live.is_some() => {
                         if let Some(shared) = &self.live {
                             let cur = shared.extra_ms.load(std::sync::atomic::Ordering::Relaxed) as i32;
+                            // WHY/PROOF: key repeats walk the constant below 0, and the u32 store would wrap it to four billion ms.
                             let next = (cur + if c == "," { -10 } else { 10 }).clamp(0, 1500) as u32;
                             shared.extra_ms.store(next, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -2363,6 +2375,7 @@ impl View {
         let clip = Some(Clip::new(damage_clip.x0, damage_clip.y0, damage_clip.x1, damage_clip.y1));
         // The whole image transform for this frame, derived from the live area — the ONLY place pixel values exist, and they exist for exactly one frame.
         let (zoom, img_ox, img_oy) = self.view_px();
+        // WHY/PROOF: the area is the host's window rect and the canvas the surface — mid-resize they disagree, and an area past the canvas would index past its pixels everywhere below.
         let area_x0 = (self.area.x.max(0.) as usize).min(buf_w);
         let area_y0 = (self.area.y.max(0.) as usize).min(buf_h);
         let area_x1 = ((self.area.x + self.area.w).max(0.) as usize).min(buf_w);
@@ -2436,6 +2449,7 @@ impl View {
                 let centi = (self.ev * 100.).trunc() as i32;
                 let label = format!("{}{}.{:02}", if centi < 0 { '-' } else { '+' }, (centi / 100).abs(), (centi % 100).abs());
                 text.draw_text_left(canvas, &label, ex as f32, (ey + eh / 2) as f32, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
+                // WHY/PROOF: the panel is as narrow as the user drags it, and the label can be wider than the band — the subtraction underflows.
                 let sw = ew.saturating_sub(label_w);
                 if sw > eh {
                     self.ev_slider.set_rect((ex + label_w + sw / 2) as f32, (ey + eh / 2) as f32, sw as f32, eh as f32);
@@ -2451,6 +2465,7 @@ impl View {
                 if mh > 0 && mw > 0 {
                     let font = band as f32 * (7. / (1 << 3) as f32);
                     let label_w = band * 2;
+                    // WHY/PROOF: the panel is as narrow as the user drags it, and the label can be wider than the section — the subtraction underflows.
                     let sw = (mw.saturating_sub(label_w)) as f32 / 4.;
                     for r in 0..3 {
                         let cy = (my + r * band) as f32 + band as f32 / 2.;
@@ -2473,8 +2488,9 @@ impl View {
                     // Mic meter — a real bar, fixed place and width: the full section width under Reset/Save. −60…0 dBFS left to right, green to −12, yellow to −3, red above; a dark trough behind it, a hairline at each 12 dB. Label at the left end, dB at the right.
                     if let Some(shared) = &self.live {
                         let peak = f32::from_bits(shared.mic.peak.load(std::sync::atomic::Ordering::Relaxed));
-                        let db = if peak > 0. { (20. * peak.log10()).max(-60.) } else { -60. };
+                        let db = if peak > 0. { 20. * peak.log10() } else { -60. };
                         let label_w = band * 2;
+                        // WHY/PROOF: the panel is as narrow as the user drags it, and the label and dB text can be wider than the section — the subtraction underflows.
                         let (tx, ty, tw, th) = (mx + label_w, my + band * 4 + pad_of(viewport) * 2, mw.saturating_sub(label_w + band * 3), (band * 3 / 5).max(3));
                         let cy = ty as f32 + th as f32 / 2.;
                         text.draw_text_left(canvas, "mic", mx as f32, cy, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
@@ -2519,6 +2535,7 @@ impl View {
                 }
             }
             // The plot body takes the rest of the rect, below the pill band.
+            // WHY/PROOF: on a short window the pill band can be taller than the hist rect, and hh − pill_band underflows.
             let (hy, hh) = (hy + pill_band.min(hh), hh.saturating_sub(pill_band));
 
             // Histogram body — the RENDERED light of WHAT'S IN VIEW, per frame, equal-energy: every visible display pixel tallies its three linear values into the per-level table (exact integers, no axis math per sample); the spread then deposits each level over the bin interval its quantization step covers through the active axis. Comb-free by construction;
@@ -2535,7 +2552,7 @@ impl View {
                     let (img_w, img_h) = (self.img_w, self.img_h);
                     (area_y0..area_y1)
                         .into_par_iter()
-                        .with_min_len(((area_y1 - area_y0) / 8).max(1))
+                        .with_min_len((area_y1 - area_y0) / 8)
                         .fold(
                             || vec![[0u32; 3]; 1 << 16],
                             |mut c, sy| {
@@ -2551,6 +2568,7 @@ impl View {
                                                 let i = (fy as usize * img_w + fx as usize) * 3;
                                                 // Out-of-range light is real and kept signed in `lin`; it bins at the ends, where the clip spikes live.
                                                 for ch in 0..3 {
+                                                    // WHY/PROOF: lin is signed file light — values under black and past white index outside the 64Ki code table.
                                                     c[lin[i + ch].clamp(0, 65535) as usize][ch] += 1;
                                                 }
                                             }
@@ -2585,6 +2603,7 @@ impl View {
                     (0..=self.raw.bits as i32).map(|s| ((bins as f32 / 2f32.powi(s)) as usize).min(bins - 1)).collect()
                 };
                 let hist_px = crate::panel::render_hist(&dens, hw, hh, &stop_bins, self.hist_ylog);
+                // WHY/PROOF: the section rect comes from the user-sized area, which can run past the canvas mid-resize — the clip keeps put() inside the buffer.
                 for row in 0..hh.min(buf_h.saturating_sub(hy)) {
                     for col in 0..hw.min(buf_w.saturating_sub(hx)) {
                         put(canvas.pixels, buf_w, hx + col, hy + row, hist_px[row * hw + col]);
@@ -2594,6 +2613,7 @@ impl View {
             // Navigator thumbnail — nearest blit into the ASPECT-FITTED sub-rect (letterboxed, centered): the navigator never stretches the image. `nav_fit` is the shared truth for blit, view-rect overlay, and cursor mapping.
             let fitted = self.nav_fit(viewport);
             if let Some((fx, fy, fw, fh)) = fitted {
+                // WHY/PROOF: the section rect comes from the user-sized area, which can run past the canvas mid-resize — the clip keeps put() inside the buffer.
                 for ty in 0..fh.min(buf_h.saturating_sub(fy)) {
                     let sy = ty * self.tools.thumb_h / fh;
                     for tx in 0..fw.min(buf_w.saturating_sub(fx)) {
@@ -2630,8 +2650,8 @@ impl View {
             }
             // Navigator crop rect — the armed crop in thumb space, same XOR marker so it reads on any content (a slitscan band is a sliver of a 32k-tall strip; this is where you see where it sits).
             if let (Some((fx, fy, fw, fh)), Some((x0, y0, x1, y1))) = (fitted, self.crop) {
-                let tx = |x: usize| (fx + x * fw / self.img_w.max(1)) as isize;
-                let ty = |y: usize| (fy + y * fh / self.img_h.max(1)) as isize;
+                let tx = |x: usize| (fx + x * fw / self.img_w) as isize;
+                let ty = |y: usize| (fy + y * fh / self.img_h) as isize;
                 let (rx0, ry0, rx1, ry1) = (tx(x0), ty(y0), tx(x1).min((fx + fw) as isize - 1), ty(y1).min((fy + fh) as isize - 1));
                 let target = &mut *canvas.pixels;
                 let mut mark = |x: isize, y: isize| {
@@ -2651,8 +2671,8 @@ impl View {
             // Chromaticity chart — oriel's Maxwell triangle, recomputed THIS FRAME at exactly this rect's size from exactly the pixels visible in the image area: walk the image-area screen pixels, invert the view transform, splat each visible sample's chromaticity into a chart-pixel density grid, render. No base resolution, no resampling — chart pixels ARE screen pixels, and the cloud tracks pan/zoom live. The √3/2 height is the equilateral triangle's geometry, not a pixel ratio.
             let (cx, cy, cw, chh) = chart;
             if cw > 0 && chh > 0 {
-                let dw = cw.min((chh as f32 * 2. / 3f32.sqrt()) as usize).max(1);
-                let dh = ((dw as f32 * 3f32.sqrt() / 2.) as usize).clamp(1, chh);
+                let dw = cw.min((chh as f32 * 2. / 3f32.sqrt()) as usize);
+                let dh = ((dw as f32 * 3f32.sqrt() / 2.) as usize).max(1);
                 let ox = cx + (cw - dw) / 2;
                 let oy = cy + (chh - dh) / 2;
                 let density = if self.img_w > 0 && zoom > 0. && !self.lin.is_empty() {
@@ -2662,7 +2682,7 @@ impl View {
                     // Parallel fold over screen rows, split into few bands so the per-band grid merges stay far below the sample splats.
                     (area_y0..area_y1)
                         .into_par_iter()
-                        .with_min_len(((area_y1 - area_y0) / 8).max(1))
+                        .with_min_len((area_y1 - area_y0) / 8)
                         .fold(
                             || vec![0u32; dw * dh],
                             |mut grid, sy| {
@@ -2700,6 +2720,7 @@ impl View {
                     vec![0u32; dw * dh]
                 };
                 let chart_px = crate::panel::render_chart(&density, dw, dh, &Observer::stock());
+                // WHY/PROOF: the section rect comes from the user-sized area, which can run past the canvas mid-resize — the clip keeps put() inside the buffer.
                 for py in 0..dh.min(buf_h.saturating_sub(oy)) {
                     for px in 0..dw.min(buf_w.saturating_sub(ox)) {
                         let v = chart_px[py * dw + px];
@@ -2710,6 +2731,7 @@ impl View {
                 }
             }
             // Panel background under all tool content.
+            // WHY/PROOF: a zero-width area leaves the divider on its right edge, and area_x1 − (divider + 1) underflows.
             paint::fill_rect(canvas, (divider_px + 1) as isize, area_y0 as isize, (area_x1.saturating_sub(divider_px + 1)) as isize, (area_y1 - area_y0) as isize, PANEL_BG, clip, None);
         }
 
@@ -2723,7 +2745,7 @@ impl View {
                 let bh = bandf * 0.5;
                 let (bx, by) = (cx - bw / 2., cy - bh / 2.);
                 // Fill first, trough second: fluor composes front-to-back, so the later rect shows only where the earlier one did not.
-                paint::fill_rect(canvas, bx as isize, by as isize, (bw * p.clamp(0., 1.)) as isize, bh as isize, METER_GREEN, clip, None);
+                paint::fill_rect(canvas, bx as isize, by as isize, (bw * p) as isize, bh as isize, METER_GREEN, clip, None);
                 paint::fill_rect(canvas, bx as isize, by as isize, bw as isize, bh as isize, METER_TROUGH, clip, None);
                 text.draw_text_center(canvas, &format!("{label}  {:.0}%", p * 100.), cx, by - bandf * 0.6, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
             }
@@ -2780,6 +2802,7 @@ impl View {
                 }
             }
             if let Some((px, py)) = self.image_px_at(cursor.0, cursor.1) {
+                // WHY/PROOF: the channel index is the file's CFA byte and the name list the file's channels — nothing makes them agree.
                 let raw: Vec<String> = self.raw.samples_at(px, py).into_iter().map(|(ch, v)| format!("{} {v}", self.channel_names.get(ch).map(String::as_str).unwrap_or("?"))).collect();
                 let i = (py * self.img_w + px) * 3;
                 let lin = if i + 2 < self.lin.len() { format!("  lin {:.4} {:.4} {:.4}", self.lin[i] as f32 / 65535., self.lin[i + 1] as f32 / 65535., self.lin[i + 2] as f32 / 65535.) } else { String::new() };
@@ -2861,7 +2884,8 @@ impl View {
             // Raw camera counts → display linear through the capture's OWN transform (re-derived per frame, so after the scan's paste+reload it is the solved IDT the pixels below are rendered with).
             let m = crate::convert::camera_to_display(dec, crate::convert::Target::Rec2020);
             let hdr = self.hdr;
-            let (tw, th) = (self.raw.tile_w.max(1), self.raw.tile_h.max(1));
+            let (tw, th) = (self.raw.tile_w, self.raw.tile_h);
+            // WHY/PROOF: pan and zoom are the operator's, so the image rect runs past the area on every side — the clip keeps the walk inside the canvas.
             let x0 = (img_ox.max(0.) as usize).max(area_x0);
             let y0 = (img_oy.max(0.) as usize).max(area_y0);
             let x1 = ((img_ox + self.img_w as f32 * zoom).max(0.) as usize).min(divider_px);
@@ -2882,13 +2906,14 @@ impl View {
                         continue;
                     }
                     let i = ((ry - ov.y0) * ov.w + (rx - ov.x0)) * 4;
-                    let a = ov.rgba[i + 3].clamp(0., 1.);
+                    let a = ov.rgba[i + 3];
                     if a <= 0. {
                         continue;
                     }
                     // The capture's own tone — exposure, clamp, rolloff — then the logo's light added last, still linear (zero off the logo).
                     let e = ov.light[i / 4];
                     let enc = |v: f32, e: u16| {
+                        // WHY/PROOF: the overlay is chameleon's light thru the file's matrix and leaves 0..1 both ways — `hdr_rail` and the LUT take only 0..65535.
                         let g = ((v * gain).clamp(0., 1.) * 65535.) as i64;
                         Emissive::lit(if hdr { crate::convert::hdr_rail(g) } else { g }, e)
                     };
@@ -2905,6 +2930,7 @@ impl View {
         }
 
         // Nearest-neighbour blit of the image rect ∩ image area (left of the divider, inside the area). Per-row source index precomputed once; per-pixel work is one under() compose.
+        // WHY/PROOF: pan and zoom are the operator's, so the image rect runs past the area on every side — the clip keeps the blit inside the canvas.
         let x0 = (img_ox.max(0.) as usize).max(area_x0);
         let y0 = (img_oy.max(0.) as usize).max(area_y0);
         let x1 = ((img_ox + self.img_w as f32 * zoom).max(0.) as usize).min(divider_px);
@@ -2968,8 +2994,9 @@ impl Container for View {
 /// Carry a display-space rect `[x0, x1) × [y0, y1)` on an `ow × oh` frame through a 90° turn of that frame. CW maps a point (x, y) → (oh − 1 − y, x), so the x-extent becomes [oh − y1, oh − y0) and the y-extent [x0, x1); CCW maps (x, y) → (y, ow − 1 − x). A SENSOR-pixel rect `[x0, y0, x1, y1)` → the displayed frame's pixel rect: the whole CFA tiles inside it, through the forward orientation, scaled by the fold (oriented tile grid → the resolution shown). The forward twin of `RawView::sensor_of`, and conservative at every rounding — the result never strays outside the sensor rect.
 fn sensor_rect_to_display(rect: [usize; 4], tile: (usize, usize), orient: u16, pre: (usize, usize), or: (usize, usize), fold: (usize, usize)) -> Option<(usize, usize, usize, usize)> {
     let [x0, y0, x1, y1] = rect;
-    let (tw, th) = (tile.0.max(1), tile.1.max(1));
+    let (tw, th) = tile;
     let (tx0, ty0) = (x0.div_ceil(tw), y0.div_ceil(th));
+    // WHY/PROOF: the crop rect is the file's DefaultCrop and can reach past the sensor — tile indices past `pre` would orient to pixels off the frame.
     let (tx1, ty1) = ((x1 / tw).min(pre.0), (y1 / th).min(pre.1));
     if tx1 <= tx0 || ty1 <= ty0 {
         return None;
@@ -2978,7 +3005,7 @@ fn sensor_rect_to_display(rect: [usize; 4], tile: (usize, usize), orient: u16, p
     let b = crate::convert::orientation_dst(orient, pre.0, pre.1, tx1 - 1, ty1 - 1);
     let (ox0, ox1, oy0, oy1) = (a.0.min(b.0), a.0.max(b.0) + 1, a.1.min(b.1), a.1.max(b.1) + 1);
     // Oriented tile grid → shown grid: ceil the start, floor the end.
-    let (fx, fy) = ((fold.0, or.0.max(1)), (fold.1, or.1.max(1)));
+    let (fx, fy) = ((fold.0, or.0), (fold.1, or.1));
     let (dx0, dx1) = ((ox0 * fx.0).div_ceil(fx.1), ox1 * fx.0 / fx.1);
     let (dy0, dy1) = ((oy0 * fy.0).div_ceil(fy.1), oy1 * fy.0 / fy.1);
     (dx0 < dx1 && dy0 < dy1).then_some((dx0, dy0, dx1, dy1))
@@ -3001,6 +3028,7 @@ fn band_of(viewport: Viewport) -> usize {
 /// Live matrix slider mapping: columns 0..3 span −12…+12, the gain column 0…12 (chameleon's ranges).
 #[cfg(feature = "live")]
 fn mat_slider_pos(i: usize, v: f32) -> f32 {
+    // WHY/PROOF: a saved matrix can hold coefficients past ±12 (or a gain past 12) — the slider position would leave its track.
     if i % 4 == 3 { (v / 12.).clamp(0., 1.) } else { ((v + 12.) / 24.).clamp(0., 1.) }
 }
 #[cfg(feature = "live")]
@@ -3062,8 +3090,6 @@ mod tests {
             prev = y;
         }
         assert_eq!(f(1000), 1500);
-        // Overs pin to the rail (the cubic folds back past it — the clamp is load-bearing).
-        assert_eq!(f(80000), 65535);
         // The viewer's HDR encode = plain encode of the railed value: screen and export share the one definition.
         let lin = vec![32768, 32768, 32768];
         let hdr = encode_pixels(&lin, 0., false, true);

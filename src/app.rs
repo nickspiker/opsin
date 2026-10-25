@@ -143,7 +143,7 @@ impl OpsinApp {
             self.pending_open = Some(path);
             return;
         };
-        self.load_token = self.load_token.wrapping_add(1);
+        self.load_token += 1;
         self.load_step = step;
         let token = self.load_token;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

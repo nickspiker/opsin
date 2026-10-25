@@ -49,8 +49,8 @@ pub struct PanelTools {
 
 /// visible RGB + α → α+darkness u32 (saturating on all channels), in the surface's byte order (fluor's `fmt` — see `view::argb`).
 fn pack(r: f32, g: f32, b: f32, a: f32) -> u32 {
-    let d = |v: f32| 255 - (v.clamp(0., 255.) as u32);
-    fluor::theme::fmt(((a.clamp(0., 255.) as u32) << 24) | (d(r) << 16) | (d(g) << 8) | d(b))
+    let d = |v: f32| 255 - (v as u8 as u32);
+    fluor::theme::fmt(((a as u8 as u32) << 24) | (d(r) << 16) | (d(g) << 8) | d(b))
 }
 
 /// α+darkness u32 (surface order) → (α, visible RGB bytes as f32). `fmt` is its own inverse, so the same call undoes the pack's swap.
@@ -100,7 +100,7 @@ fn draw_gradient_line(buf: &mut [u32], w: usize, h: usize, x0: f32, y0: f32, x1:
 }
 
 fn wu_line(buf: &mut [u32], bw: usize, bh: usize, x0: f32, y0: f32, x1: f32, y1: f32, c0: [f32; 3], c1: [f32; 3]) {
-    let total = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1e-6);
+    let total = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
     let steep = (y1 - y0).abs() > (x1 - x0).abs();
     let (mut x0, mut y0, mut x1, mut y1) = (x0, y0, x1, y1);
     let mut flipped = false;
@@ -124,7 +124,7 @@ fn wu_line(buf: &mut [u32], bw: usize, bh: usize, x0: f32, y0: f32, x1: f32, y1:
         }
         let t = if flipped { 1. - t } else { t };
         let colour = [c0[0] + (c1[0] - c0[0]) * t, c0[1] + (c1[1] - c0[1]) * t, c0[2] + (c1[2] - c0[2]) * t];
-        let alias = c.min(1.).sqrt();
+        let alias = c.sqrt();
         let idx = y as usize * bw + x as usize;
         let (oa, old) = unpack(buf[idx]);
         if oa <= 0. {
@@ -166,6 +166,7 @@ fn thumb_from(pixels: &[u32], w: usize, h: usize) -> (Vec<u32>, usize, usize) {
         return (Vec::new(), 0, 0);
     }
     let scale = ((1 << 9) as f32 / w.max(h) as f32).min(1.);
+    // WHY/PROOF: w and h are the image's, and a file with an extreme aspect (a 1 × 32k slitscan) scales its short side to 0 — an empty thumb the navigator then divides by.
     let tw = ((w as f32 * scale) as usize).max(1);
     let th = ((h as f32 * scale) as usize).max(1);
     let mut t = Vec::with_capacity(tw * th);
@@ -182,10 +183,10 @@ fn thumb_from(pixels: &[u32], w: usize, h: usize) -> (Vec<u32>, usize, usize) {
 pub fn render_hist(dens: &[[f32; 3]], hw: usize, hh: usize, stop_bins: &[usize], y_log: bool) -> Vec<u32> {
     let bins = dens.len();
     let heights: Vec<[f32; 3]> = if y_log {
-        let dmax = dens.iter().flat_map(|b| b.iter().copied()).fold(0f32, f32::max).max(1.);
+        let dmax = dens.iter().flat_map(|b| b.iter().copied()).fold(0f32, f32::max);
         let inv = 1. / (1. + dmax).log2();
         dens.iter()
-            .map(|b| [0, 1, 2].map(|ch| ((1. + b[ch].max(0.)).log2() * inv * hh as f32).min(hh as f32 - 1.)))
+            .map(|b| [0, 1, 2].map(|ch| (1. + b[ch]).log2() * inv * hh as f32))
             .collect()
     } else {
         let mut nonzero: Vec<f32> = dens.iter().flat_map(|b| b.iter().copied()).filter(|&c| c > 0.).collect();
@@ -193,10 +194,10 @@ pub fn render_hist(dens: &[[f32; 3]], hw: usize, hh: usize, stop_bins: &[usize],
             0.
         } else {
             nonzero.sort_unstable_by(f32::total_cmp);
-            HIST_SCALE / nonzero[(0.875 * nonzero.len() as f32) as usize].max(f32::MIN_POSITIVE)
+            HIST_SCALE / nonzero[(0.875 * nonzero.len() as f32) as usize]
         };
         dens.iter()
-            .map(|b| [0, 1, 2].map(|ch| ((b[ch].max(0.) * scale) * hh as f32).min(hh as f32 - 1.)))
+            .map(|b| [0, 1, 2].map(|ch| b[ch] * scale * hh as f32))
             .collect()
     };
     let mut stop_mask = vec![false; bins];
@@ -244,7 +245,7 @@ pub fn render_chart(density: &[u32], w: usize, h: usize, observer: &Observer) ->
     let mut buf = vec![0u32; w * h];
     buf.par_chunks_mut(w).enumerate().for_each(|(hy, row)| {
         for (wx, px) in row.iter_mut().enumerate() {
-            let triangle = (hy as f32 / h as f32 * w as f32 / 2. - (wx as f32 - w as f32 / 2.).abs()).clamp(0., 1.);
+            let triangle = (hy as f32 / h as f32 * w as f32 / 2. - (wx as f32 - w as f32 / 2.).abs()).min(1.);
             if triangle <= 0. {
                 continue;
             }
@@ -252,7 +253,7 @@ pub fn render_chart(density: &[u32], w: usize, h: usize, observer: &Observer) ->
             *px = pack(
                 v * wx as f32 * triangle * 256.,
                 v * (w - hy - 1) as f32 * triangle * 256.,
-                v * (hy as f32 - wx as f32).max(0.) * triangle * 256.,
+                v * (hy as f32 - wx as f32) * triangle * 256.,
                 triangle * 255.,
             );
         }
@@ -282,11 +283,12 @@ pub fn render_chart(density: &[u32], w: usize, h: usize, observer: &Observer) ->
         let radius = 4.216491804 * scale;
         let softness = 0.0751 / (scale * scale);
         let r_sq = radius * radius;
-        for py in ((dy - radius).max(0.) as usize)..=(((dy + radius) as usize).min(h.saturating_sub(1))) {
-            for px in ((dx - radius).max(0.) as usize)..=(((dx + radius) as usize).min(w.saturating_sub(1))) {
+        // WHY/PROOF: the dot sits wherever the observer projects D65, and on a chart a few pixels across its disc reaches past the buffer edge — the clip keeps idx inside buf.
+        for py in ((dy - radius).max(0.) as usize)..=(((dy + radius) as usize).min(h - 1)) {
+            for px in ((dx - radius).max(0.) as usize)..=(((dx + radius) as usize).min(w - 1)) {
                 let dist_sq = (px as f32 - dx).powi(2) + (py as f32 - dy).powi(2);
                 if dist_sq <= r_sq {
-                    let a = ((r_sq - dist_sq) * softness).clamp(0., 1.);
+                    let a = ((r_sq - dist_sq) * softness).min(1.);
                     let idx = py * w + px;
                     let (oa, old) = unpack(buf[idx]);
                     buf[idx] = pack(
