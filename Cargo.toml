@@ -16,7 +16,7 @@ vsf = { version = "0.10", path = "../vsf", features = ["inspect", "rayon"] }
 # Sensor intake — decodes RAW/DNG to counts + gives us both DNG ColorMatrices and illuminant codes to build the tiered colour_profile.
 limbus = { version = "0.0.2", path = "../limbus" }
 # CPU softbuffer compositor — hosts the viewer's event loop, chrome, paint primitives. Same dep shape as Photon's desktop block.
-fluor = { version = "0.0.5", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon"], optional = true }
+fluor = { version = "0.0.6", path = "../fluor", default-features = false, features = ["std", "text", "simd", "rayon"], optional = true }
 rayon = "1.12.0"
 chameleon = { path = "../chameleon", optional = true }
 v4l = { version = "0.14", optional = true }
