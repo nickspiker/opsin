@@ -693,8 +693,10 @@ pub struct View {
     needs_fit: bool,
     /// The rectangle the host gave us, set by [`View::set_area`].
     area: Area,
-    /// Right tool panel width as a fraction of the area width; the divider drags it.
+    /// Right tool panel width as a fraction of the area width; the divider drags it. The panel is never narrower than its content needs ([`PANEL_BANDS`] bands) nor wider than half the area.
     panel_frac: f32,
+    /// The control band ([`View::band`]) as of the last render — the panel's content width and the divider grab read it between frames, when no viewport is at hand. 0 until the first render.
+    band_px: f32,
     divider_drag: bool,
     tools: PanelTools,
     /// Linear SIGNED Rec.2020 of the current image (white = 65535, out-of-range preserved) — kept so exposure re-encodes without re-decoding the source, so the EV multiply can recover clipped-at-display speculars and sub-black noise, and as the chart's per-frame chromaticity source.
@@ -847,6 +849,7 @@ impl View {
             needs_fit: true,
             area: Area { x: 0., y: 0., w: 1280., h: 800. },
             panel_frac: 7. / (1 << 5) as f32,
+            band_px: 0.,
             divider_drag: false,
             tools,
             lin: loaded.lin,
@@ -1041,14 +1044,34 @@ impl View {
 
     // ── geometry ──
 
-    /// Divider grab band half-width — RU-scaled like every other affordance (no pixel constants).
+    /// Divider grab band half-width — three eighths of the control band, so it scales with the controls it sits beside.
     fn divider_grab(&self) -> f32 {
-        (self.area.w.min(self.area.h) / (1 << 5) as f32).ceil() / 4.
+        self.band_px * 3. / (1 << 3) as f32
     }
 
-    /// The image area's width — the whole area with the controls hidden, else what the divider leaves.
+    /// The control band in whole pixels for this frame (see [`band_of`]).
+    fn band(&self, viewport: Viewport) -> usize {
+        band_of(viewport, self.area.h).ceil() as usize
+    }
+
+    /// The panel's padding: half a band.
+    fn pad(&self, viewport: Viewport) -> usize {
+        (band_of(viewport, self.area.h) / 2.).ceil() as usize
+    }
+
+    /// The tool panel's width: the user's dragged fraction, widened to hold its content ([`PANEL_BANDS`] bands) when zoom grows the band, and never past half the area so the image keeps the other half.
+    /// The floor and the cap are SMOOTH (soft max / soft min with a one-band blend), so as zoom crosses from the dragged width to the content width the panel edge moves without a corner.
+    fn panel_w(&self) -> f32 {
+        // Before the first render the band is 0 and the blend width with it, so the bounds are the plain max and min for that one frame.
+        let e = self.band_px;
+        let soft_max = |a: f32, b: f32| (a + b + ((a - b) * (a - b) + e * e).sqrt()) / 2.;
+        let soft_min = |a: f32, b: f32| (a + b - ((a - b) * (a - b) + e * e).sqrt()) / 2.;
+        soft_min(soft_max(self.area.w * self.panel_frac, self.band_px * PANEL_BANDS), self.area.w / 2.)
+    }
+
+    /// The image area's width — the whole area with the controls hidden, else what the panel leaves.
     fn image_w(&self) -> f32 {
-        if self.plain { self.area.w } else { self.area.w * (1. - self.panel_frac) }
+        if self.plain { self.area.w } else { self.area.w - self.panel_w() }
     }
 
     /// Screen x of the panel divider (left edge of the panel).
@@ -1146,22 +1169,18 @@ impl View {
         Some((((x - ox) / zoom) as usize, ((y - oy) / zoom) as usize))
     }
 
-    /// Panel section rects (x0, y0, w, h) in pixels — named, not position-coded. Stacked top-down inside the panel with uniform padding; each section keeps its natural aspect (navigator = image aspect, histogram = 2:1, buttons/slider = thin bands, chart = square) and the stack just runs off the bottom on short areas.
+    /// Panel section rects (x0, y0, w, h) in pixels — named, not position-coded. Stacked top-down inside the panel with uniform padding (2026-10-28: the stack used to keep fixed shares of the height while its rows grew with zoom, so the chart collapsed and the sliders ran off the bottom).
+    /// A HEIGHT BUDGET: the fixed rows (the button rows, the EV slider, the live matrix) and the padding take their unit-sized height first; the three elastic sections — navigator (the image's aspect), histogram (2:1) and chart (square) — keep their natural sizes when they fit and otherwise share what is left in proportion to them. Nothing runs past the bottom: on an area too short even for the fixed rows, a section that would start below it gets no height.
     fn panel_rects(&self, viewport: Viewport) -> PanelRects {
         let vw = (self.area.x + self.area.w) as usize;
         let vh = (self.area.y + self.area.h) as usize;
         let dx = self.divider_x() as usize;
-        let pad = pad_of(viewport);
-        let band = band_of(viewport);
-        // WHY/PROOF: the window is user-sized and can be narrower or shorter than the panel stack — the min and saturating_sub on x0, w, y and chart_h keep every rect inside the area so the rect math downstream (w − label_w, buf_h − hy) cannot underflow.
+        let pad = self.pad(viewport);
+        let band = self.band(viewport);
+        // WHY/PROOF: the window is user-sized and can be narrower or shorter than the panel stack — the min and saturating_sub on x0, w and every height keep each rect inside the area, so the rect math downstream (w − label_w, buf_h − hy) cannot underflow.
         let x0 = (dx + 1 + pad).min(vw);
         let w = vw.saturating_sub(x0 + pad);
-        let mut y = (self.area.y as usize + pad).min(vh);
-        let ah = self.area.h as usize;
-
-        let nav_h = if self.img_w > 0 { (w * self.img_h / self.img_w).min(ah / 3) } else { 0 };
-        let nav = (x0, y, w, nav_h);
-        y += nav_h + pad;
+        let top = (self.area.y as usize + pad).min(vh);
 
         // Two rows: [1:1][mag][Fit][export][Info] over [CCW][CW][Crop], a half-pad between. The empty viewer keeps one row for the controls that need no image (Live).
         #[cfg(feature = "live")]
@@ -1169,27 +1188,37 @@ impl View {
         #[cfg(not(feature = "live"))]
         let empty_h = 0;
         let btn_h = if self.img_w > 0 { band * 2 + pad / 2 } else { empty_h };
-        let btns = (x0, y.min(vh), w, btn_h);
-        y += btn_h + pad;
-
-        let hist_h = (w / 2).min(ah / 4);
-        let hist = (x0, y.min(vh), w, hist_h);
-        y += hist_h + pad;
-
-        let ev = (x0, y.min(vh), w, band);
-        y += band + pad;
-
         #[cfg(feature = "live")]
         let mat_h = if self.live.is_some() { band * 5 + pad * 2 } else { 0 };
         #[cfg(not(feature = "live"))]
         let mat_h = 0;
-        let mat = (x0, y.min(vh), w, mat_h);
-        if mat_h > 0 {
-            y += mat_h + pad;
-        }
+        let ev_h = band;
 
-        let chart_h = w.min(vh.saturating_sub(y + pad));
-        let chart = (x0, y.min(vh), w, chart_h);
+        // The budget: what the fixed rows and the six paddings leave for the elastic sections.
+        let fixed = btn_h + ev_h + mat_h + pad * 6;
+        let room = vh.saturating_sub(top + fixed);
+        let nav_nat = if self.img_w > 0 { w * self.img_h / self.img_w } else { 0 };
+        let hist_nat = w / 2;
+        let chart_nat = w;
+        let natural = nav_nat + hist_nat + chart_nat;
+        let share = |n: usize| if natural <= room { n } else { n * room / natural.max(1) };
+        let (nav_h, hist_h, chart_h) = (share(nav_nat), share(hist_nat), share(chart_nat));
+
+        // Stack them; a section with no height takes no padding, and a rect that would start at or past the bottom is held at the bottom with no height.
+        let mut y = top;
+        let mut place = |h: usize| {
+            let r = (x0, y.min(vh), w, h.min(vh.saturating_sub(y)));
+            if h > 0 {
+                y += h + pad;
+            }
+            r
+        };
+        let nav = place(nav_h);
+        let btns = place(btn_h);
+        let hist = place(hist_h);
+        let ev = place(ev_h);
+        let mat = place(mat_h);
+        let chart = place(chart_h);
         PanelRects { nav, btns, hist, ev, mat, chart }
     }
 
@@ -2366,6 +2395,8 @@ impl View {
 
     /// Draw the view into its area of the host's canvas (front-to-back under-blend, like every fluor consumer: panel content, then the HUD and overlays, then the image, then the backdrop under everything) and stamp its pills into `hit_map`. The load-time fit runs here, the first call guaranteed real dims.
     pub fn render(&mut self, canvas: &mut Canvas, viewport: Viewport, text: &mut fluor::text::TextRenderer, damage_clip: fluor::canvas::PixelRect, cursor: (Coord, Coord), hit_map: &mut [HitId]) {
+        // This frame's control band, recorded first: the panel width (and so the image area, the fit and the divider) reads it.
+        self.band_px = band_of(viewport, self.area.h);
         if self.needs_fit {
             self.needs_fit = false;
             self.fit();
@@ -2382,15 +2413,16 @@ impl View {
         let area_y1 = ((self.area.y + self.area.h).max(0.) as usize).min(buf_h);
         let divider_px = if self.plain { area_x1 } else { (self.divider_x() as usize).clamp(area_x0, area_x1.saturating_sub(1).max(area_x0)) };
         let PanelRects { nav: _, btns, hist, ev: ev_rect, mat, chart } = self.panel_rects(viewport);
-        let band = band_of(viewport);
+        let band = self.band(viewport);
+        let pad = self.pad(viewport);
 
         // ── Right tool panel ── (none with the controls hidden: the divider sits at the area edge and nothing below draws)
         if !self.plain {
             // Divider — 1px vertical hairline down the area (fill_rect's 0-width hairline convention).
             paint::fill_rect(canvas, divider_px as isize, area_y0 as isize, 0, (area_y1 - area_y0) as isize, HAIRLINE, clip, None);
-            // Section separators under nav-buttons and hist.
+            // Section separators under nav-buttons and hist, in the middle of the padding that follows each.
             for &(sx, sy, sw, sh) in &[btns, hist] {
-                paint::fill_rect(canvas, sx as isize, (sy + sh) as isize + 4, sw as isize, 0, HAIRLINE, clip, None);
+                paint::fill_rect(canvas, sx as isize, (sy + sh + pad / 2) as isize, sw as isize, 0, HAIRLINE, clip, None);
             }
             // 1:1 / magnification / Fit / export / Info — the band splits in fifths: fluor pill Buttons around the LIVE magnification readout (screen px per image px: 1x = pixel-exact certificate, 2.00x = zoomed in past it). The readout derives from the same per-frame span-relative transform as the blit, so it tracks every host op — press 1:1, resize, and it honestly drifts; that's the relative model reporting itself.
             let (bx, by, bw, bh2) = btns;
@@ -2399,7 +2431,7 @@ impl View {
             if bw > 2 && bh2 > 0 && self.img_w == 0 {
                 let font = bh2 as f32 / 2.;
                 self.btn_live.set_rect(bx as f32 + bw as f32 / 2., by as f32 + bh2 as f32 / 2., bw as f32 / 3., bh2 as f32);
-                self.btn_live.set_font_size(font);
+                self.btn_live.set_font_size_fitted(font, text);
                 let id = self.btn_live.hit_id();
                 self.btn_live.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
             }
@@ -2419,13 +2451,13 @@ impl View {
                 let third = bw as f32 / row2.len() as f32;
                 for (i, b) in row2.into_iter().enumerate() {
                     b.set_rect(bx as f32 + third * (i as f32 + 0.5), r2y, third, bh as f32);
-                    b.set_font_size(font);
+                    b.set_font_size_fitted(font, text);
                     let id = b.hit_id();
                     b.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
                 }
                 for (b, slot) in [(&mut self.btn_one, 0.5), (&mut self.btn_fit, 2.5), (&mut self.btn_export, 3.5), (&mut self.btn_info, 4.5)] {
                     b.set_rect(bx as f32 + quarter * slot, bcy, quarter, bh as f32);
-                    b.set_font_size(font);
+                    b.set_font_size_fitted(font, text);
                     let id = b.hit_id();
                     b.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
                 }
@@ -2478,10 +2510,10 @@ impl View {
                             sl.render_content_into(canvas, Some(&mut *hit_map), id);
                         }
                     }
-                    let ry = (my + band * 3 + pad_of(viewport)) as f32 + band as f32 / 2.;
+                    let ry = (my + band * 3 + pad) as f32 + band as f32 / 2.;
                     for (i, b) in [&mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec].into_iter().enumerate() {
                         b.set_rect(mx as f32 + mw as f32 * ((i as f32 + 0.5) / 3.), ry, mw as f32 * 0.3, band as f32);
-                        b.set_font_size(band as f32 / 2.);
+                        b.set_font_size_fitted(band as f32 / 2., text);
                         let id = b.hit_id();
                         b.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
                     }
@@ -2491,7 +2523,7 @@ impl View {
                         let db = if peak > 0. { 20. * peak.log10() } else { -60. };
                         let label_w = band * 2;
                         // WHY/PROOF: the panel is as narrow as the user drags it, and the label and dB text can be wider than the section — the subtraction underflows.
-                        let (tx, ty, tw, th) = (mx + label_w, my + band * 4 + pad_of(viewport) * 2, mw.saturating_sub(label_w + band * 3), (band * 3 / 5).max(3));
+                        let (tx, ty, tw, th) = (mx + label_w, my + band * 4 + pad * 2, mw.saturating_sub(label_w + band * 3), (band * 3 / 5).max(3));
                         let cy = ty as f32 + th as f32 / 2.;
                         text.draw_text_left(canvas, "mic", mx as f32, cy, &fluor::text::TextStyle::new(font, TEXT_GREY), clip, None);
                         // Front-to-back: the level fill and the hairlines first, the trough LAST so it shows only where nothing else did.
@@ -2516,19 +2548,19 @@ impl View {
             #[cfg(not(feature = "live"))]
             let _ = mat;
 
-            // Histogram pills in their OWN band carved from the top of the hist rect — above the plot, never on it. Right-aligned row: [HDR][X ..][Y ..][Clip]. Geometry derives from the hist rect (RU-coherent, no pixel constants).
+            // Histogram pills in their OWN band carved from the top of the hist rect — above the plot, never on it. Right-aligned row: [HDR][X ..][Y ..][source][Clip], each a fifth of the row less the gaps.
+            // Sized off the control band like every other pill, labels fitted to their slots (2026-10-28: sized off the hist rect they ignored zoom and read about three times the other labels' size).
             let (hx, hy, hw, hh) = hist;
-            let pill_h = (hh as f32 / 5.).max(8.);
-            let pill_pad = hh as f32 / (1 << 4) as f32;
+            let pill_h = band as f32;
+            let pill_pad = pad as f32 / 2.;
             let pill_band = (pill_h + pill_pad * 2.) as usize;
-            if hw > 0 && hh > pill_band && !self.raw.counts.is_empty() {
-                // Five pills must fit the row: shrink from the 3:1 pill when the panel is narrow rather than spill over the divider.
-                let pill_w = (pill_h * 3.).min((hw as f32 - pill_pad * 6.) / 5.);
+            let pill_w = (hw as f32 - pill_pad * 6.) / 5.;
+            if pill_w > 0. && hh > pill_band && !self.raw.counts.is_empty() {
                 let cy_pill = hy as f32 + pill_pad + pill_h / 2.;
                 let mut right = hx as f32 + hw as f32 - pill_pad;
                 for b in [&mut self.btn_clip, &mut self.btn_source, &mut self.btn_yscale, &mut self.btn_xscale, &mut self.btn_hdr] {
                     b.set_rect(right - pill_w / 2., cy_pill, pill_w, pill_h);
-                    b.set_font_size(pill_h * (3. / 4.));
+                    b.set_font_size_fitted(pill_h / 2., text);
                     let id = b.hit_id();
                     b.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
                     right -= pill_w + pill_pad;
@@ -3015,15 +3047,17 @@ fn rotate_rect((x0, y0, x1, y1): (usize, usize, usize, usize), ow: usize, oh: us
     if cw { (oh - y1, x0, oh - y0, x1) } else { (y0, ow - x1, y1, ow - x0) }
 }
 
-/// The panel's section padding — RU-coherent, derived from the host viewport's span.
-fn pad_of(viewport: Viewport) -> usize {
-    (viewport.effective_span() / (1 << 7) as f32).ceil() as usize
+/// THE ONE UNIT of the viewer's controls — the control band (a pill row, a slider, a HUD line) — and every panel size derives from it.
+/// HEIGHT-BUDGETED like Photon's screens (settings_layout.rs): the user-scaled span term `s = span·ru·3/128` (grows with zoom) blended with the view's own height term `h = area_h/16` as `s·h/(s+h)` — smooth everywhere (no clamp, no kink), close to `s` while the area is roomy and approaching `h` as zoom climbs, so a control can never outgrow the screen it is on (2026-10-28: the panel ran off the bottom and its labels clipped at high zoom).
+/// At 1080p it is about 22 px at ru 1 (the old span/64), 39 at ru 3 and 13 at ru ½; on a 4K view the height term lets ru 3 reach about 78.
+fn band_of(viewport: Viewport, area_h: f32) -> f32 {
+    let s = viewport.effective_span() * 3. / (1 << 7) as f32;
+    let h = area_h / (1 << 4) as f32;
+    s * h / (s + h)
 }
 
-/// The panel's control band height (pill rows, the slider).
-fn band_of(viewport: Viewport) -> usize {
-    (viewport.effective_span() / (1 << 6) as f32).ceil() as usize
-}
+/// The panel needs this many control bands across to hold its widest row (five pills with legible labels, plus its padding); the panel widens to it when zoom grows the band, up to half the area.
+const PANEL_BANDS: f32 = (1 << 4) as f32;
 
 /// Live matrix slider mapping: columns 0..3 span −12…+12, the gain column 0…12 (chameleon's ranges).
 #[cfg(feature = "live")]
