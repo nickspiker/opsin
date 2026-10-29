@@ -441,13 +441,15 @@ impl FluorApp for OpsinApp {
     }
 
     fn on_zoom(&mut self, factor: f32, anchor_x: Coord, anchor_y: Coord, ctx: &mut Context) {
-        // A pinch / Ctrl+wheel zooms the PICTURE about the anchor; the window's own scale is untouched.
-        self.view.zoom_around(factor, anchor_x, anchor_y);
+        // With the controls hidden a pinch / Ctrl+wheel zooms the PICTURE about the anchor and the window's own scale is untouched; with them up the gesture scaled the window (the controls) and the picture holds still.
+        if self.view.plain() {
+            self.view.zoom_around(factor, anchor_x, anchor_y);
+        }
         ctx.window.request_redraw();
     }
 
     fn owns_zoom_gesture(&self) -> bool {
-        true
+        self.view.plain()
     }
 
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {

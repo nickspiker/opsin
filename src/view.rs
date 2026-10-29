@@ -792,8 +792,13 @@ pub struct View {
     /// HDR highlight rolloff at the encode boundary (screen AND JPEG export — they must agree): `(3x − x³)/2` after the clamp, per channel, in linear. Brightens (slope 1.5 at black) and compresses the top into a soft shoulder instead of a hard stop; pull EV down ~3× and the reclaimed range is ~1.5 stops of highlight. `H` / the HDR pill. A CREATIVE op — recorded as `dr_curve` when converting to VSF, never silent.
     hdr: bool,
     btn_hdr: fluor::widgets::Button,
-    /// Controls hidden — image only, edge to edge: no panel, no HUD. `F` enters fitted, `N` enters at 1:1 centred; either key (or Escape) leaves.
+    /// Controls hidden — image only, edge to edge: no panel, no HUD. A tap on the picture shows or hides them; `F` enters fitted, `N` enters at 1:1 centred; either key (or Escape) leaves.
+    /// With the controls up the picture holds still (the wheel and the zoom gesture are the host's, and the controls scale with its zoom); with them hidden the wheel, the zoom gesture and a drag move the picture.
     plain: bool,
+    /// Where a press on the picture landed, while it may still be a TAP (the show/hide toggle): cleared once the pointer travels past half a band, which makes it a drag.
+    tap_from: Option<(Coord, Coord)>,
+    /// The host paints the background under the whole view (Photon's speckle): the view leaves its backdrop and panel surface unpainted.
+    host_backdrop: bool,
     /// Frame info HUD (metadata + live stats) over the image area's bottom-left; `I` toggles. Default on — opsin is an instrument, the readings are the point.
     show_info: bool,
     title: String,
@@ -914,6 +919,8 @@ impl View {
             hdr: false,
             btn_hdr,
             plain: false,
+            tap_from: None,
+            host_backdrop: false,
             show_info: true,
             title: loaded.title,
             file_name: loaded.file_name,
@@ -984,6 +991,11 @@ impl View {
 
     pub fn plain(&self) -> bool {
         self.plain
+    }
+
+    /// The host paints its own background under the view (Photon's speckle shows thru): the backdrop and the panel surface stay unpainted.
+    pub fn set_host_backdrop(&mut self, on: bool) {
+        self.host_backdrop = on;
     }
 
     pub fn title(&self) -> &str {
@@ -2034,6 +2046,13 @@ impl View {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
+                // A press that travels past half a band is a drag, never the show/hide tap.
+                if let Some((tx, ty)) = self.tap_from {
+                    let slop = self.band_px as f32 * 0.5;
+                    if (cx - tx).powi(2) + (cy - ty).powi(2) > slop * slop {
+                        self.tap_from = None;
+                    }
+                }
                 if let Some((lx, ly)) = self.drag {
                     // Pan: shift the anchored fraction by the cursor delta in image-fraction space. Guarded by construction — drag only starts on_image, so img dims and zoom are nonzero.
                     self.pan_by(cx - lx, cy - ly);
@@ -2134,13 +2153,24 @@ impl View {
                         ctx.window.request_redraw();
                         return EventResponse::Handled;
                     }
-                    self.drag = Some((cx, cy));
+                    // A press on the picture may be the show/hide tap; only with the controls hidden does it also drag the picture (with them up the picture holds still).
+                    self.tap_from = Some((cx, cy));
+                    if self.plain {
+                        self.drag = Some((cx, cy));
+                    }
                     return EventResponse::Handled;
                 }
                 // Backdrop (letterbox margin) — the host's.
                 EventResponse::Pass
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
+                // A press on the picture that never travelled is the tap: the controls show or hide, the composition kept (it is span-relative, so it rides the image area's new size).
+                if self.tap_from.take().is_some() {
+                    self.drag = None;
+                    let plain = !self.plain;
+                    self.set_plain(plain, ctx);
+                    return EventResponse::Handled;
+                }
                 let was = self.drag.is_some() || self.crop_drag.is_some() || self.divider_drag || self.ev_drag || self.nav_drag;
                 self.drag = None;
                 self.crop_drag = None;
@@ -2155,6 +2185,10 @@ impl View {
             }
             FEvent::MouseWheel { delta } => {
                 if !self.inside(ctx.cursor_x, ctx.cursor_y) && !cfg!(target_os = "android") {
+                    return EventResponse::Pass;
+                }
+                // With the controls up the picture holds still: the wheel is the host's.
+                if !self.plain {
                     return EventResponse::Pass;
                 }
                 match delta {
@@ -2763,8 +2797,11 @@ impl View {
                 }
             }
             // Panel background under all tool content.
-            // WHY/PROOF: a zero-width area leaves the divider on its right edge, and area_x1 − (divider + 1) underflows.
-            paint::fill_rect(canvas, (divider_px + 1) as isize, area_y0 as isize, (area_x1.saturating_sub(divider_px + 1)) as isize, (area_y1 - area_y0) as isize, PANEL_BG, clip, None);
+            // A host painting its own background under the view keeps it: no panel surface over it.
+            if !self.host_backdrop {
+                // WHY/PROOF: a zero-width area leaves the divider on its right edge, and area_x1 − (divider + 1) underflows.
+                paint::fill_rect(canvas, (divider_px + 1) as isize, area_y0 as isize, (area_x1.saturating_sub(divider_px + 1)) as isize, (area_y1 - area_y0) as isize, PANEL_BG, clip, None);
+            }
         }
 
         // Progress bar and confirmation toast — centred over the image area, drawn BEFORE the image like the HUD so the under-compose order puts them on top. The bar is whatever long job is running (a full-resolution export takes ~0.8 s of demosaic on a 12 MP frame); the toast is the receipt, and fades on its own via the Tick its timer raises. Drawn with or without an image: the first load's bar has nothing under it yet.
@@ -2984,7 +3021,10 @@ impl View {
             }
         }
 
-        // Backdrop under everything else, the area only.
+        // Backdrop under everything else, the area only — unless the host paints its own under the whole view.
+        if self.host_backdrop {
+            return;
+        }
         for sy in area_y0..area_y1 {
             for px in &mut target[sy * buf_w + area_x0..sy * buf_w + area_x1] {
                 *px = px.under(BACKDROP, BlendMode::Normal);
