@@ -416,6 +416,8 @@ fn ingest_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
 /// Interleaved sRGB8 (`stride` bytes a pixel: 3 for RGB, 4 for RGBA) → LINEAR planar u16 RGB, `n` pixels. sRGB EOTF un-done via a 256-entry LUT built once per process. With a fourth byte the pixel is composited over black (the linear value scaled by alpha) — opsin has no alpha plane, and a transparent region carrying leftover colour would otherwise render as garbage; over black is what a viewer with no backdrop honestly shows.
 fn srgb8_to_linear_planar(px: &[u8], stride: usize, n: usize) -> Vec<u16> {
     static LUT: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
+    // The input IS sRGB-encoded (untagged JPEG/WebP, the web default), and vsf has no undeprecated sRGB EOTF, so the legacy curve is the honest decode — same as the other sRGB sites in this file.
+    #[allow(deprecated)]
     let lut = LUT.get_or_init(|| {
         let mut t = [0u16; 256];
         for (v, out) in t.iter_mut().enumerate() {
@@ -1217,6 +1219,7 @@ mod tests {
         // Planar [3, h, w]: the red plane is the first four samples.
         let all = dec.img.samples.unpack_u16();
         let r = &all[..4];
+        #[allow(deprecated)]
         let grey = (vsf::colour::srgb_eotf(128. / 255.) * 65535.).round() as u16;
         assert_eq!(r[0], 65535);
         assert_eq!(r[1], grey);

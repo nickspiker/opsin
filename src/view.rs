@@ -32,7 +32,9 @@ const METER_TROUGH: u32 = argb(0x14, 0x14, 0x14, 0xFF);
 /// How long a confirmation stays up before it fades.
 const TOAST_SECS: f32 = 3.;
 const METER_GREEN: u32 = argb(0x30, 0xC0, 0x50, 0xFF);
+#[cfg(feature = "live")]
 const METER_YELLOW: u32 = argb(0xE0, 0xC0, 0x20, 0xFF);
+#[cfg(feature = "live")]
 const METER_RED: u32 = argb(0xE0, 0x30, 0x30, 0xFF);
 /// Panel label text (EV readout, button labels).
 const TEXT_GREY: u32 = argb(0xE0, 0xE0, 0xE0, 0xFF);
@@ -314,13 +316,6 @@ impl RawView {
         }
     }
 
-    /// Equal-energy spread: each ADC code deposits its census-weighted count uniformly over the bin interval its quantization step `[v, v+1)` covers through the active axis — exact density on both axes, comb-free, deterministic (lumis's `bin_span` idea taken to its conclusion: the interval IS the span, deposited rather than divided, so no duty-cycle/log-order weirdness survives). Below-black collapses into bin 0 and at/above-white into the last bin — the clip spikes.
-    ///
-    /// `gain` is the live EV multiplier (2^ev), applied to the black-subtracted counts before the axis map, so the histogram tracks the exposure slider exactly as the display does: in linear-x every peak moves 2× per stop, in log-x the whole distribution translates one stop per stop — a labelled remap of the same raw counts, still no curve. Data pushed past display white by the gain collapses into the last bin: the clip spike grows as you rack exposure, agreeing with the image's encode-boundary indicator.
-    fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, ev_gain: f32) -> Vec<[f32; 3]> {
-        self.domain().spread(codes, x_log, bins, ev_gain)
-    }
-
     /// What [`Domain::spread`] needs to bin RAW ADC codes: the sensor's own levels and the render's per-channel gain.
     fn domain(&self) -> Domain {
         Domain { black: self.black, white: self.white, gains: self.gains, census: self.census, bits: self.bits }
@@ -343,6 +338,9 @@ impl Domain {
         Domain { black: [0.; 3], white: [65535.; 3], gains: [1.; 3], census: [1.; 3], bits }
     }
 
+    /// Equal-energy spread: each ADC code deposits its census-weighted count uniformly over the bin interval its quantization step `[v, v+1)` covers through the active axis — exact density on both axes, comb-free, deterministic (lumis's `bin_span` idea taken to its conclusion: the interval IS the span, deposited rather than divided, so no duty-cycle/log-order weirdness survives). Below-black collapses into bin 0 and at/above-white into the last bin — the clip spikes.
+    ///
+    /// `gain` is the live EV multiplier (2^ev), applied to the black-subtracted counts before the axis map, so the histogram tracks the exposure slider exactly as the display does: in linear-x every peak moves 2× per stop, in log-x the whole distribution translates one stop per stop — a labelled remap of the same raw counts, still no curve. Data pushed past display white by the gain collapses into the last bin: the clip spike grows as you rack exposure, agreeing with the image's encode-boundary indicator.
     fn spread(&self, codes: &[[u32; 3]], x_log: bool, bins: usize, ev_gain: f32) -> Vec<[f32; 3]> {
         let mut dens = vec![[0f32; 3]; bins];
         for ch in 0..3 {
@@ -3327,7 +3325,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The display domain puts a rendered level exactly where the screen has it: a buffer sitting at a quarter of display white bins at a quarter of the way along, a stop of exposure doubles that, and light past white lands in the clip bin. This is the agreement the raw-count histogram could never hold once the colour matrix mixed channels (2026-10-05).
     #[test]
     fn display_domain_bins_rendered_light_where_it_renders() {
@@ -3357,20 +3354,21 @@ mod tests {
         assert!(d[bins - 1][0] >= 77. * 0.99, "over-white belongs in the clip bin, got {}", d[bins - 1][0]);
     }
 
+    #[test]
     fn spread_gain_shifts_bins_and_grows_clip_spike() {
         let raw = RawView { counts: Vec::new(), sensor_w: 0, tile_w: 1, tile_h: 1, cfa: Vec::new(), planar_n: 0, black: [0.; 3], white: [65535.; 3], bits: 16, orient: 1, pre_w: 0, pre_h: 0, or_w: 0, or_h: 0, fold_w: 0, fold_h: 0, census: [1.; 3], gains: [1.; 3] };
         let bins = 64;
         let mut codes = vec![[0u32; 3]; 1 << 16];
         codes[16000][0] = 100; // quarter-scale population
-        let d0 = raw.spread(&codes, false, bins, 1.);
-        let d1 = raw.spread(&codes, false, bins, 2.);
+        let d0 = raw.domain().spread(&codes, false, bins, 1.);
+        let d1 = raw.domain().spread(&codes, false, bins, 2.);
         let peak = |d: &Vec<[f32; 3]>| d.iter().enumerate().max_by(|a, b| a.1[0].total_cmp(&b.1[0])).map(|(i, _)| i).unwrap();
         // Linear x: doubling the gain doubles the peak's bin position (±1 for the bin floor).
         assert!((peak(&d1) as i32 - 2 * peak(&d0) as i32).abs() <= 1, "peaks {} vs {}", peak(&d1), peak(&d0));
         // Gain pushing data past white collapses it into the last bin — the display-clip spike.
         codes[16000][0] = 0;
         codes[50000][0] = 77;
-        let d2 = raw.spread(&codes, false, bins, 2.);
+        let d2 = raw.domain().spread(&codes, false, bins, 2.);
         assert!(d2[bins - 1][0] >= 77. * 0.99, "overspill lands whole in the clip bin, got {}", d2[bins - 1][0]);
     }
 
