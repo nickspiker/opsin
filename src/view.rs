@@ -2158,7 +2158,12 @@ impl View {
                     }
                     return EventResponse::Handled;
                 }
-                // Backdrop (letterbox margin) — the host's.
+                // Controls hidden: a tap ANYWHERE in the view brings them back, the letterbox margin as much as the picture (Nick 2026-11-01: "any tap should bring back the controls, not just a tap on the image") — the same never-travelled tap, with no drag behind it.
+                if self.plain {
+                    self.tap_from = Some((cx, cy));
+                    return EventResponse::Handled;
+                }
+                // Backdrop (letterbox margin) with the controls up — the host's.
                 EventResponse::Pass
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
