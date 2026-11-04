@@ -719,16 +719,62 @@ pub fn hdr_rail(x: i64) -> i64 {
 /// `dr_curve` view-op params for [`hdr_rail`]: polynomial coefficients [c0, c1, c2, c3] of f(x) = Σ cᵢxⁱ.
 pub const HDR_CURVE_COEFS: [f32; 4] = [0., 1.5, 0., -0.5];
 
+/// Why an output path was refused, decided before a byte is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRefusal {
+    /// The target is the source. An export is a rendering: nothing is ever written back to the source, so this is refused outright and no second ask lifts it.
+    IsSource,
+    /// The target exists and is not the source: it is replaced only on an explicit second ask (the armed second press in the view, `--overwrite` on the CLI).
+    Exists,
+}
+
+/// The one path check every export and convert runs before writing. `overwrite` is the explicit second ask; it never lifts [`OutputRefusal::IsSource`].
+pub fn check_output(source: Option<&Path>, out: &Path, overwrite: bool) -> Result<(), OutputRefusal> {
+    if source.is_some_and(|s| same_path(s, out)) {
+        return Err(OutputRefusal::IsSource);
+    }
+    if out.exists() && !overwrite {
+        return Err(OutputRefusal::Exists);
+    }
+    Ok(())
+}
+
+/// Two spellings of one file: equal as given, or equal once canonicalised when both resolve (a symlink, a `./x` spelling, a relative path against an absolute one must not slip a write past the source).
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Write `out` thru a temp file beside it: `write` fills the temp, and only its success renames the temp over `out`, so a failed encode never leaves a truncated target. A failure removes the temp.
+pub fn write_via_temp(out: &Path, write: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+    let name = out.file_name().ok_or_else(|| format!("{}: no file name to write", out.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.opsin-tmp", std::process::id()));
+    let tmp = out.with_file_name(tmp_name);
+    let r = write(&tmp).and_then(|()| std::fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display())));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
 /// Export the rendered view as an sRGB JPEG — the ONE legacy-space concession, for posts on platforms that assume sRGB and strip everything else. Input is [`to_linear`]'s output (signed linear Rec.2020, white = 65535, orientation already applied); the live exposure is baked as a linear gain, then Rec.2020 → sRGB (thru vsf's deprecated legacy constants — deliberately: sRGB IS the legacy), clamp to gamut (the single display clamp, same boundary rule as the viewer), the HDR rolloff when on (same [`hdr_rail`] the viewer encodes with, so the JPEG is the screen), sRGB OETF, quality-95 JPEG. Untagged on purpose — an untagged JPEG is defined-sRGB everywhere that matters, which is exactly the consistency being bought. Nothing is written back to the source: the sensor plane stays as captured, the JPEG is a rendering.
 pub fn export_srgb_jpeg(lin: &[i32], w: usize, h: usize, ev: f32, hdr: bool, out: &Path) -> Result<(), String> {
     if w > u16::MAX as usize || h > u16::MAX as usize {
         return Err(format!("{w}×{h} exceeds JPEG's 65535 dimension limit"));
     }
     let rgb8 = srgb8(lin, w, h, ev, hdr)?;
-    let encoder = jpeg_encoder::Encoder::new_file(out, 95).map_err(|e| format!("{}: {e}", out.display()))?;
-    encoder
-        .encode(&rgb8, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
-        .map_err(|e| format!("{}: {e}", out.display()))
+    // The encoder truncates its file on open, so it gets the temp beside the target; the target changes only once the whole JPEG is on disk.
+    write_via_temp(out, |tmp| {
+        let encoder = jpeg_encoder::Encoder::new_file(tmp, 95).map_err(|e| format!("{}: {e}", out.display()))?;
+        encoder.encode(&rgb8, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).map_err(|e| format!("{}: {e}", out.display()))
+    })
 }
 
 /// The sRGB encode behind [`export_srgb_jpeg`] and [`write_thumbnail`]: [`to_linear`]'s output → interleaved 8-bit sRGB, exposure baked as a linear gain, Rec.2020 → sRGB, the single display clamp, the HDR rolloff when on, sRGB OETF.
@@ -812,7 +858,7 @@ pub fn fold_linear(lin: Vec<i32>, w: usize, h: usize, max_edge: usize) -> (usize
 /// Serialize a `SpectralImage` to a VSF-Image file.
 pub fn write_vsf(dec: &Decoded, output: &Path) -> Result<(), String> {
     let bytes = visual_of(dec).write()?;
-    std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))
+    write_via_temp(output, |tmp| std::fs::write(tmp, &bytes).map_err(|e| format!("{}: {e}", output.display())))
 }
 
 /// The visual a decode writes as: the image's plane, profile and view log through the bridge, plus the capture facts (baseline included), the maker's crop and orientation on the plane, and the foreign metadata verbatim — nothing the ingest read is dropped.
@@ -1166,6 +1212,74 @@ pub fn to_linear_in(dec: &Decoded, target: Target) -> Result<(usize, usize, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh scratch directory per test, so the path checks never see another test's files.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("opsin-out-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn output_check_refuses_the_source_however_spelled() {
+        let dir = scratch("source");
+        let src = dir.join("shot.jpg");
+        std::fs::write(&src, b"original").unwrap();
+        // The same path, and the same file thru a different spelling: both are the source, and no second ask lifts the refusal.
+        assert_eq!(check_output(Some(&src), &src, false), Err(OutputRefusal::IsSource));
+        assert_eq!(check_output(Some(&src), &src, true), Err(OutputRefusal::IsSource));
+        // Path equality already folds a `.` component, so the spelling that only canonicalisation resolves is a symlink to the source.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.jpg");
+            std::os::unix::fs::symlink(&src, &link).unwrap();
+            assert_ne!(link, src);
+            assert_eq!(check_output(Some(&src), &link, true), Err(OutputRefusal::IsSource));
+            assert_eq!(check_output(Some(&link), &src, true), Err(OutputRefusal::IsSource));
+        }
+        // A DNG beside its camera JPEG: the JPEG is not the source, so it is the existing-target case, never the source case.
+        let dng = dir.join("shot.dng");
+        std::fs::write(&dng, b"raw").unwrap();
+        assert_eq!(check_output(Some(&dng), &src, false), Err(OutputRefusal::Exists));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_check_asks_before_an_existing_target_and_passes_a_fresh_one() {
+        let dir = scratch("exists");
+        let src = dir.join("shot.dng");
+        std::fs::write(&src, b"raw").unwrap();
+        let fresh = dir.join("shot.jpg");
+        assert_eq!(check_output(Some(&src), &fresh, false), Ok(()));
+        std::fs::write(&fresh, b"camera jpeg").unwrap();
+        assert_eq!(check_output(Some(&src), &fresh, false), Err(OutputRefusal::Exists));
+        assert_eq!(check_output(Some(&src), &fresh, true), Ok(()));
+        // No source at all (a live frame): only the existing-target rule applies.
+        assert_eq!(check_output(None, &fresh, false), Err(OutputRefusal::Exists));
+        assert_eq!(check_output(None, &dir.join("live.jpg"), false), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_write_leaves_the_target_intact_when_the_encode_fails() {
+        let dir = scratch("temp");
+        let out = dir.join("shot.jpg");
+        std::fs::write(&out, b"camera jpeg").unwrap();
+        // An encode that writes half its output and then fails: the target keeps every byte, and no temp is left beside it.
+        let r = write_via_temp(&out, |tmp| {
+            std::fs::write(tmp, b"half a").unwrap();
+            Err("encoder fell over".to_string())
+        });
+        assert_eq!(r, Err("encoder fell over".to_string()));
+        assert_eq!(std::fs::read(&out).unwrap(), b"camera jpeg");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // An encode that succeeds replaces the target whole, and again leaves nothing beside it.
+        write_via_temp(&out, |tmp| std::fs::write(tmp, b"new jpeg").map_err(|e| e.to_string())).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new jpeg");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A 2×1 buffer: pixel A left, pixel B right, distinct per-channel values.
     fn two_px() -> Vec<i32> {

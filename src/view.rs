@@ -42,6 +42,8 @@ const TEXT_GREY: u32 = argb(0xE0, 0xE0, 0xE0, 0xFF);
 const CLIP_ON_FILL: u32 = argb(0x8B, 0x30, 0x30, 0xFF);
 /// Info pill fill while the HUD is shown — a quiet blue-grey, distinct from the clip pill's warning red.
 const INFO_ON_FILL: u32 = argb(0x30, 0x48, 0x70, 0xFF);
+/// Export pill fill while an overwrite is armed (the target exists; the next press replaces it) — the clip pill's warning red, since the next press destroys a file.
+const ARMED_FILL: u32 = CLIP_ON_FILL;
 /// Key-hint text — a step dimmer than the readings, so the numbers stay the thing you read.
 const HINT_GREY: u32 = argb(0x9A, 0x9A, 0x9A, 0xFF);
 /// HUD backdrop — translucent near-black so the readings stay legible over any image content.
@@ -738,6 +740,10 @@ pub struct View {
     source: Option<PathBuf>,
     /// Set by the export pill / `E` when there is no source path to write beside; the host drains it.
     export_requested: bool,
+    /// An export or convert armed to overwrite: the existing target the first press refused to touch, written only if the very next press asks for the same path again. Any other key, pill, click or load clears it — an edge, never a timer. The export pill shows it in [`ARMED_FILL`].
+    export_armed: Option<PathBuf>,
+    /// The sum of every pill's click counter but the export pill's, as of the last poll: it moves exactly when some other pill was pressed, which disarms the overwrite whichever walk (ours or the host's) delivered the press.
+    pill_clicks_seen: u32,
     /// A background export in flight: the label and how far along, for the bar over the image.
     busy: Option<(String, f32)>,
     /// Which frame is on screen. Bumped by every install, so a demosaic that finishes after the operator has arrowed on is dropped instead of landing on the wrong picture.
@@ -878,6 +884,8 @@ impl View {
             wake: None,
             source: None,
             export_requested: false,
+            export_armed: None,
+            pill_clicks_seen: 0,
             busy: None,
             frame_gen: 0,
             preview_job: LatestJob::default(),
@@ -948,6 +956,7 @@ impl View {
 
     /// Where the shown image lives on disk (the desktop viewer); `None` for an in-memory host.
     pub fn set_source(&mut self, path: Option<PathBuf>) {
+        self.disarm_export();
         self.source = path;
     }
 
@@ -1306,6 +1315,8 @@ impl View {
 
     /// Swap a decoded image into the view: title, pixels, dims, panel tools, redraw. EVERY setting the operator holds survives a load — exposure, clip, histogram axes, the HUD, the panel split — whether the frame arrives by arrow, drop, or socket handoff. Same dimensions ⇒ pan and zoom stay put too, so stepping through a burst or LED sequence compares like with like; different dimensions ⇒ refit.
     pub fn install(&mut self, loaded: Loaded, ctx: &mut Context) {
+        // A new picture is a new target: an overwrite armed for the last one must not fire on this one.
+        self.disarm_export();
         let same_geometry = loaded.w == self.img_w && loaded.h == self.img_h && self.img_w > 0;
         self.title = loaded.title;
         self.img_w = loaded.w;
@@ -1362,7 +1373,12 @@ impl View {
             return Ok(None);
         }
         // A VSF source is edited in place: the view is appended as a generation (old bytes untouched, byte-exact undo); any other source is converted to a new VSF beside it.
-        let out = if crate::sniff::sniff_path(&src) == Some(crate::sniff::Kind::Vsf) { src.clone() } else { src.with_extension("vsf") };
+        let in_place = crate::sniff::sniff_path(&src) == Some(crate::sniff::Kind::Vsf);
+        let out = if in_place { src.clone() } else { src.with_extension("vsf") };
+        // The new-file branch passes the write gate: a non-VSF file named `.vsf` would otherwise be truncated by its own convert, and an existing `<stem>.vsf` is replaced only on the armed second press.
+        if !in_place && !self.gate_output(&out) {
+            return Ok(None);
+        }
         // The display orientation as the view holds it NOW (ingest's EXIF code composed with any 90° turns), and the live view ops.
         let code = self.raw.orient;
         let mut ops = Vec::new();
@@ -1419,6 +1435,10 @@ impl View {
                 return Ok(None);
             }
         };
+        // Never over the source (`shot.jpg` viewed and exported would be its own target), and never over an existing file (a RAW+JPEG pair's camera JPEG) without the armed second press.
+        if !self.gate_output(&out) {
+            return Ok(None);
+        }
         // A JPEG is a DELIVERABLE, so it goes out at the sensor's own resolution: the decode is re-rendered through RCD rather than reusing the view's binned buffer (a quarter of the pixels). That costs ~0.8 s on a 12.5 MP frame, far too long to block the window, so it runs on a thread and reports progress; without a retained decode or a wake sender — a host that dropped the decode to save memory, a live frame — the view buffer is exactly right and goes out directly, on the spot.
         let (ev, hdr, crop) = (self.ev, self.hdr, self.crop);
         let (view_w, view_h) = (self.img_w, self.img_h);
@@ -1473,7 +1493,10 @@ impl View {
         match self.export_current_jpeg() {
             Ok(Some(out)) => println!("opsin: wrote {}", out.display()),
             Ok(None) => {}
-            Err(e) => eprintln!("opsin: JPEG export failed: {e}"),
+            Err(e) => {
+                eprintln!("opsin: JPEG export failed: {e}");
+                self.say(format!("Export failed: {e}"));
+            }
         }
     }
 
@@ -1643,6 +1666,37 @@ impl View {
                     let _ = wake.send(Msg::Tick);
                 })
                 .ok();
+        }
+    }
+
+    /// The write gate every export and convert passes before touching disk: `true` = go ahead and write `out`. The source is never written over (an export is a rendering) — that is refused on the spot with a line saying so. An existing target that is not the source is not written on the first press: the overwrite is ARMED (pill red, a line naming the file) and only the next press asking for the same path writes it. Whatever the answer, the armed state is settled here, so a press for a different path can never fire a stale arm.
+    fn gate_output(&mut self, out: &Path) -> bool {
+        let armed = self.export_armed.as_deref() == Some(out);
+        let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match crate::convert::check_output(self.source.as_deref(), out, armed) {
+            Ok(()) => {
+                self.disarm_export();
+                true
+            }
+            Err(crate::convert::OutputRefusal::IsSource) => {
+                self.disarm_export();
+                eprintln!("opsin: {} is the source: an export is a rendering, never written back", out.display());
+                self.say(format!("Not written: {name} is the source"));
+                false
+            }
+            Err(crate::convert::OutputRefusal::Exists) => {
+                self.export_armed = Some(out.to_path_buf());
+                self.btn_export.set_fill(Some(ARMED_FILL));
+                self.say(format!("{name} exists — press again to overwrite"));
+                false
+            }
+        }
+    }
+
+    /// Clear an armed overwrite and the pill's warning fill. Called on every action that is not the second press.
+    fn disarm_export(&mut self) {
+        if self.export_armed.take().is_some() {
+            self.btn_export.set_fill(None);
         }
     }
 
@@ -2010,6 +2064,18 @@ impl View {
 
     /// A pointer, wheel or key event the host forwards, with `hit` = the id the host's hit map holds under the cursor. `Handled` = consumed; `Close` = Escape asked to leave the viewer; `Pass` = not the view's (dead panel space, backdrop, an unbound key) — the host decides (a window drag, its own binding).
     pub fn on_event(&mut self, event: &FEvent, ctx: &mut Context, hit: HitId) -> EventResponse {
+        // An armed overwrite survives only its own trigger — the `E` / `V` key or a press on the export pill — and the gate re-checks the path on that press, so a stale arm can never fire. Any other key or press disarms it before dispatch: an edge, never a timer.
+        let keeps_arm = match event {
+            FEvent::KeyboardInput { event } => {
+                let ctrl = ctx.modifiers.control_key() || ctx.modifiers.super_key();
+                event.state != ElementState::Pressed || (!ctrl && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("e") || c.eq_ignore_ascii_case("v")))
+            }
+            FEvent::MouseInput { state: ElementState::Pressed, .. } => hit == self.btn_export.hit_id(),
+            _ => true,
+        };
+        if !keeps_arm {
+            self.disarm_export();
+        }
         match event {
             FEvent::CursorMoved { .. } => {
                 let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
@@ -2341,6 +2407,13 @@ impl View {
 
     /// The pills fired thru the Container walk only bump counters — poll and act. Public so a host that dispatches presses thru its own walk (photon's arbiter) can settle them.
     pub fn poll_pills(&mut self, ctx: &mut Context) {
+        // Any pill but the export pill disarms an armed overwrite before it acts: the other pills' counters are monotonic, so their sum moves exactly when one of them was pressed, whichever walk delivered the press.
+        let export_id = self.btn_export.hit_id();
+        let others: u32 = self.buttons_mut().iter().filter(|b| b.hit_id() != export_id).map(|b| b.click_count()).sum();
+        if others != self.pill_clicks_seen {
+            self.pill_clicks_seen = others;
+            self.disarm_export();
+        }
         if self.btn_one.take_click() {
             // 1:1 — a MOMENT: exactly one image pixel per screen pixel right now; the composition then scales relatively like everything else.
             self.one_to_one();

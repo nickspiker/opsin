@@ -3,7 +3,7 @@
 //!   opsin                     open an empty viewer; drag any supported image onto it.
 //!   opsin <file>              open the viewer on an image (any supported format); ←/→ navigate the folder, V converts the current image to VSF.
 //!   opsin <dir>               open the first supported image in a directory.
-//!   opsin --convert <in> [out]  headless: decode <in> to a VSF-Image (default <in>.vsf). The GUI's V without a window.
+//!   opsin --convert <in> [out] [--overwrite]  headless: decode <in> to a VSF-Image (default <in>.vsf). The GUI's V without a window. Never written over <in>; an existing <out> is replaced only with --overwrite.
 //!   opsin --copy-idt <frame>    lift the DSR IDT (DNG ColorMatrix1 + illuminant + camera fingerprint) into the clip file. The GUI's Ctrl+C.
 //!   opsin --live               headless virtual webcam (live feature): camera → saved matrix → /dev/video10, no window. Ctrl+C stops.
 //!   opsin --paste-idt [--force] <frame>...  write the clipped IDT into each frame — as a DNG CameraCalibration onto the file's own matrix, with the class and provenance in XMP; nothing original moves — only where the camera fingerprint matches; --force overrides a mismatch (a lens change on an interchangeable-lens body) with a warning. The GUI's Ctrl+V / Ctrl+Shift+V, for a whole folder.
@@ -91,15 +91,29 @@ fn main() {
     // `--notify` anywhere: report thru desktop notifications and dialogs instead of only stdout/stderr — what the file manager's right-click actions pass, since nothing reads their terminal.
     let notify = args.iter().any(|a| a == "--notify");
     args.retain(|a| a != "--notify");
+    // `--overwrite` anywhere: the explicit second ask that lets `--convert` replace an existing target — never its own input.
+    let overwrite = args.iter().any(|a| a == "--overwrite");
+    args.retain(|a| a != "--overwrite");
     match args.first().map(String::as_str) {
         Some("--version") => println!("opsin {}", env!("CARGO_PKG_VERSION")),
         Some("--convert") => {
             let Some(input) = args.get(1) else {
-                eprintln!("opsin --convert <in> [out]");
+                eprintln!("opsin --convert <in> [out] [--overwrite]");
                 std::process::exit(2);
             };
             let in_path = std::path::Path::new(input);
             let out = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| in_path.with_extension("vsf"));
+            match convert::check_output(Some(in_path), &out, overwrite) {
+                Ok(()) => {}
+                Err(convert::OutputRefusal::IsSource) => {
+                    eprintln!("opsin: convert: {} is the input; a convert is never written back over its source", out.display());
+                    std::process::exit(1);
+                }
+                Err(convert::OutputRefusal::Exists) => {
+                    eprintln!("opsin: convert: {} exists; pass --overwrite to replace it", out.display());
+                    std::process::exit(1);
+                }
+            }
             match convert::load_any(in_path) {
                 Ok(dec) => match convert::write_vsf(&dec, &out) {
                     Ok(()) => println!("opsin: wrote {}", out.display()),
