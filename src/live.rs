@@ -806,6 +806,8 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
             // yuv420p planes for both ffmpegs (limited range, BT.2020 non-constant luminance): half the bytes of rgb24, and no swscale on the far side — ffmpeg's rgb→yuv conversion is single-threaded and at 4K it was the bottleneck of both the loopback and the recorder.
             let mut yuv = vec![0u8; n * 3 / 2];
             let mut frame_no = 0u64;
+            // The last wrong frame size reported, so a camera stuck in the wrong mode says so once rather than 15 times a second.
+            let mut bad_size: Option<(usize, usize)> = None;
             while !shared.stop.load(Ordering::Relaxed) {
                 // Recording requests from the UI: a new path starts (or replaces) a recording, None ends it.
                 {
@@ -855,8 +857,15 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(mjpeg), options);
                 let Ok(px) = dec.decode() else { continue };
                 if px.len() != n * 3 {
+                    // The format negotiated is WIDTH×HEIGHT, but the camera chooses what it puts inside the JPEG: a SIGMA fp set to 3:2 sends 1620×1080 inside "3840×2160" (2026-11-04). Every frame is dropped, so say so — once per size — instead of showing "→ /dev/video10" over a stream that never starts.
+                    let got = dec.dimensions().unwrap_or((0, 0));
+                    if bad_size != Some(got) {
+                        bad_size = Some(got);
+                        send(LiveMsg::Status(format!("live: {path} sends {}×{} frames, opsin needs {WIDTH}×{HEIGHT} — check the camera's aspect ratio; nothing reaches {LOOPBACK}", got.0, got.1)));
+                    }
                     continue;
                 }
+                bad_size = None;
 
                 #[cfg(feature = "calibrate")]
                 if shared.scan_requested.swap(false, Ordering::Relaxed) {
