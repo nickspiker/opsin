@@ -725,10 +725,8 @@ pub fn find_device() -> Result<String, String> {
     fallback.ok_or_else(|| "no MJPEG camera found under /dev/video*".to_string())
 }
 
-/// Start the capture thread. Returns once the device is open (errors here are immediate: no camera, wrong format); everything after is reported thru `send`.
-pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static) -> Result<std::thread::JoinHandle<()>, String> {
-    let send: Arc<dyn Fn(LiveMsg) + Send + Sync> = Arc::new(send);
-    use v4l::io::traits::CaptureStream;
+/// Find the camera, open it close-on-exec, set WIDTH×HEIGHT MJPG and map its buffers — [`start`]'s open, and the capture thread's reopen after the camera drops off the bus.
+fn open_camera() -> Result<(String, v4l::io::mmap::Stream<'static>), String> {
     use v4l::video::Capture;
     let path = find_device()?;
     let mut dev = v4l::Device::with_path(&path).map_err(|e| format!("{path}: {e} (another process has the camera? `fuser {path}`)"))?;
@@ -750,7 +748,15 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
         return Err(format!("{path}: wanted {WIDTH}×{HEIGHT} MJPG, got {}×{} {}", fmt.width, fmt.height, String::from_utf8_lossy(&fmt.fourcc.repr)));
     }
     // Two buffers: the driver fills one while we process the other. One (chameleon's choice) drops every frame whose successor arrives mid-processing — measured ~10 of 15 fps kept with the recorder running.
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 2).map_err(|e| e.to_string())?;
+    let stream = v4l::io::mmap::Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 2).map_err(|e| e.to_string())?;
+    Ok((path, stream))
+}
+
+/// Start the capture thread. Returns once the device is open (errors here are immediate: no camera, wrong format); everything after is reported thru `send`.
+pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static) -> Result<std::thread::JoinHandle<()>, String> {
+    let send: Arc<dyn Fn(LiveMsg) + Send + Sync> = Arc::new(send);
+    use v4l::io::traits::CaptureStream;
+    let (mut path, mut stream) = open_camera()?;
 
     // ffmpeg → loopback, exactly chameleon's invocation. Absent loopback ⇒ viewfinder only.
     let mut ffmpeg = if std::path::Path::new(LOOPBACK).exists() {
@@ -808,7 +814,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
             let mut frame_no = 0u64;
             // The last wrong frame size reported, so a camera stuck in the wrong mode says so once rather than 15 times a second.
             let mut bad_size: Option<(usize, usize)> = None;
-            while !shared.stop.load(Ordering::Relaxed) {
+            'capture: while !shared.stop.load(Ordering::Relaxed) {
                 // Recording requests from the UI: a new path starts (or replaces) a recording, None ends it.
                 {
                     let want = shared.record.lock().unwrap().clone();
@@ -851,7 +857,26 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                         _ => {}
                     }
                 }
-                let Ok((mjpeg, meta)) = stream.next() else { continue };
+                let (mjpeg, meta) = match stream.next() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // A replugged camera comes back on a NEW node and leaves this fd on the deleted one: every dequeue fails at once, forever. That was a `continue` — a 100% spin behind a black viewfinder (2026-11-04). Drop the dead stream (ENODEV, which its Drop ignores) and reopen whatever camera is there, once a second, until it answers or live is stopped.
+                        send(LiveMsg::Status(format!("live: {path} lost ({e}) — waiting for the camera")));
+                        drop(stream);
+                        loop {
+                            if shared.stop.load(Ordering::Relaxed) {
+                                break 'capture;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            if let Ok((p, s)) = open_camera() {
+                                (path, stream) = (p, s);
+                                break;
+                            }
+                        }
+                        send(LiveMsg::Status(format!("live: {path} → {LOOPBACK} (camera back)")));
+                        continue;
+                    }
+                };
                 let captured_ms = meta.timestamp.sec as f64 * 1e3 + meta.timestamp.usec as f64 / 1e3;
                 let options = zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
                 let mut dec = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(mjpeg), options);
