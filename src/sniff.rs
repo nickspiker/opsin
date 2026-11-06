@@ -3,7 +3,7 @@
 /// The byte-recognised family of a file. Everything except `Unknown` has a decoder; `Unknown` goes to the headerless guesser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// `RÅ<` — a VSF container (only a `spectral_image` document renders; another VSF document falls thru to the guesser, which shows its bytes).
+    /// `RÅ<` — a VSF container (an image in the visual container, or a vector scene in a `vector` section; another VSF document falls thru to the guesser, which shows its bytes).
     Vsf,
     /// `FF D8 FF`.
     Jpeg,

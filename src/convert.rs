@@ -221,6 +221,7 @@ pub fn load_known(input: &Path) -> Result<Decoded, String> {
 fn decode_known(input: &Path, bytes: &[u8], kind: crate::sniff::Kind) -> Result<Decoded, String> {
     use crate::sniff::Kind;
     match kind {
+        Kind::Vsf if has_scene(bytes) => vsf::types::renderable::read_scene(bytes).and_then(|scene| ingest_vector(&scene)),
         Kind::Vsf => vsf::visual::Visual::read(bytes).map_err(|e| e.to_string()).and_then(decoded_of_visual),
         Kind::Jxl => ingest_jxl(bytes),
         Kind::Jpeg => ingest_jpeg(bytes),
@@ -228,6 +229,33 @@ fn decode_known(input: &Path, bytes: &[u8], kind: crate::sniff::Kind) -> Result<
         Kind::Tiff | Kind::Cr3 | Kind::Raf | Kind::Crw => ingest_image(input),
         Kind::Unknown => Err(String::new()),
     }
+}
+
+/// The long side, in pixels, a vector scene is drawn at for viewing. Enough for the whole mark to stay crisp at a full-screen fit; zooming past it shows these pixels.
+const VECTOR_SIDE: usize = 1 << 11;
+
+/// Whether a VSF document holds a vector scene (a `vector` section), which is drawn rather than read as an image.
+fn has_scene(bytes: &[u8]) -> bool {
+    vsf::container::Document::open(bytes).is_ok_and(|d| d.entry(vsf::types::renderable::SCENE_SECTION).is_some())
+}
+
+/// A vector scene drawn by vsf's reference rasterizer over white (VSF RGB's equal-energy white), fitted to the root node's `view`, and ingested as the linear VSF RGB it is. Objects the rasterizer does not draw (text, widgets) are named in the HUD's first line.
+fn ingest_vector(scene: &vsf::VsfType) -> Result<Decoded, String> {
+    let vsf::VsfType::ron(root) = scene else { return Err("a vector scene's root is not a node, so it has no view to show".into()) };
+    let view = root.view.as_ref().ok_or("the scene's root node has no view: opsin cannot tell what region to show")?.to_f64();
+    let (hw, hh) = (view[2], view[3]);
+    if !(hw > 0. && hh > 0.) {
+        return Err(format!("the scene's view has half-size {hw} × {hh}"));
+    }
+    // The longer half-size takes VECTOR_SIDE; the other keeps the view's aspect, never below one pixel.
+    let long = hw.max(hh);
+    let (w, h) = (((VECTOR_SIDE as f64 * hw / long).round() as usize).max(1), ((VECTOR_SIDE as f64 * hh / long).round() as usize).max(1));
+    let drawn = vsf::raster::render(scene, w, h, vsf::raster::Affine::fit([view[0], view[1]], [hw, hh], w, h));
+    let mut label = format!("vector scene, {} objects", root.children.len());
+    if !drawn.skipped.is_empty() {
+        label.push_str(&format!(" (not drawn: {})", drawn.skipped.join(", ")));
+    }
+    Ok(ingest_linear_vsf_rgb(w, h, drawn.image.planar_u16_over([1., 1., 1.]), &label))
 }
 
 /// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] with NO profile. That is the correct representation, not a shortcut: untagged samples are VSF RGB by specification, so absence is the complete statement and an identity entry would only restate it under a tier that has no honest value for it (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). With no entry to carry `source`, the label goes where the headerless guesser already puts its verdict — `model`, the HUD's first line.
@@ -1211,6 +1239,21 @@ pub fn to_linear_in(dec: &Decoded, target: Target) -> Result<(usize, usize, Vec<
 
 #[cfg(test)]
 mod tests {
+
+    /// A vector document is drawn, not read as an image: fitted to its root node's view at the view's aspect, named in the HUD with the objects it could not draw.
+    #[test]
+    fn a_vector_scene_is_drawn_at_its_views_aspect() {
+        use vsf::types::{Ellipse, Node, Nums, Paint, Text};
+        let mut root = Node::new();
+        root.view = Some(Nums::centre_half_f32([0., 0.], [2., 1.]));
+        root.children.push(vsf::VsfType::roe(Box::new(Ellipse { geometry: Nums::centre_half_f32([0., 0.], [1., 1.]), rotation: None, start: None, sweep: None, fill: Some(Paint::colour(vsf::VsfType::rck).unwrap()), stroke: None })));
+        root.children.push(vsf::VsfType::rot(Box::new(Text::new(vsf::VsfType::a("hi".into()), Nums::f32(vec![2], vec![0., 0.]).unwrap(), vsf::types::Num::from(0.25f32), Paint::colour(vsf::VsfType::rck).unwrap()))));
+        let (name, fields) = vsf::types::renderable::scene_section(vsf::VsfType::ron(Box::new(root)));
+        let bytes = vsf::vsf_builder::VsfBuilder::new().add_section(name, fields).build().unwrap();
+        let dec = super::decode_known(std::path::Path::new("scene.vsf"), &bytes, crate::sniff::sniff(&bytes)).unwrap();
+        assert_eq!((dec.img.width, dec.img.height), (super::VECTOR_SIDE, super::VECTOR_SIDE / 2));
+        assert!(dec.img.model.contains("2 objects") && dec.img.model.contains("rot text"), "{}", dec.img.model);
+    }
     use super::*;
 
     /// A fresh scratch directory per test, so the path checks never see another test's files.
