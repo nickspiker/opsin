@@ -239,7 +239,7 @@ fn has_scene(bytes: &[u8]) -> bool {
     vsf::container::Document::open(bytes).is_ok_and(|d| d.entry(vsf::types::renderable::SCENE_SECTION).is_some())
 }
 
-/// A vector scene drawn by vsf's reference rasterizer over white (VSF RGB's equal-energy white), fitted to the root node's `view`, and ingested as the linear VSF RGB it is. Objects the rasterizer does not draw (text, widgets) are named in the HUD's first line.
+/// A vector scene drawn by vsf's reference rasterizer, fitted to the root node's `view`, and ingested as the linear VSF RGB it is. Objects the rasterizer does not draw (text, widgets) are named in the HUD's first line.
 fn ingest_vector(scene: &vsf::VsfType) -> Result<Decoded, String> {
     let vsf::VsfType::ron(root) = scene else { return Err("a vector scene's root is not a node, so it has no view to show".into()) };
     let view = root.view.as_ref().ok_or("the scene's root node has no view: opsin cannot tell what region to show")?.to_f64();
@@ -255,7 +255,7 @@ fn ingest_vector(scene: &vsf::VsfType) -> Result<Decoded, String> {
     if !drawn.skipped.is_empty() {
         label.push_str(&format!(" (not drawn: {})", drawn.skipped.join(", ")));
     }
-    Ok(ingest_linear_vsf_rgb(w, h, drawn.image.planar_u16_over([1., 1., 1.]), &label))
+    Ok(ingest_linear_vsf_rgb(w, h, drawn.image.planar_u16(), &label))
 }
 
 /// A host that already linearised into VSF RGB (photon's `image`-crate path for the formats opsin has no decoder for — PNG, GIF, BMP) → a [`Decoded`] with NO profile. That is the correct representation, not a shortcut: untagged samples are VSF RGB by specification, so absence is the complete statement and an identity entry would only restate it under a tier that has no honest value for it (Nick 2026-09-22: "it IS VSF RGB if there is no profile attached"). With no entry to carry `source`, the label goes where the headerless guesser already puts its verdict — `model`, the HUD's first line.
