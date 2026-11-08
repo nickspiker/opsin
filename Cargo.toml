@@ -54,3 +54,7 @@ path = "src/lib.rs"
 name = "opsin"
 path = "src/main.rs"
 required-features = ["viewer"]
+
+# Dev builds keep line tables only: backtraces still name the file and line, and the full debug info that filled Harbor (2026-11-08) is gone.
+[profile.dev]
+debug = "line-tables-only"
