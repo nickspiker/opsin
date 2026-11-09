@@ -1,4 +1,4 @@
-//! Live: a V4L2 camera as opsin's frame source, behind the `live` feature. What `chameleon live` does, hosted by the viewer instead of a terminal + egui window: the capture thread pulls MJPEG frames from the camera, decodes, turns them 180° (the mount), linearizes (the camera's gamma-2), applies the live colour matrix (3×3 with a per-row gain, from the panel's sliders), and emits two things per frame — the corrected stream to ffmpeg → a v4l2loopback device (`/dev/video10`, tagged BT.2020 gamma 2.2) for the call app, and the full-resolution linear frame to the UI thread (gated so a slow UI drops frames rather than queueing them), which lands in the viewer exactly like a decoded file: histogram, chart, EV, clip, HDR, HUD, and `E` (save a JPEG) all work on it. No loopback device ⇒ viewfinder only, and the HUD says so.
+//! Live: a V4L2 camera as opsin's frame source, behind the `live` feature. What `chameleon live` does, hosted by the viewer instead of a terminal + egui window: the capture thread pulls MJPEG frames from the camera, decodes, turns them 180° when the camera is mounted upside down (the Flip pill, persisted), linearizes (the camera's gamma-2), applies the live colour matrix (3×3 with a per-row gain, from the panel's sliders), and emits two things per frame — the corrected stream to ffmpeg → a v4l2loopback device (`/dev/video10`, tagged BT.2020 gamma 2.2) for the call app, and the full-resolution linear frame to the UI thread (gated so a slow UI drops frames rather than queueing them), which lands in the viewer exactly like a decoded file: histogram, chart, EV, clip, HDR, HUD, and `E` (save a JPEG) all work on it. No loopback device ⇒ viewfinder only, and the HUD says so.
 //!
 //! With `calibrate` too, `C` requests a scan of the next frame: chameleon solves the matrix from a held-up target, the sliders jump to it, and the solved overlay is composited into both outputs for a few seconds so the fit is visible on the call. The matrix persists to `~/.config/Verichrome/live_colour.vsf` in chameleon's own section format, so the two tools share it.
 
@@ -52,11 +52,13 @@ pub struct Shared {
     pub sys: AudioTap,
     /// Frames the solved overlay stays composited for (counts down).
     pub overlay_frames: AtomicU32,
+    /// The camera is mounted upside down: every frame is turned 180° before the stream, the viewfinder and a recording see it. The Flip pill; persisted in `live_colour.vsf`, read per frame.
+    pub turn: AtomicBool,
 }
 
 impl Shared {
     pub fn new(matrix: Sliders) -> Arc<Shared> {
-        Arc::new(Shared { matrix: Mutex::new(matrix), stop: AtomicBool::new(false), frame_pending: AtomicBool::new(false), viewfinder: AtomicBool::new(true), clip: AtomicBool::new(false), ev_gain: AtomicU32::new(1f32.to_bits()), hdr: AtomicBool::new(false), scan_requested: AtomicBool::new(false), overlay_frames: AtomicU32::new(0), pipe_ms10: AtomicU32::new(0), extra_ms: AtomicU32::new(load_extra_ms()), record: Mutex::new(None), rec_frames: AtomicU32::new(0), mic: AudioTap::new(1), sys: AudioTap::new(2) })
+        Arc::new(Shared { matrix: Mutex::new(matrix), stop: AtomicBool::new(false), frame_pending: AtomicBool::new(false), viewfinder: AtomicBool::new(true), clip: AtomicBool::new(false), ev_gain: AtomicU32::new(1f32.to_bits()), hdr: AtomicBool::new(false), scan_requested: AtomicBool::new(false), overlay_frames: AtomicU32::new(0), pipe_ms10: AtomicU32::new(0), extra_ms: AtomicU32::new(load_extra_ms()), record: Mutex::new(None), rec_frames: AtomicU32::new(0), mic: AudioTap::new(1), sys: AudioTap::new(2), turn: AtomicBool::new(load_turn()) })
     }
     /// Total audio delay to apply, in ms: measured pipe + operator's constant.
     pub fn av_delay_ms(&self) -> f32 {
@@ -134,7 +136,7 @@ fn webcam_raw_info() -> chameleon::RawInfo {
     }
 }
 
-/// The solved overlay as live composites it, in SOURCE (pre-rotation) frame pixels: `rgba` is scene-referred (camera-linear, composited BEFORE the matrix, so it exposes like the target), `light` is the logo's display light beside it (added AFTER everything — [`stream_byte`]). `vf` is that same light in the viewfinder's rotated grid.
+/// The solved overlay as live composites it, in SOURCE (pre-rotation) frame pixels: `rgba` is scene-referred (camera-linear, composited BEFORE the matrix, so it exposes like the target), `light` is the logo's display light beside it (added AFTER everything — [`stream_byte`]). `vf` is that same light in the viewfinder's grid, indexed by the mount: `[upright, turned]`.
 struct LiveOverlay {
     x0: usize,
     y0: usize,
@@ -142,7 +144,7 @@ struct LiveOverlay {
     h: usize,
     rgba: Vec<f32>,
     light: Vec<[u16; 3]>,
-    vf: Arc<crate::view::Emissive>,
+    vf: [Arc<crate::view::Emissive>; 2],
 }
 
 /// The stream's encode boundary, the viewer's rules in the viewer's order: EV gain → clip indicator (pre-rail) → clamp → HDR rail → + emissive light → transfer. `light` is display-linear 0..65535 and lands at exactly its own value whatever the exposure; a lit channel skips the clip indicator.
@@ -169,7 +171,7 @@ fn stream_lut() -> Vec<u8> {
     (0..65536u32).map(|v| ((v as f32 / 65535.).powf(1. / 2.4) * 255.) as u8).collect()
 }
 
-/// The logo light (source grid, origin x0,y0, w×h) re-gridded for the viewfinder, which shows the frame turned 180°: source (sx, sy) → (WIDTH−1−sx, HEIGHT−1−sy).
+/// The logo light (source grid, origin x0,y0, w×h) re-gridded for a viewfinder that shows the frame turned 180°: source (sx, sy) → (WIDTH−1−sx, HEIGHT−1−sy). Upright, the source grid IS the viewfinder's ([`viewfinder_light_upright`]).
 #[cfg(feature = "calibrate")]
 fn viewfinder_light(x0: usize, y0: usize, w: usize, h: usize, light: &[[u16; 3]]) -> crate::view::Emissive {
     // WHY/PROOF: the logo rect is where chameleon found it in the camera frame, and it can reach past the frame's edge — WIDTH − (x0 + w) would underflow.
@@ -191,6 +193,12 @@ fn viewfinder_light(x0: usize, y0: usize, w: usize, h: usize, light: &[[u16; 3]]
     crate::view::Emissive { frame_w: WIDTH, x0: ox0, y0: oy0, w, h, rgb }
 }
 
+/// The logo light for an upright viewfinder: the source grid unchanged.
+#[cfg(feature = "calibrate")]
+fn viewfinder_light_upright(x0: usize, y0: usize, w: usize, h: usize, light: &[[u16; 3]]) -> crate::view::Emissive {
+    crate::view::Emissive { frame_w: WIDTH, x0, y0, w, h, rgb: light.to_vec() }
+}
+
 /// A scan's overlay, ready to composite: both rasters warped thru chameleon's 8×7 mesh ([`crate::calibrate::mesh_warp`]) and binned from its 2× space to frame pixels; the logo coverage turned into display light (white wordmark, illuminant-E rail in the destination space, each normalized on its own).
 #[cfg(feature = "calibrate")]
 fn live_overlay(lo: &chameleon::LiveOverlay, settings: &chameleon::CurrentSettings) -> LiveOverlay {
@@ -203,7 +211,7 @@ fn live_overlay(lo: &chameleon::LiveOverlay, settings: &chameleon::CurrentSettin
     // Normalized over the frame-pixel raster the stream actually shows: text and rail each to their own white.
     let light: Vec<[u16; 3]> = chameleon::logo::light_layer(&cov, &rail).into_iter().map(crate::calibrate::to_light).collect();
     let (x0, y0, w, h) = (x0 / 2, y0 / 2, w / 2, h / 2);
-    let vf = Arc::new(viewfinder_light(x0, y0, w, h, &light));
+    let vf = [Arc::new(viewfinder_light_upright(x0, y0, w, h, &light)), Arc::new(viewfinder_light(x0, y0, w, h, &light))];
     LiveOverlay { x0, y0, w, h, rgba, light, vf }
 }
 
@@ -230,17 +238,60 @@ fn config_path() -> PathBuf {
 
 /// chameleon's `live_colour.vsf`: one section `colour_matrix`, field `matrix` = a 3×3 f32 tensor with the gains folded in.
 pub fn load_matrix() -> Option<Sliders> {
+    let d = load_matrix_flat()?;
+    Some([[d[0], d[1], d[2], 1.], [d[3], d[4], d[5], 1.], [d[6], d[7], d[8], 1.]])
+}
+
+fn load_config() -> Option<vsf::VsfSection> {
     let data = std::fs::read(config_path()).ok()?;
     let mut ptr = 0;
-    let section = vsf::VsfSection::parse(&data, &mut ptr).ok()?;
-    let field = section.get_field("matrix")?;
-    if let Some(vsf::VsfType::t_f5(t)) = field.values.first() {
-        if t.data.len() == 9 {
-            let d = &t.data;
-            return Some([[d[0], d[1], d[2], 1.], [d[3], d[4], d[5], 1.], [d[6], d[7], d[8], 1.]]);
-        }
+    vsf::VsfSection::parse(&data, &mut ptr).ok()
+}
+
+/// The stored matrix as written, gains folded in.
+fn load_matrix_flat() -> Option<Vec<f32>> {
+    match load_config()?.get_field("matrix")?.values.first() {
+        Some(vsf::VsfType::t_f5(t)) if t.data.len() == 9 => Some(t.data.clone()),
+        _ => None,
     }
-    None
+}
+
+/// Is the camera mounted upside down? `live_colour.vsf` field `turn_180` (chameleon's reader ignores it); absent means turned, the mount live was written for.
+pub fn load_turn() -> bool {
+    turn_of(load_config().as_ref())
+}
+
+fn turn_of(config: Option<&vsf::VsfSection>) -> bool {
+    match config.and_then(|c| c.get_field("turn_180")).and_then(|f| f.values.first()) {
+        Some(vsf::VsfType::u0(t)) => *t,
+        _ => true,
+    }
+}
+
+/// Persist the Flip pill, the rest of the file as it stands: a stored matrix stays the stored matrix (the sliders are saved only by Save), the A/V constant stays.
+pub fn save_turn(turn: bool) -> Result<PathBuf, String> {
+    write_config(load_matrix_flat(), load_extra_ms(), turn)
+}
+
+fn config_section(matrix: Option<Vec<f32>>, extra_ms: u32, turn: bool) -> vsf::VsfSection {
+    let mut section = vsf::VsfSection::new("colour_matrix");
+    if let Some(flat) = matrix {
+        section.add_field("matrix", vsf::VsfType::t_f5(vsf::Tensor::new(vec![3, 3], flat)));
+    }
+    section.add_field("av_extra_ms", vsf::VsfType::u5(extra_ms));
+    section.add_field("turn_180", vsf::VsfType::u0(turn));
+    section
+}
+
+/// The one writer of `live_colour.vsf`: the matrix when there is one (chameleon reads it; with none it keeps its own default), the A/V constant, the mount.
+fn write_config(matrix: Option<Vec<f32>>, extra_ms: u32, turn: bool) -> Result<PathBuf, String> {
+    let section = config_section(matrix, extra_ms, turn);
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, section.encode()).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 /// The part of the operator's constant that is downstream of opsin (ffmpeg → loopback → the call app's capture) and so does NOT apply to a recorded file: the file's video is opsin's own output. What's left of the constant is the camera's sensor→USB time, which does.
@@ -271,15 +322,7 @@ pub fn save_matrix_and_extra(s: &Sliders, extra_ms: u32) -> Result<PathBuf, Stri
             flat.push(s[r][c] * s[r][3]);
         }
     }
-    let mut section = vsf::VsfSection::new("colour_matrix");
-    section.add_field("matrix", vsf::VsfType::t_f5(vsf::Tensor::new(vec![3, 3], flat)));
-    section.add_field("av_extra_ms", vsf::VsfType::u5(extra_ms));
-    let path = config_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, section.encode()).map_err(|e| e.to_string())?;
-    Ok(path)
+    write_config(Some(flat), extra_ms, load_turn())
 }
 
 /// rgb24 (full-range gamma-encoded bytes) → yuv420p, limited range, BT.2020 NCL (Kr 0.2627, Kb 0.0593): Y per pixel, Cb/Cr averaged over each 2×2. Parallel over row pairs; integer Q16 arithmetic.
@@ -962,11 +1005,12 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                 }
                 use rayon::prelude::*;
                 let row_w = WIDTH * 3;
-                // One parallel pass over output rows (rotated 180°): linearize, overlay, matrix, then the loopback byte; the viewfinder rows (when wanted) are written in the same pass from the same linear values.
+                // One parallel pass over output rows (turned 180° when the camera is mounted upside down — read once per frame, so a Flip lands on a frame boundary): linearize, overlay, matrix, then the loopback byte; the viewfinder rows (when wanted) are written in the same pass from the same linear values.
+                let turn = shared.turn.load(Ordering::Relaxed);
                 let work = |h: usize, orow: &mut [u8], lrow: Option<&mut [i32]>, crow: Option<&mut [u16]>| {
                     let (mut lrow, mut crow) = (lrow, crow);
                     for w in 0..WIDTH {
-                        let (sh, sw) = (HEIGHT - 1 - h, WIDTH - 1 - w);
+                        let (sh, sw) = if turn { (HEIGHT - 1 - h, WIDTH - 1 - w) } else { (h, w) };
                         let s = (sh * WIDTH + sw) * 3;
                         let (mut r, mut g, mut b) = (lin_lut[px[s] as usize] as f32, lin_lut[px[s + 1] as usize] as f32, lin_lut[px[s + 2] as usize] as f32);
                         let mut light = [0u16; 3];
@@ -1057,7 +1101,7 @@ pub fn start(shared: Arc<Shared>, send: impl Fn(LiveMsg) + Send + Sync + 'static
                 }
                 if want_frame {
                     shared.frame_pending.store(true, Ordering::Relaxed);
-                    let emissive = overlay.as_ref().filter(|_| show_overlay).map(|o| o.vf.clone());
+                    let emissive = overlay.as_ref().filter(|_| show_overlay).map(|o| o.vf[turn as usize].clone());
                     send(LiveMsg::Frame(Frame { w: WIDTH, h: HEIGHT, lin: std::mem::take(&mut lin_buf), codes: std::mem::take(&mut codes_buf), emissive }));
                 }
             }
@@ -1095,6 +1139,27 @@ mod light_tests {
         // Unlit, the boundary is unchanged: overs flag under the clip indicator, and clamp without it.
         assert_eq!(stream_byte(70000., 0, 1., true, false, &lut), lut[0]);
         assert_eq!(stream_byte(70000., 0, 1., false, false, &lut), 255);
+    }
+
+    /// The mount survives the file both ways, beside the matrix and the A/V constant; a file written before the Flip pill (no `turn_180`) reads as turned, the mount live always assumed.
+    #[test]
+    fn turn_round_trips_in_the_config() {
+        let parse = |sec: vsf::VsfSection| {
+            let bytes = sec.encode();
+            let mut ptr = 0;
+            vsf::VsfSection::parse(&bytes, &mut ptr).unwrap()
+        };
+        let m: Vec<f32> = (0..9).map(|i| i as f32).collect();
+        for turn in [false, true] {
+            let back = parse(config_section(Some(m.clone()), 123, turn));
+            assert_eq!(turn_of(Some(&back)), turn);
+            assert!(matches!(back.get_field("matrix").and_then(|f| f.values.first()), Some(vsf::VsfType::t_f5(t)) if t.data == m));
+            assert!(matches!(back.get_field("av_extra_ms").and_then(|f| f.values.first()), Some(vsf::VsfType::u5(123))));
+        }
+        let mut old = vsf::VsfSection::new("colour_matrix");
+        old.add_field("matrix", vsf::VsfType::t_f5(vsf::Tensor::new(vec![3, 3], m)));
+        assert!(turn_of(Some(&parse(old))));
+        assert!(turn_of(None));
     }
 
     /// The viewfinder shows the frame turned 180°: the light must land on the same scene pixel there as in the stream.

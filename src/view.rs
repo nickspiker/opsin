@@ -785,6 +785,9 @@ pub struct View {
     /// Record pill — blue idle, red while recording; `Space` and the pill share `toggle_record`.
     #[cfg(feature = "live")]
     btn_rec: fluor::widgets::Button,
+    /// The camera's mount: lit while frames are turned 180° (upside-down mount). Persisted with the matrix file, so it holds across launches and headless `--live`.
+    #[cfg(feature = "live")]
+    btn_flip: fluor::widgets::Button,
     /// Crop rect in DISPLAY pixels (after orientation), `[x0, x1) × [y0, y1)`; `Some` = crop mode on. Toggling on seeds the full frame and fits; a click or drag on the image moves the NEAREST corner to the cursor (no handles, no modes); toggling off clears and fits. Armed = the JPEG exports the rect and `V` records a `crop` view op. A view op: it culls, the plane never changes.
     crop: Option<(usize, usize, usize, usize)>,
     /// The corner being dragged (0 = x0y0, 1 = x1y0, 2 = x0y1, 3 = x1y1) while the button is down in crop mode.
@@ -834,6 +837,10 @@ impl View {
         let mut btn_rec = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Rec");
         #[cfg(feature = "live")]
         btn_rec.set_fill(Some(INFO_ON_FILL));
+        #[cfg(feature = "live")]
+        let mut btn_flip = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "Flip");
+        #[cfg(feature = "live")]
+        btn_flip.set_fill(crate::live::load_turn().then_some(INFO_ON_FILL));
         #[cfg(feature = "live")]
         let mat_sliders: Vec<fluor::widgets::Slider> = (0..12).map(|i| fluor::widgets::Slider::new(hit_counter, 0., 0., 1., 1., mat_slider_pos(i, crate::live::IDENTITY[i / 4][i % 4]))).collect();
         let btn_rot_ccw = fluor::widgets::Button::new(hit_counter, 0., 0., 1., 1., 1., "CCW");
@@ -917,6 +924,8 @@ impl View {
             btn_mat_save,
             #[cfg(feature = "live")]
             btn_rec,
+            #[cfg(feature = "live")]
+            btn_flip,
             crop: None,
             crop_drag: None,
             btn_crop,
@@ -1035,7 +1044,7 @@ impl View {
         ids.push(self.btn_cal.hit_id());
         #[cfg(feature = "live")]
         {
-            ids.extend([self.btn_live.hit_id(), self.btn_mat_reset.hit_id(), self.btn_mat_save.hit_id(), self.btn_rec.hit_id()]);
+            ids.extend([self.btn_live.hit_id(), self.btn_mat_reset.hit_id(), self.btn_mat_save.hit_id(), self.btn_rec.hit_id(), self.btn_flip.hit_id()]);
             ids.extend(self.mat_sliders.iter().map(|s| s.hit_id()));
         }
         ids
@@ -1862,6 +1871,21 @@ impl View {
         ctx.window.request_redraw();
     }
 
+    /// Flip — the camera's mount, turned 180° or upright. Saved at once (the running stream, the viewfinder and a recording all follow from the next frame); works with live off too, so the next start comes up the right way.
+    #[cfg(feature = "live")]
+    fn toggle_flip(&mut self, ctx: &mut Context) {
+        let turn = !self.live.as_ref().map_or_else(crate::live::load_turn, |s| s.turn.load(std::sync::atomic::Ordering::Relaxed));
+        if let Some(shared) = &self.live {
+            shared.turn.store(turn, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.btn_flip.set_fill(turn.then_some(INFO_ON_FILL));
+        self.live_status = Some(match crate::live::save_turn(turn) {
+            Ok(_) => format!("live: camera {}", if turn { "turned 180°" } else { "upright" }),
+            Err(e) => format!("live: flip not saved: {e}"),
+        });
+        ctx.window.request_redraw();
+    }
+
     /// Record start/stop — `Space` and the Rec pill. The pill is blue idle, red while a recording is requested (the capture thread owns the encoder; the pill reflects the request, the HUD's REC clock the frames actually written).
     #[cfg(feature = "live")]
     fn toggle_record(&mut self, ctx: &mut Context) {
@@ -2401,7 +2425,7 @@ impl View {
         #[cfg(feature = "calibrate")]
         pills.push(&mut self.btn_cal);
         #[cfg(feature = "live")]
-        pills.extend([&mut self.btn_live, &mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec]);
+        pills.extend([&mut self.btn_live, &mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec, &mut self.btn_flip]);
         pills
     }
 
@@ -2460,6 +2484,9 @@ impl View {
             }
             if self.btn_rec.take_click() {
                 self.toggle_record(ctx);
+            }
+            if self.btn_flip.take_click() {
+                self.toggle_flip(ctx);
             }
             if self.btn_mat_save.take_click() {
                 let m = self.matrix();
@@ -2621,8 +2648,8 @@ impl View {
                         }
                     }
                     let ry = (my + band * 3 + pad) as f32 + band as f32 / 2.;
-                    for (i, b) in [&mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec].into_iter().enumerate() {
-                        b.set_rect(mx as f32 + mw as f32 * ((i as f32 + 0.5) / 3.), ry, mw as f32 * 0.3, band as f32);
+                    for (i, b) in [&mut self.btn_mat_reset, &mut self.btn_mat_save, &mut self.btn_rec, &mut self.btn_flip].into_iter().enumerate() {
+                        b.set_rect(mx as f32 + mw as f32 * ((i as f32 + 0.5) / 4.), ry, mw as f32 * (0.9 / 4.), band as f32);
                         b.set_font_size_fitted(band as f32 / 2., text);
                         let id = b.hit_id();
                         b.render_content_into(canvas, 0., 0., text, clip, Some(&mut *hit_map), id);
@@ -3127,6 +3154,7 @@ impl Container for View {
             f(&mut self.btn_mat_reset);
             f(&mut self.btn_mat_save);
             f(&mut self.btn_rec);
+            f(&mut self.btn_flip);
             for s in &mut self.mat_sliders {
                 f(s);
             }
