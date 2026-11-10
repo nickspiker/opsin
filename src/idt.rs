@@ -530,7 +530,11 @@ impl IdtClip {
         let signature = format!("VERICHROME {} {} target#{} {}", p.class, p.tier, p.target_serial, if p.scanned.is_empty() { "-" } else { p.scanned.as_str() });
         let mut foreign = vis.foreign.clone();
         foreign.calibration_signature = signature.clone();
-        let add = vsf::container::Appender::new("opsin", "paste idt")
+        // vsf writes these as `a` (ASCII text) and panics on text that is not; they come from the IDT file and the target scan, so the paste is refused here, naming the field.
+        for (name, s) in [("observer", observer.as_str()), ("calibration_signature", signature.as_str()), ("cal_timestamp", p.target_calibrated.as_str())] {
+            vsf::Ascii::new(s).map_err(|e| format!("{name}: {e}"))?;
+        }
+        let add =vsf::container::Appender::new(vsf::Ascii::lit("opsin"), vsf::Ascii::lit("paste idt"))
             .add_section("characterization", vsf::visual::characterization_fields(&profile, &observer, self.response.as_ref().map(response_to_vsf).as_ref()))
             .add_section("foreign", foreign.fields())
             .supersede("colour_profile")

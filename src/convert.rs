@@ -885,8 +885,28 @@ pub fn fold_linear(lin: Vec<i32>, w: usize, h: usize, max_edge: usize) -> (usize
 
 /// Serialize a `SpectralImage` to a VSF-Image file.
 pub fn write_vsf(dec: &Decoded, output: &Path) -> Result<(), String> {
-    let bytes = visual_of(dec).write()?;
+    let v = visual_of(dec);
+    ascii_text(&v)?;
+    let bytes = v.write()?;
     write_via_temp(output, |tmp| std::fs::write(tmp, &bytes).map_err(|e| format!("{}: {e}", output.display())))
+}
+
+/// The free text a visual writes as `a` (ASCII text) where vsf has no error to return and panics on text that is not ASCII: the camera's and the DNG's words (make, model, lens, profile name, the EXIF date) and a sidecar's title, text and observer can legitimately be anything, so the write is refused here, naming the field, before vsf sees it.
+fn ascii_text(v: &vsf::visual::Visual) -> Result<(), String> {
+    let mut text: Vec<(&str, &str)> = vec![("title", &v.title), ("text", &v.text), ("observer", &v.observer), ("profile_name", &v.foreign.profile_name), ("calibration_signature", &v.foreign.calibration_signature)];
+    if let Some(c) = &v.capture {
+        text.extend([("at_text", c.at_text.as_str()), ("make", &c.make), ("model", &c.model), ("sensor_module", &c.sensor_module), ("lens", &c.lens), ("mode", &c.mode), ("stack", &c.stack), ("shading", &c.shading)]);
+    }
+    if let Some(cal) = v.characterization.as_ref().and_then(|p| p.cal.as_ref()) {
+        text.push(("cal_timestamp", &cal.timestamp));
+    }
+    if let Some(r) = &v.response {
+        text.push(("response_prior", &r.prior));
+    }
+    for (name, s) in text {
+        vsf::Ascii::new(s).map_err(|e| format!("{name}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// The visual a decode writes as: the image's plane, profile and view log through the bridge, plus the capture facts (baseline included), the maker's crop and orientation on the plane, and the foreign metadata verbatim — nothing the ingest read is dropped.
@@ -1247,7 +1267,7 @@ mod tests {
         let mut root = Node::new();
         root.view = Some(Nums::centre_half_f32([0., 0.], [2., 1.]));
         root.children.push(vsf::VsfType::roe(Box::new(Ellipse { geometry: Nums::centre_half_f32([0., 0.], [1., 1.]), rotation: None, start: None, sweep: None, fill: Some(Paint::colour(vsf::VsfType::rck).unwrap()), stroke: None })));
-        root.children.push(vsf::VsfType::rot(Box::new(Text::new(vsf::VsfType::a("hi".into()), Nums::f32(vec![2], vec![0., 0.]).unwrap(), vsf::types::Num::from(0.25f32), Paint::colour(vsf::VsfType::rck).unwrap()))));
+        root.children.push(vsf::VsfType::rot(Box::new(Text::new(vsf::VsfType::a(vsf::Ascii::lit("hi")), Nums::f32(vec![2], vec![0., 0.]).unwrap(), vsf::types::Num::from(0.25f32), Paint::colour(vsf::VsfType::rck).unwrap()))));
         let (name, fields) = vsf::types::renderable::scene_section(vsf::VsfType::ron(Box::new(root)));
         let bytes = vsf::vsf_builder::VsfBuilder::new().add_section(name, fields).build().unwrap();
         let dec = super::decode_known(std::path::Path::new("scene.vsf"), &bytes, crate::sniff::sniff(&bytes)).unwrap();
