@@ -48,6 +48,8 @@ Formats in: `vsf` native, DNG and the common camera RAWs through [iris](https://
 
 ## Install
 
+`./install.sh` is the one command, for a fresh clone and for every upgrade: it clones any sibling repo opsin builds against that isn't beside it yet (vsf, limbus, fluor, …; chameleon is skipped when it can't be fetched), builds with the features this machine can have — `calibrate` when `../chameleon` is there, `live` on Linux — and installs over the `opsin` already on your `PATH` (else `~/.local/bin`) through the platform script below. `--prefix DIR` and `--features "…"` override the guesses. A running opsin keeps its old binary until every window is closed, and the script says so.
+
 `cargo build --release` gives you the binary, and on Linux that is the whole story — the `.desktop` `%f` hands a double-clicked file straight to `argv`. `sh packaging/linux/install.sh` installs it to `~/.local/bin` and adds the IDT actions below to Dolphin, Nautilus, Nemo and Caja.
 
 macOS needs a bundle. Finder delivers an opened document as an Apple Event and only ever to an application bundle, so a bare binary on `$PATH` can be your shell's `opsin` but can never be the thing Finder opens a raw file with. `sh packaging/macos/install.sh` builds opsin, wraps it in `Opsin.app` with the orb as its icon, ad-hoc signs it (unsigned Mach-O bundles are refused at launch), installs the CLI to `~/.local/bin`, and claims every content type opsin decodes — VSF and the raw family and the display-referred trio — as the default handler. Re-run it to upgrade in place. The bundle is local and not notarized: it runs on the machine that built it, not on one you copy it to.
