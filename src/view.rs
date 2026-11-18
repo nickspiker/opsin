@@ -687,6 +687,8 @@ pub struct View {
     /// The image-space point (as fractions of image dims) anchored at the centre of the image area. Pan and navigator move these; resizes preserve them — which IS composition preservation.
     cx_frac: f32,
     cy_frac: f32,
+    /// The composition is the fitted one: set by [`View::fit`], cleared by anything that zooms or pans. A new frame refits when this holds and otherwise keeps the operator's magnification and centre, so it is what tells "show me the whole next one" from "show me the same spot on the next one".
+    fitted: bool,
     /// Cursor position at the last drag event while panning; None = not panning.
     drag: Option<(Coord, Coord)>,
     /// One-shot fit queued for the next render — the host may construct the view before it knows its real area, so load-time fitting is lazy (render is the first call guaranteed real dims). NOT a mode: the span-relative transform preserves the fitted composition thru resizes by construction.
@@ -861,6 +863,7 @@ impl View {
             zoom_rel: 0.,
             cx_frac: 0.5,
             cy_frac: 0.5,
+            fitted: true,
             drag: None,
             needs_fit: true,
             area: Area { x: 0., y: 0., w: 1280., h: 800. },
@@ -1140,12 +1143,14 @@ impl View {
         self.zoom_rel = zoom / Self::area_span(aw, ah);
         self.cx_frac = (rx0 as f32 + rw / 2.) / self.img_w as f32;
         self.cy_frac = (ry0 as f32 + rh / 2.) / self.img_h as f32;
+        self.fitted = true;
     }
 
     /// 1:1 — one image pixel per screen pixel, EXACTLY: stores `zoom_rel = 1/span` bitwise so the readout's `==` test can certify pixel-exactness (and lose it the moment a resize changes the span). Zooms about the image-area centre for free — the anchored fractions ARE the centre point.
     pub fn one_to_one(&mut self) {
         let (_, _, aw, ah) = self.image_area();
         self.zoom_rel = 1. / Self::area_span(aw, ah);
+        self.fitted = false;
     }
 
     /// Rescale around a screen-space anchor so the image point under the cursor stays put — computed in derived pixel space, stored back as relative state. Zoom is unbounded — the blit cost is capped by screen area at any zoom, and the wheel factor is strictly positive so zoom can't reach 0. The host's pinch and Ctrl+wheel land here.
@@ -1161,6 +1166,7 @@ impl View {
         self.zoom_rel = zoom2 / Self::area_span(aw, ah);
         self.cx_frac = (px + aw * 0.5 - ox2) / (self.img_w as f32 * zoom2);
         self.cy_frac = (py + ah * 0.5 - oy2) / (self.img_h as f32 * zoom2);
+        self.fitted = false;
     }
 
     /// Pan by a screen-pixel delta (a touch drag or trackpad scroll from the host).
@@ -1174,6 +1180,7 @@ impl View {
         }
         self.cx_frac -= dx / (self.img_w as f32 * zoom);
         self.cy_frac -= dy / (self.img_h as f32 * zoom);
+        self.fitted = false;
     }
 
     /// Continuous image coordinate of a screen point (unclamped — the caller decides what off-image means).
@@ -1284,6 +1291,7 @@ impl View {
         }
         self.cx_frac = ((cx - fx as f32) / fw as f32).clamp(0., 1.);
         self.cy_frac = ((cy - fy as f32) / fh as f32).clamp(0., 1.);
+        self.fitted = false;
     }
 
     // ── state changes ──
@@ -1322,11 +1330,11 @@ impl View {
         self.tools.refresh_thumb(&self.pixels, self.img_w, self.img_h);
     }
 
-    /// Swap a decoded image into the view: title, pixels, dims, panel tools, redraw. EVERY setting the operator holds survives a load — exposure, clip, histogram axes, the HUD, the panel split — whether the frame arrives by arrow, drop, or socket handoff. Same dimensions ⇒ pan and zoom stay put too, so stepping through a burst or LED sequence compares like with like; different dimensions ⇒ refit.
+    /// Swap a decoded image into the view: title, pixels, dims, panel tools, redraw. EVERY setting the operator holds survives a load — exposure, clip, histogram axes, the HUD, the panel split, and the composition: a fitted view fits the new frame, a zoomed one keeps its magnification and its centre, and an armed crop carries over as the same fractions of the frame — whether the frame arrives by arrow, drop, or socket handoff. Opsin is a viewer: stepping through a folder compares like with like.
     pub fn install(&mut self, loaded: Loaded, ctx: &mut Context) {
         // A new picture is a new target: an overwrite armed for the last one must not fire on this one.
         self.disarm_export();
-        let same_geometry = loaded.w == self.img_w && loaded.h == self.img_h && self.img_w > 0;
+        let (old_w, old_h) = (self.img_w, self.img_h);
         self.title = loaded.title;
         self.img_w = loaded.w;
         self.img_h = loaded.h;
@@ -1360,12 +1368,21 @@ impl View {
         } else {
             self.pixels = loaded.pixels;
         }
-        if !same_geometry {
-            // A crop is framed on one sensor's dims: it can't mean anything on another's, and an out-of-range rect would be a bad slice at export. Same dims (a burst) keep it.
+        // WHY/PROOF: geometry used to be kept only on IDENTICAL dims, and a RAW lands as the binned preview while the frame it replaces had already been upgraded to the full demosaic — so the dims never matched and every arrow refit and dropped the crop (Nick 2026-11-17: "it completely forgets the zoom, location and really about everything except for the exposure"). Nothing here may compare pixel counts.
+        self.crop_drag = None;
+        if old_w == 0 || old_h == 0 || self.img_w == 0 || self.img_h == 0 {
             self.crop = None;
-            self.crop_drag = None;
             self.btn_crop.set_fill(None);
             self.fit();
+        } else {
+            // The crop rides as fractions of the frame, so it means the same trim on a preview, a full demosaic or another camera's frame, and it lands inside the new frame by construction.
+            self.crop = self.crop.map(|r| rescale_rect(r, (old_w, old_h), (self.img_w, self.img_h)));
+            if self.fitted {
+                self.fit();
+            } else {
+                // The same on-screen size for the frame's long edge: one sensor's frames (landscape or portrait) keep their magnification exactly, and the preview upgrade that follows re-bases it as it does for any load.
+                self.zoom_rel *= old_w.max(old_h) as f32 / self.img_w.max(self.img_h) as f32;
+            }
         }
         self.frame_gen += 1;
         self.preview_full = false;
@@ -1647,13 +1664,15 @@ impl View {
             return;
         }
         // Hold the picture exactly where it is: the image's on-screen size is `img_w × zoom`, so the relative zoom scales down by however much the buffer grew.
-        let (sx, sy) = (w as f32 / self.img_w as f32, h as f32 / self.img_h as f32);
-        self.zoom_rel /= sx;
-        self.crop = self.crop.map(|(x0, y0, x1, y1)| {
-            ((x0 as f32 * sx) as usize, (y0 as f32 * sy) as usize, (x1 as f32 * sx) as usize, (y1 as f32 * sy) as usize)
-        });
+        self.zoom_rel /= w as f32 / self.img_w as f32;
+        self.crop = self.crop.map(|r| rescale_rect(r, (self.img_w, self.img_h), (w, h)));
         self.img_w = w;
         self.img_h = h;
+        // A 1:1 carried across a load went through two rescales (the load's and this one); it was 1:1 and it lands back on the exact certificate, not an ulp off it.
+        let (_, _, aw, ah) = self.image_area();
+        if ((self.zoom_rel * Self::area_span(aw, ah)) - 1.).abs() < 1e-4 {
+            self.zoom_rel = 1. / Self::area_span(aw, ah);
+        }
         self.lin = lin;
         // The cursor bridge maps a display pixel back to the oriented sensor grid by this ratio.
         self.raw.fold_w = w;
@@ -3187,6 +3206,14 @@ fn sensor_rect_to_display(rect: [usize; 4], tile: (usize, usize), orient: u16, p
     (dx0 < dx1 && dy0 < dy1).then_some((dx0, dy0, dx1, dy1))
 }
 
+/// A rect on an `old` W×H frame moved to the same fractions of a `new` one: the start floors, the end ceils, both clamp to the frame, and the rect keeps at least one pixel of extent — so whatever the two frames' dims, the result is a valid slice of the new one.
+fn rescale_rect((x0, y0, x1, y1): (usize, usize, usize, usize), old: (usize, usize), new: (usize, usize)) -> (usize, usize, usize, usize) {
+    let lo = |v: usize, o: usize, n: usize| (v * n / o).min(n - 1);
+    let hi = |v: usize, o: usize, n: usize| (v * n).div_ceil(o).min(n);
+    let (nx0, ny0) = (lo(x0, old.0, new.0), lo(y0, old.1, new.1));
+    (nx0, ny0, hi(x1, old.0, new.0).max(nx0 + 1), hi(y1, old.1, new.1).max(ny0 + 1))
+}
+
 fn rotate_rect((x0, y0, x1, y1): (usize, usize, usize, usize), ow: usize, oh: usize, cw: bool) -> (usize, usize, usize, usize) {
     if cw { (oh - y1, x0, oh - y0, x1) } else { (y0, ow - x1, y1, ow - x0) }
 }
@@ -3432,6 +3459,15 @@ mod tests {
     }
 
     /// The display domain puts a rendered level exactly where the screen has it: a buffer sitting at a quarter of display white bins at a quarter of the way along, a stop of exposure doubles that, and light past white lands in the clip bin. This is the agreement the raw-count histogram could never hold once the colour matrix mixed channels (2026-10-05).
+    /// A crop carried to another frame is the same fractions of it and always a valid slice: preview → full demosaic doubles it, a landscape trim lands on a portrait frame inside it, and a one-pixel sliver on a big frame survives the trip to a small one.
+    #[test]
+    fn crop_rides_to_any_frame_as_fractions() {
+        assert_eq!(rescale_rect((100, 50, 900, 550), (1000, 600), (2000, 1200)), (200, 100, 1800, 1100));
+        assert_eq!(rescale_rect((100, 60, 900, 540), (1000, 600), (600, 1000)), (60, 100, 540, 900));
+        let (x0, y0, x1, y1) = rescale_rect((999, 599, 1000, 600), (1000, 600), (10, 6));
+        assert!(x0 < x1 && x1 <= 10 && y0 < y1 && y1 <= 6, "{x0} {y0} {x1} {y1}");
+    }
+
     #[test]
     fn display_domain_bins_rendered_light_where_it_renders() {
         let bins = 64;

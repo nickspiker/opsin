@@ -322,7 +322,7 @@ impl OpsinApp {
         ctx.window.set_title(&self.title);
     }
 
-    /// Step `delta` (±1) through the folder, skipping images that fail to decode. Reloads the view and refits.
+    /// Step `delta` (±1) through the folder, skipping images that fail to decode. The view keeps its composition and crop across the step ([`crate::view::View::install`]).
     fn navigate(&mut self, delta: isize, ctx: &mut Context) {
         let n = self.dir_list.len();
         if n <= 1 {
